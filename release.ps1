@@ -72,14 +72,23 @@ if ($DryRun) {
 }
 
 # --- Commit (if bumped), tag, push, release ------------------------------
+# git/gh write benign status to stderr ("Everything up-to-date"), which PowerShell 5.1 would
+# treat as terminating under -ErrorActionPreference Stop. Switch to explicit exit-code checks.
+$ErrorActionPreference = "Continue"
+
 if ($Version -ne $current) {
     git -C $root add Directory.Build.props
     git -C $root commit -m "Release v$Version"
+    if ($LASTEXITCODE -ne 0) { throw "git commit failed." }
 }
 git -C $root tag "v$Version"
+if ($LASTEXITCODE -ne 0) { throw "git tag failed." }
 git -C $root push
+if ($LASTEXITCODE -ne 0) { throw "git push failed." }
 git -C $root push origin "v$Version"
+if ($LASTEXITCODE -ne 0) { throw "git tag push failed." }
 
 gh release create "v$Version" $zip --repo RelentlessOldMan/ComputeWarden --title "ComputeWarden v$Version" --generate-notes
+if ($LASTEXITCODE -ne 0) { throw "gh release failed." }
 Write-Host ""
 Write-Host "Released v$Version -> https://github.com/RelentlessOldMan/ComputeWarden/releases/tag/v$Version"
