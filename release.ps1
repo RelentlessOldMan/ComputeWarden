@@ -39,7 +39,7 @@ Write-Host "Releasing v$Version (current props: $current)"
 
 # --- Tests ---------------------------------------------------------------
 Write-Host "Running tests..."
-dotnet test $root --nologo --verbosity quiet
+dotnet test (Join-Path $root "tests\ComputeWarden.Tests\ComputeWarden.Tests.csproj") --nologo --verbosity quiet
 if ($LASTEXITCODE -ne 0) { throw "Tests failed; aborting release." }
 
 # --- Bump version (so the built exes carry it) ---------------------------
