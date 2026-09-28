@@ -146,6 +146,11 @@ The daemon reads `%ProgramData%\ComputeWarden\config.yaml` (override with the
 [`config.example.yaml`](config.example.yaml) for the full shape: poll interval, lease bounds,
 debounce, the blocking `process_rules` list, and log level.
 
+**Hot-reload:** the daemon watches the config file — editing `process_rules` or the debounce
+takes effect within ~1s, no restart needed (add a game or tool to the list and it's live). A
+corrupt edit is logged and ignored, keeping the running rules. Changing `poll_interval_ms`,
+`leases`, `allow_manual_blocker`, or logging still requires a daemon restart.
+
 ## Design notes
 
 See [`DESIGN.md`](DESIGN.md) for the full implementation plan and rationale, and

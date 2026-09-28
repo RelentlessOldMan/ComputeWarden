@@ -149,6 +149,28 @@ public class ProcessDetectionTests
     }
 
     [Fact]
+    public void UpdateRules_swaps_the_active_rule_set_live()
+    {
+        var lister = new FakeLister();
+        var clock = new FakeClock();
+        var provider = Provider(lister, clock); // rules: MSBuild, CodeCompass
+        lister.Set(("MSBuild", 1), ("Game", 2));
+        provider.Refresh();
+        var before = Assert.Single(provider.GetBlockers().Blockers);
+        Assert.Contains("MSBuild", before.Description); // Game isn't a rule yet
+
+        // Hot-swap: drop the old rules, add Game.
+        provider.UpdateRules(
+            new[] { new ProcessRule { Name = "Game", Executable = "Game.exe" } },
+            new ProcessDetectionOptions { AvailableAfterMs = 0 });
+        provider.Refresh();
+
+        var after = Assert.Single(provider.GetBlockers().Blockers);
+        Assert.Contains("Game", after.Description);   // Game now blocks
+        Assert.DoesNotContain("MSBuild", after.Description); // MSBuild no longer configured
+    }
+
+    [Fact]
     public void Enumeration_failure_yields_non_confident_result()
     {
         var lister = new FakeLister { Throw = true };

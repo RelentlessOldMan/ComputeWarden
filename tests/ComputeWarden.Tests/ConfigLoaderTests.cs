@@ -3,6 +3,9 @@ using YamlDotNet.Core;
 
 namespace ComputeWarden.Tests;
 
+// Shares the process-global COMPUTEWARDEN_CONFIG env var with HotReloadTests; same collection
+// keeps them serialized so they don't clobber each other's env.
+[Collection("config-env")]
 public class ConfigLoaderTests
 {
     [Fact]

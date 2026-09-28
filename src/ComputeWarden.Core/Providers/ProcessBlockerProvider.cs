@@ -17,8 +17,8 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
 {
     private readonly IProcessLister _lister;
     private readonly IClock _clock;
-    private readonly ProcessDetectionOptions _options;
-    private readonly Dictionary<string, RuleEntry> _rulesByExe;
+    private ProcessDetectionOptions _options;
+    private Dictionary<string, RuleEntry> _rulesByExe;
 
     private readonly object _gate = new();
     private readonly Dictionary<string, MatchState> _state = new(StringComparer.OrdinalIgnoreCase);
@@ -36,15 +36,44 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
         _lister = lister;
         _clock = clock;
         _options = options;
+        _rulesByExe = BuildRuleMap(rules);
+    }
 
-        _rulesByExe = new Dictionary<string, RuleEntry>(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Swaps in a new rule set and detection options at runtime (config hot-reload). The next
+    /// <see cref="Refresh"/> uses them; debounce state for exes no longer configured is dropped
+    /// so a removed rule stops blocking promptly. Note: the poll interval lives in the monitor,
+    /// not here — changing it still requires a restart.
+    /// </summary>
+    public void UpdateRules(IEnumerable<ProcessRule> rules, ProcessDetectionOptions options)
+    {
+        var map = BuildRuleMap(rules);
+        lock (_gate)
+        {
+            _rulesByExe = map;
+            _options = options;
+
+            List<string>? stale = null;
+            foreach (var key in _state.Keys)
+                if (!map.ContainsKey(key))
+                    (stale ??= new()).Add(key);
+            if (stale is not null)
+                foreach (var key in stale)
+                    _state.Remove(key);
+        }
+    }
+
+    private static Dictionary<string, RuleEntry> BuildRuleMap(IEnumerable<ProcessRule> rules)
+    {
+        var map = new Dictionary<string, RuleEntry>(StringComparer.OrdinalIgnoreCase);
         foreach (var rule in rules)
         {
             if (!rule.Enabled) continue;
             var key = Normalize(rule.Executable);
             if (key.Length == 0) continue;
-            _rulesByExe[key] = new RuleEntry(rule.Name, rule.Executable);
+            map[key] = new RuleEntry(rule.Name, rule.Executable);
         }
+        return map;
     }
 
     public ProviderResult GetBlockers()
@@ -77,12 +106,16 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
 
         var now = _clock.UtcNow;
 
+        // Snapshot the (immutable, reference-swapped) rule map once so a concurrent hot-reload
+        // can't tear a single poll.
+        var ruleMap = _rulesByExe;
+
         // Group matched processes by normalized executable name.
         var matched = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         foreach (var proc in running)
         {
             var key = Normalize(proc.Name);
-            if (!_rulesByExe.ContainsKey(key)) continue;
+            if (!ruleMap.ContainsKey(key)) continue;
             if (!matched.TryGetValue(key, out var pids))
             {
                 pids = new List<int>();
@@ -94,6 +127,7 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
         lock (_gate)
         {
             _confident = true;
+            var opts = _options;
 
             // Refresh / create state for currently-present matches.
             foreach (var (key, pids) in matched)
@@ -103,9 +137,8 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
                     state.LastSeen = now;
                     state.Pids = pids;
                 }
-                else
+                else if (ruleMap.TryGetValue(key, out var rule))
                 {
-                    var rule = _rulesByExe[key];
                     _state[key] = new MatchState(rule.RuleName, rule.Executable, now, now, pids);
                 }
             }
@@ -115,7 +148,7 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
             foreach (var (key, state) in _state)
             {
                 if (matched.ContainsKey(key)) continue;
-                if ((now - state.LastSeen).TotalMilliseconds >= _options.AvailableAfterMs)
+                if ((now - state.LastSeen).TotalMilliseconds >= opts.AvailableAfterMs)
                     (stale ??= new()).Add(key);
             }
             if (stale is not null)
@@ -126,7 +159,7 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
             var blockers = new List<Blocker>(_state.Count);
             foreach (var (key, state) in _state)
             {
-                if ((now - state.FirstSeen).TotalMilliseconds < _options.BusyAfterMs) continue;
+                if ((now - state.FirstSeen).TotalMilliseconds < opts.BusyAfterMs) continue;
                 blockers.Add(BuildBlocker(state, present: matched.ContainsKey(key)));
             }
 

@@ -4,6 +4,10 @@
 #   %ProgramData%\ComputeWarden\config.yaml
 # or wherever the COMPUTEWARDEN_CONFIG environment variable points.
 # If no file is found, built-in defaults are used.
+#
+# Hot-reload: editing process_rules or the debounce (busy_after_ms / available_after_ms)
+# takes effect within ~1s while the daemon is running - no restart needed. Changing
+# poll_interval_ms, leases, allow_manual_blocker, or logging still requires a restart.
 
 server:
   # Fallback process poll interval if process_detection.poll_interval_ms is unset.
