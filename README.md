@@ -122,9 +122,11 @@ snippet into your agent's global instructions (e.g. Claude Code's `~/.claude/CLA
 ## ComputeWarden (heavy-compute gate)
 `computewarden_*` MCP tools cooperatively coordinate machine-saturating work. Default OFF —
 never gate normal work. Gate only when the project's own CLAUDE.md has
-`ComputeWarden: gate intensive work` (or the user asks) AND the op is one known to peg
-most/all cores or sustain heavy disk I/O — any duration (full indexing, clean parallel
-builds, large test fan-outs, ML/encode). Then computewarden_acquire (owner, description,
+`ComputeWarden: gate intensive work` (or the user asks) AND the op is one known to be
+resource-heavy — pegging most/all cores, holding a large share of RAM, or sustaining heavy
+disk I/O; any duration (full indexing, clean parallel builds, large test fan-outs, ML
+training/inference, media encode, big in-memory analysis). Intensity is about any saturated
+resource, not just CPU. Then computewarden_acquire (owner, description,
 lease_seconds); if not acquired or UNKNOWN, don't start — report the blocker, ask whether to
 wait/retry or proceed; computewarden_release when done (crash-safe via lease expiry).
 ```
