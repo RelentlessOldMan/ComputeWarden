@@ -1,0 +1,38 @@
+# ComputeWarden configuration.
+#
+# The daemon looks for this file at:
+#   %ProgramData%\ComputeWarden\config.yaml
+# or wherever the COMPUTEWARDEN_CONFIG environment variable points.
+# If no file is found, built-in defaults are used.
+
+server:
+  # Fallback process poll interval if process_detection.poll_interval_ms is unset.
+  poll_interval_ms: 2000
+
+leases:
+  default_seconds: 300   # lease length when a client doesn't specify one
+  minimum_seconds: 30    # requests below this are clamped up
+  maximum_seconds: 3600  # requests above this are clamped down
+
+process_detection:
+  poll_interval_ms: 2000
+  busy_after_ms: 0        # delay before a newly-seen process counts as a blocker
+  available_after_ms: 3000 # keep BUSY this long after a matched process exits (debounce)
+
+# Cooperating agents will see the machine as BUSY whenever any enabled rule matches.
+process_rules:
+  - name: Visual Studio Build
+    executable: MSBuild.exe
+    enabled: true
+  - name: CodeCompass Indexer
+    executable: CodeCompass.exe
+    enabled: true
+  - name: CodeCarver
+    executable: CodeCarver.exe
+    enabled: true
+
+# Set false to forbid clients from setting/clearing the manual blocker over MCP.
+allow_manual_blocker: true
+
+logging:
+  level: info   # debug | info | warn | error

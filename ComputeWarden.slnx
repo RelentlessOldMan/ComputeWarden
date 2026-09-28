@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ComputeWarden.Client/ComputeWarden.Client.csproj" />
+    <Project Path="src/ComputeWarden.Core/ComputeWarden.Core.csproj" />
+    <Project Path="src/ComputeWarden.Daemon/ComputeWarden.Daemon.csproj" />
+    <Project Path="src/ComputeWarden.Mcp/ComputeWarden.Mcp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ComputeWarden.Tests/ComputeWarden.Tests.csproj" />
+  </Folder>
+</Solution>

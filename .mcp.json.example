@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "computewarden": {
+      "command": "C:\\path\\to\\publish\\ComputeWarden.Mcp.exe",
+      "args": [],
+      "env": {}
+    }
+  }
+}
