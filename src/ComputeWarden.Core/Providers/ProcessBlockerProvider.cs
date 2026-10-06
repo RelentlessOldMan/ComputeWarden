@@ -71,7 +71,7 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
             if (!rule.Enabled) continue;
             var key = Normalize(rule.Executable);
             if (key.Length == 0) continue;
-            map[key] = new RuleEntry(rule.Name, rule.Executable);
+            map[key] = new RuleEntry(rule.Name, rule.Executable, rule.Resources);
         }
         return map;
     }
@@ -136,10 +136,12 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
                 {
                     state.LastSeen = now;
                     state.Pids = pids;
+                    // Pick up a hot-reloaded resource change for an already-running process.
+                    if (ruleMap.TryGetValue(key, out var current)) state.Resources = current.Resources;
                 }
                 else if (ruleMap.TryGetValue(key, out var rule))
                 {
-                    _state[key] = new MatchState(rule.RuleName, rule.Executable, now, now, pids);
+                    _state[key] = new MatchState(rule.RuleName, rule.Executable, now, now, pids) { Resources = rule.Resources };
                 }
             }
 
@@ -180,17 +182,24 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
             ["executable"] = state.Executable,
             ["pids"] = string.Join(",", state.Pids),
             ["present"] = present ? "true" : "false",
-        });
+        },
+        Resources: state.Resources);
+
+    private static readonly char[] PathSeparators = { '\\', '/' };
 
     private static string Normalize(string? executable)
     {
+        // Process names carry no directory, so a rule written as a full path would otherwise
+        // never match. Both separators are handled regardless of OS.
         var value = executable?.Trim() ?? string.Empty;
+        var slash = value.LastIndexOfAny(PathSeparators);
+        if (slash >= 0) value = value[(slash + 1)..];
         if (value.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             value = value[..^4];
         return value;
     }
 
-    private readonly record struct RuleEntry(string RuleName, string Executable);
+    private readonly record struct RuleEntry(string RuleName, string Executable, ResourceSet Resources);
 
     private sealed class MatchState
     {
@@ -208,5 +217,6 @@ public sealed class ProcessBlockerProvider : IBlockerProvider
         public DateTimeOffset FirstSeen { get; }
         public DateTimeOffset LastSeen { get; set; }
         public IReadOnlyList<int> Pids { get; set; }
+        public ResourceSet Resources { get; set; } = ResourceSet.All;
     }
 }

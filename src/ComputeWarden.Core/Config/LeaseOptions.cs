@@ -14,8 +14,10 @@ public sealed class LeaseOptions
     /// </summary>
     public int Resolve(int? requestedSeconds)
     {
-        var seconds = requestedSeconds ?? DefaultSeconds;
-        var max = Math.Max(MinimumSeconds, MaximumSeconds);
-        return Math.Clamp(seconds, MinimumSeconds, max);
+        // Floor at 1s: a zero/negative minimum in config would otherwise grant a reservation
+        // that is already expired — a misleading success.
+        var min = Math.Max(1, MinimumSeconds);
+        var max = Math.Max(min, MaximumSeconds);
+        return Math.Clamp(requestedSeconds ?? DefaultSeconds, min, max);
     }
 }

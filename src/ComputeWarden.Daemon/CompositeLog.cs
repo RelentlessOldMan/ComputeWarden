@@ -2,7 +2,7 @@ using ComputeWarden.Core.Diagnostics;
 
 namespace ComputeWarden.Daemon;
 
-/// <summary>Fans log calls out to several sinks (e.g. console + file).</summary>
+/// <summary>Fans log calls out to several sinks (e.g. console + file). Sinks are expected not to throw.</summary>
 public sealed class CompositeLog : ILog, IDisposable
 {
     private readonly ILog[] _sinks;

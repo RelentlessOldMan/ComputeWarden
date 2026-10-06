@@ -23,8 +23,16 @@ public sealed class ConsoleLog : ILog
         var line = LogFormat.Line(level, message);
         lock (_gate)
         {
-            if (level == LogLevel.Error) Console.Error.WriteLine(line);
-            else Console.Out.WriteLine(line);
+            try
+            {
+                if (level == LogLevel.Error) Console.Error.WriteLine(line);
+                else Console.Out.WriteLine(line);
+            }
+            catch
+            {
+                // e.g. stdout redirected to a pipe whose reader went away. Callers log while
+                // holding the warden lock, so a throwing sink would fail the request itself.
+            }
         }
     }
 }

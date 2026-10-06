@@ -73,6 +73,14 @@ public sealed class WardenHost : IAsyncDisposable
     /// </summary>
     public void ReloadConfig()
     {
+        // Editors often save by renaming, so the file can be briefly absent. Treat that as "no
+        // change" — falling through would swap the live rules for the built-in defaults.
+        if (!File.Exists(ConfigLoader.ResolvePath()))
+        {
+            _log.Warn("Config reload skipped (keeping current rules): config file not found");
+            return;
+        }
+
         ConfigLoadResult loaded;
         try
         {
@@ -91,7 +99,8 @@ public sealed class WardenHost : IAsyncDisposable
         }
 
         _processProvider.UpdateRules(loaded.Config.ProcessRules, loaded.Config.ProcessDetection);
-        _log.Info($"Configuration reloaded: {loaded.Config.ProcessRules.Count} process rule(s) active");
+        var active = loaded.Config.ProcessRules.Count(r => r.Enabled);
+        _log.Info($"Configuration reloaded: {active} process rule(s) active");
     }
 
     private void StartConfigWatcher()

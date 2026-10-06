@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "computewarden": {
-      "command": "C:\\path\\to\\publish\\ComputeWarden.Mcp.exe",
+      "command": "C:\\Users\\you\\AppData\\Local\\ComputeWarden\\bin\\ComputeWarden.Mcp.exe",
       "args": [],
       "env": {}
     }

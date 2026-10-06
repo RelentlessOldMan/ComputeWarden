@@ -14,6 +14,7 @@ public sealed class FileLog : ILog, IDisposable
     private readonly long _maxBytes;
     private readonly object _gate = new();
     private StreamWriter? _writer;
+    private bool _disposed;
 
     public FileLog(string path, string level = "info", long maxBytes = 5L * 1024 * 1024)
     {
@@ -44,7 +45,8 @@ public sealed class FileLog : ILog, IDisposable
         {
             try
             {
-                if (_writer is null) return;
+                if (_disposed) return;
+                _writer ??= Open(_path); // recover from an earlier failed open/rollover
                 _writer.WriteLine(line);
                 RollIfNeeded();
             }
@@ -61,16 +63,27 @@ public sealed class FileLog : ILog, IDisposable
         if (!info.Exists || info.Length <= _maxBytes) return;
 
         _writer!.Dispose();
-        var backup = _path + ".1";
-        File.Delete(backup);        // no-op if absent
-        File.Move(_path, backup);
-        _writer = Open(_path);      // fresh empty primary
+        _writer = null;
+        try
+        {
+            var backup = _path + ".1";
+            File.Delete(backup);    // no-op if absent
+            File.Move(_path, backup);
+        }
+        finally
+        {
+            // Reopen even if the move failed (e.g. a reader holds the file without delete
+            // sharing): keep appending past the cap rather than going silent, and retry the
+            // rollover on a later write.
+            _writer = Open(_path);
+        }
     }
 
     public void Dispose()
     {
         lock (_gate)
         {
+            _disposed = true;
             _writer?.Dispose();
             _writer = null;
         }

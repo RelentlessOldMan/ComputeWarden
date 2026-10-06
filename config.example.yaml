@@ -5,7 +5,7 @@
 # or wherever the COMPUTEWARDEN_CONFIG environment variable points.
 # If no file is found, built-in defaults are used.
 #
-# Hot-reload: editing process_rules or the debounce (busy_after_ms / available_after_ms)
+# Hot-reload: editing process_rules (incl. resources) or the debounce (busy_after_ms / available_after_ms)
 # takes effect within ~1s while the daemon is running - no restart needed. Changing
 # poll_interval_ms, leases, allow_manual_blocker, or logging still requires a restart.
 
@@ -24,6 +24,8 @@ process_detection:
   available_after_ms: 3000 # keep BUSY this long after a matched process exits (debounce)
 
 # Cooperating agents will see the machine as BUSY whenever any enabled rule matches.
+# Optional per rule: `resources` = which of cpu, gpu, ram, network, disk the process occupies.
+# Agents asking only for other resources can still proceed. Omit it to block everything.
 process_rules:
   - name: Visual Studio Build
     executable: MSBuild.exe
@@ -34,6 +36,7 @@ process_rules:
   - name: CodeCarver
     executable: CodeCarver.exe
     enabled: true
+    resources: [ram, disk]   # memory-heavy analyzer: CPU/GPU work can still run
 
 # Set false to forbid clients from setting/clearing the manual blocker over MCP.
 allow_manual_blocker: true

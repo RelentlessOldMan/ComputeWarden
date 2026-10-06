@@ -1,4 +1,5 @@
 using ComputeWarden.Core.Config;
+using ComputeWarden.Core.Model;
 using YamlDotNet.Core;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -45,7 +46,7 @@ public static class ConfigLoader
             return new ConfigLoadResult(WardenConfig.CreateDefault(),
                 $"Configuration error in {path}: {ex.Message}. Using defaults.", IsError: true);
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return new ConfigLoadResult(WardenConfig.CreateDefault(),
                 $"Could not read {path}: {ex.Message}. Using defaults.", IsError: true);
@@ -73,6 +74,7 @@ public static class ConfigLoader
                 Executable = r.Executable!,
                 Enabled = r.Enabled ?? true,
                 Description = r.Description,
+                Resources = ParseResources(r),
             })
             .ToList();
 
@@ -97,6 +99,20 @@ public static class ConfigLoader
             AllowManualBlocker = root.AllowManualBlocker ?? true,
             LogLevel = root.Logging?.Level ?? "info",
         };
+    }
+
+    private static ResourceSet ParseResources(YamlProcessRule rule)
+    {
+        try
+        {
+            return Resources.Parse(rule.Resources);
+        }
+        catch (ArgumentException ex)
+        {
+            // Surface as a config error so a typo'd edit is rejected (current rules kept)
+            // rather than silently under-blocking.
+            throw new YamlException($"process_rules '{rule.Name ?? rule.Executable}': {ex.Message}");
+        }
     }
 
     // ---- YAML shape (snake_case via UnderscoredNamingConvention) --------
@@ -133,6 +149,7 @@ public static class ConfigLoader
         public string? Executable { get; set; }
         public bool? Enabled { get; set; }
         public string? Description { get; set; }
+        public List<string>? Resources { get; set; }
     }
 
     private sealed class YamlLogging { public string? Level { get; set; } }

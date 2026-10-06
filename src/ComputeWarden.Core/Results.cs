@@ -6,7 +6,8 @@ namespace ComputeWarden.Core;
 public sealed record StatusResult(
     MachineState State,
     bool CanRunIntensive,
-    IReadOnlyList<Blocker> Blockers);
+    IReadOnlyList<Blocker> Blockers,
+    ResourceSet BusyResources = ResourceSet.None);
 
 /// <summary>Outcome of an atomic acquire attempt.</summary>
 public sealed record AcquireResult(
@@ -15,7 +16,8 @@ public sealed record AcquireResult(
     DateTimeOffset? ExpiresAt,
     MachineState MachineState,
     string? Reason,
-    IReadOnlyList<Blocker> Blockers)
+    IReadOnlyList<Blocker> Blockers,
+    ResourceSet Resources = ResourceSet.None)
 {
     public static AcquireResult Success(Reservation r) => new(
         Acquired: true,
@@ -23,7 +25,8 @@ public sealed record AcquireResult(
         ExpiresAt: r.ExpiresAt,
         MachineState: MachineState.Busy,
         Reason: null,
-        Blockers: Array.Empty<Blocker>());
+        Blockers: Array.Empty<Blocker>(),
+        Resources: r.Resources);
 
     public static AcquireResult Failure(string reason, MachineState state, IReadOnlyList<Blocker> blockers) =>
         new(false, null, null, state, reason, blockers);

@@ -30,15 +30,20 @@ public sealed class LeaseSweeper : IAsyncDisposable
         try
         {
             while (await timer.WaitForNextTickAsync(_cts.Token))
-                _warden.Sweep();
+            {
+                try
+                {
+                    _warden.Sweep();
+                }
+                catch (Exception ex)
+                {
+                    _log.Error("Lease sweep failed; will retry next interval", ex);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
             // normal shutdown
-        }
-        catch (Exception ex)
-        {
-            _log.Error("Lease sweeper loop terminated unexpectedly", ex);
         }
     }
 

@@ -36,7 +36,8 @@ public static class DaemonLauncher
         }
     }
 
-    private static (string? fileName, string[] arguments) Resolve()
+    /// <summary>Where the daemon would be launched from; internal for tests.</summary>
+    internal static (string? fileName, string[] arguments) Resolve()
     {
         // 1. Explicit override.
         var overridePath = Environment.GetEnvironmentVariable("COMPUTEWARDEN_DAEMON");

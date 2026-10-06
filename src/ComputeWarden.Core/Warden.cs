@@ -10,7 +10,10 @@ namespace ComputeWarden.Core;
 /// The authoritative, thread-safe coordinator. Holds reservations and composes blocker
 /// providers to answer "is it safe to begin intensive work?" and to atomically acquire
 /// permission. All state-mutating operations execute under a single lock so that no race
-/// can grant two exclusive reservations simultaneously (spec §27).
+/// can grant two conflicting reservations simultaneously (spec §27).
+/// <para>Exclusivity is per resource: every blocker occupies a <see cref="ResourceSet"/>, and
+/// an acquire succeeds when no blocker overlaps the requested set. Requests that omit
+/// resources ask for <see cref="ResourceSet.All"/>, i.e. the whole machine.</para>
 /// </summary>
 public sealed class Warden
 {
@@ -55,21 +58,32 @@ public sealed class Warden
 
     // ---- Read operations ------------------------------------------------
 
+    /// <summary>
+    /// Full state. <see cref="StatusResult.State"/> is machine-wide (BUSY if anything holds any
+    /// resource); <see cref="StatusResult.BusyResources"/> says which resources are taken.
+    /// </summary>
     public StatusResult GetStatus()
     {
         lock (_gate)
         {
             var blockers = CollectBlockersLocked(out var confident);
             var state = DetermineState(confident, blockers);
-            return new StatusResult(state, state == MachineState.Available, blockers);
+            return new StatusResult(state, state == MachineState.Available, blockers, Occupied(blockers));
         }
     }
 
     /// <summary>
-    /// Informational availability check. MUST NOT be treated as a guarantee that
-    /// availability persists after the call — agents doing protected work must Acquire.
+    /// Informational availability check for the given resources (default: all). MUST NOT be
+    /// treated as a guarantee that availability persists — agents doing protected work must Acquire.
     /// </summary>
-    public bool CanRun() => GetStatus().State == MachineState.Available;
+    public bool CanRun(ResourceSet resources = ResourceSet.All)
+    {
+        lock (_gate)
+        {
+            var blockers = CollectBlockersLocked(out var confident);
+            return DetermineState(confident, Conflicting(blockers, resources)) == MachineState.Available;
+        }
+    }
 
     public WardenStats GetStats()
     {
@@ -90,16 +104,19 @@ public sealed class Warden
     // ---- Reservation lifecycle -----------------------------------------
 
     /// <summary>
-    /// Atomically checks all blockers and, if the machine is Available, creates a
-    /// reservation. This is the critical correctness operation: check + acquire under
-    /// one lock.
+    /// Atomically checks blockers overlapping <paramref name="resources"/> and, if none, creates
+    /// a reservation holding those resources. This is the critical correctness operation:
+    /// check + acquire under one lock.
     /// </summary>
     public AcquireResult Acquire(
         string owner,
         string description,
         int? leaseSeconds = null,
-        IReadOnlyDictionary<string, string>? metadata = null)
+        IReadOnlyDictionary<string, string>? metadata = null,
+        ResourceSet resources = ResourceSet.All)
     {
+        if (resources == ResourceSet.None) resources = ResourceSet.All;
+
         lock (_gate)
         {
             if (!TryValidate(owner, description, metadata, out var validationError))
@@ -109,7 +126,9 @@ public sealed class Warden
                 return AcquireResult.Failure(validationError!, DetermineState(c, b), b);
             }
 
-            var blockers = CollectBlockersLocked(out var confident);
+            // Only blockers sharing a resource with this request matter. Unknown is still
+            // machine-wide: if we can't see, we can't tell which resources are free.
+            var blockers = Conflicting(CollectBlockersLocked(out var confident), resources);
             var state = DetermineState(confident, blockers);
 
             if (state == MachineState.Unknown)
@@ -122,7 +141,10 @@ public sealed class Warden
             if (blockers.Count > 0)
             {
                 _failedAcquisitions++;
-                return AcquireResult.Failure("Machine currently unavailable", state, blockers);
+                var reason = resources == ResourceSet.All
+                    ? "Machine currently unavailable"
+                    : $"Requested resources in use: {string.Join(", ", Resources.ToNames(Occupied(blockers) & resources))}";
+                return AcquireResult.Failure(reason, state, blockers);
             }
 
             var now = _clock.UtcNow;
@@ -133,13 +155,14 @@ public sealed class Warden
                 description: description ?? string.Empty,
                 createdAt: now,
                 expiresAt: now.AddSeconds(seconds),
-                metadata: CloneMetadata(metadata));
+                metadata: CloneMetadata(metadata),
+                resources: resources);
 
             _reservations[reservation.Id] = reservation;
             _totalAcquisitions++;
-            // Lifecycle events are rare (exclusive reservations), so logging under the lock is
-            // cheap here and keeps the audit trail ordered.
-            _log.Info($"Reservation acquired: {owner} \"{Trunc(reservation.Description)}\" [{Short(reservation.Id)}] lease {seconds}s");
+            // Lifecycle events are rare, so logging under the lock is cheap here and keeps the
+            // audit trail ordered.
+            _log.Info($"Reservation acquired: {owner} \"{Trunc(reservation.Description)}\" [{Short(reservation.Id)}] {Names(resources)} lease {seconds}s");
             return AcquireResult.Success(reservation);
         }
     }
@@ -183,12 +206,12 @@ public sealed class Warden
 
     // ---- Manual blocker -------------------------------------------------
 
-    public Blocker SetManualBusy(string reason)
+    public Blocker SetManualBusy(string reason, ResourceSet resources = ResourceSet.All)
     {
         if (reason is null) throw new ArgumentNullException(nameof(reason));
         if (reason.Length > _limits.MaxReasonLength)
             throw new ArgumentException($"reason exceeds {_limits.MaxReasonLength} characters", nameof(reason));
-        return _manual.Set(reason);
+        return _manual.Set(reason, resources == ResourceSet.None ? ResourceSet.All : resources);
     }
 
     public bool ClearManualBusy() => _manual.Clear();
@@ -222,6 +245,20 @@ public sealed class Warden
 
         return blockers;
     }
+
+    private static List<Blocker> Conflicting(List<Blocker> blockers, ResourceSet resources)
+        => resources == ResourceSet.All
+            ? blockers
+            : blockers.Where(b => Resources.Overlaps(b.Resources, resources)).ToList();
+
+    private static ResourceSet Occupied(IEnumerable<Blocker> blockers)
+    {
+        var set = ResourceSet.None;
+        foreach (var b in blockers) set |= b.Resources;
+        return set;
+    }
+
+    private static string Names(ResourceSet set) => "[" + string.Join(",", Resources.ToNames(set)) + "]";
 
     private static MachineState DetermineState(bool confident, IReadOnlyList<Blocker> blockers)
         => !confident ? MachineState.Unknown
@@ -286,6 +323,11 @@ public sealed class Warden
             }
             foreach (var kv in metadata)
             {
+                if (kv.Value is null)
+                {
+                    error = $"metadata value for '{kv.Key}' must be a string";
+                    return false;
+                }
                 if (kv.Key.Length > _limits.MaxMetadataKeyLength)
                 {
                     error = $"metadata key exceeds {_limits.MaxMetadataKeyLength} characters";

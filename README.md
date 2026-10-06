@@ -1,122 +1,80 @@
 # ComputeWarden 🚦
 
-A lightweight, machine-wide **coordination service** that answers one question for cooperating
-tools:
+A small Windows background service that AI coding agents and build tools ask before starting
+heavy work, so they take turns instead of all saturating one machine at once.
 
-> **Is it currently safe to begin intensive processing on this machine?**
+Two agents, one machine: agent A asks for the CPU and gets it. Agent B asks for the CPU and is
+told "no, A is indexing the repo", so it waits or asks its human. Meanwhile agent C asks for the
+GPU and goes ahead, because nobody holds it. When A finishes (or crashes), its hold expires
+and B can start.
 
-It stops multiple coding agents, build systems, and indexers from all hammering the same
-machine at once — by *coordination*, not enforcement. ComputeWarden reports state and hands
-out short-lived reservations; **cooperating** tools ask before starting heavy work and honor
-the answer. It never kills, throttles, or reprioritizes anything.
+ComputeWarden coordinates; it never enforces. Nothing is killed, throttled, or
+reprioritized. It only helps tools that ask (over [MCP](https://modelcontextprotocol.io)) and
+respect the answer.
 
 ## How it works
 
-ComputeWarden derives a machine state — `AVAILABLE`, `BUSY`, or `UNKNOWN` — from a set of
-**blockers**:
+ComputeWarden tracks **blockers**, meaning reasons some resource is in use:
 
-- **Process blockers** — a configured intensive process (e.g. `MSBuild.exe`) is running.
-- **Reservation blockers** — a cooperating agent holds a reservation.
-- **Manual blockers** — an operator marked the machine busy (e.g. disk maintenance).
+- **Reservations**: an agent asked for resources and got them, on an expiring lease.
+- **Processes**: a program you listed in the config is running (a game, `MSBuild.exe`, an indexer).
+- **Manual holds**: you marked resources busy for something it can't detect.
 
-An agent that wants to do heavy work calls **acquire**. If nothing is blocking, it atomically
-receives an expiring **reservation** (a lease). It renews the lease during long work and
-releases it when done. If it crashes, the lease expires and the machine frees itself — no
-stuck flags to clean up.
+Each blocker occupies some of `cpu`, `gpu`, `ram`, `network`, and `disk`. An agent calls
+**acquire** with the resources its job will saturate, and it gets a reservation only if no
+blocker overlaps them. A CPU+network job and a GPU+RAM job can run side by side; two GPU
+jobs take turns. Leaving out `resources` means all of them, i.e. the whole machine.
 
-```
-Claude Code ─┐
-Other agent ─┤─ MCP ─►  cw-mcp adapter (one per client)
-Dev tool    ─┘                    │
-                          named pipe \\.\pipe\ComputeWarden
-                                   │
-                                   ▼
-                        ComputeWarden daemon   ◄── single machine-wide authority
-                        ├─ ProcessMonitor (polls, applies config rules)
-                        ├─ ReservationManager (atomic acquire, leases)
-                        ├─ BlockerManager (process + reservation + manual)
-                        └─ NamedPipe server
-```
+**Ask for everything in one call.** Request every resource a job needs up front (`[ram, disk]`,
+not `ram` now and `disk` later). Holding one resource while waiting on another is how two
+agents end up stuck on each other. Each acquire is a separate, unrelated reservation, so a
+second request can even be refused by your own first hold. If a job's needs change, release
+and re-acquire the full set.
 
-The **daemon** is the single source of truth. Each agent runs a thin **MCP adapter** that
-forwards calls over a local named pipe; the first adapter to start auto-spawns the daemon if
-it isn't already running. No Windows Service, no installer, no network port, no database.
+Reservations are leases: renew during long work, release when done. If the agent crashes,
+the lease runs out and the resources free themselves. There are no stuck flags to clean up.
 
-## Projects
+## Install
 
-| Project | What it is |
-|---|---|
-| `ComputeWarden.Core` | Pure, OS-agnostic domain: `Warden` (atomic acquire), blockers, leases, process detection, IPC dispatcher. No I/O dependencies. |
-| `ComputeWarden.Daemon` | The background authority: process monitor, lease sweeper, named-pipe server, YAML config, single-instance guard. |
-| `ComputeWarden.Client` | `WardenClient` — typed IPC client library (also usable by a future CLI). |
-| `ComputeWarden.Mcp` | The stdio MCP adapter agents talk to; auto-spawns the daemon. |
-| `ComputeWarden.Tests` | xUnit test suite. |
+Windows x64. Self-contained, so you don't need the .NET runtime.
 
-## Build & test
+1. Download the latest `ComputeWarden-vX.Y.Z-win-x64.zip` from
+   [Releases](https://github.com/RelentlessOldMan/ComputeWarden/releases).
+2. Extract `ComputeWarden.Mcp.exe` and `ComputeWarden.Daemon.exe` into one folder, e.g.
+   `%LOCALAPPDATA%\ComputeWarden\bin`. The two must stay side by side.
+3. Register the MCP server with your agent:
 
-```powershell
-dotnet build
-dotnet test
-```
+   **Claude Code** (user scope = available in every project):
+   ```powershell
+   claude mcp add --scope user computewarden "$env:LOCALAPPDATA\ComputeWarden\bin\ComputeWarden.Mcp.exe"
+   ```
 
-Requires the **.NET 10 SDK** (the MCP SDK depends on the .NET 10 base libraries).
+   **Codex** (`~/.codex/config.toml`):
+   ```toml
+   [mcp_servers.computewarden]
+   command = 'C:\Users\you\AppData\Local\ComputeWarden\bin\ComputeWarden.Mcp.exe'
+   ```
 
-## Publish (self-contained)
+   Other MCP clients: point them at `ComputeWarden.Mcp.exe` as a stdio server (see
+   [`.mcp.json.example`](.mcp.json.example)).
+4. Optional: copy [`config.example.yaml`](config.example.yaml) to
+   `%ProgramData%\ComputeWarden\config.yaml` and list the programs that should count as busy.
 
-Publishes the daemon and MCP adapter as self-contained single-file executables into
-`publish/` so target machines don't need the .NET runtime installed. Both land in the same
-folder, which is how the adapter finds and auto-spawns the daemon.
+You don't need to start anything yourself. The first time an agent calls a tool, the adapter
+starts the daemon in the background, and it then runs until reboot.
 
-```powershell
-./publish.ps1              # win-x64, Release
-```
-
-## Wire into Claude Code
-
-Point Claude Code at the published adapter (see `.mcp.json.example`):
+**Check it works:** start a new agent session and ask it to call `computewarden_status`.
+You should get something like:
 
 ```json
-{
-  "mcpServers": {
-    "computewarden": {
-      "command": "C:\\path\\to\\publish\\ComputeWarden.Mcp.exe"
-    }
-  }
-}
+{"state":"AVAILABLE","can_run_intensive":true,"busy_resources":[],"blockers":[]}
 ```
 
-## MCP tools
+## Getting agents to use it
 
-| Tool | Purpose |
-|---|---|
-| `computewarden_status` | Full state: `AVAILABLE`/`BUSY`/`UNKNOWN` + all blockers explaining why. |
-| `computewarden_can_run` | Quick availability check. Informational only — **not** a guarantee; use acquire before protected work. |
-| `computewarden_acquire` | Atomically check + reserve. Returns a reservation, or the current blockers. |
-| `computewarden_renew` | Extend a reservation's lease during long work. |
-| `computewarden_release` | Release a reservation (idempotent). |
-| `computewarden_set_manual_busy` | Mark the machine busy for undetectable work. |
-| `computewarden_clear_manual_busy` | Clear the manual blocker. |
-
-All tools return compact structured JSON so an agent can decide and explain, rather than parse prose.
-
-## Agent usage pattern
-
-```
-1. Decide the upcoming work is intensive.
-2. computewarden_acquire.
-3. If not acquired  -> don't start; report/wait/retry (every 5-15s, no aggressive polling).
-4. If acquired      -> save reservation_id.
-5. Do the work; periodically computewarden_renew.
-6. computewarden_release (in a finally/cleanup block).
-```
-
-`UNKNOWN` means ComputeWarden can't reliably tell — treat it as "do not begin protected work."
-
-### Wiring it into an AI coding agent (recommended convention)
-
-ComputeWarden only helps if agents actually ask. To avoid gating *everything*, make it
-**opt-in per project** and driven by whether the work truly saturates the machine. Drop this
-snippet into your agent's global instructions (e.g. Claude Code's `~/.claude/CLAUDE.md`):
+Agents only help if they ask, and you don't want them gating every `git status`. What works
+well is making it **opt-in per project**, limited to work that really saturates the machine.
+Add this to your agent's global instructions (for Claude Code, `~/.claude/CLAUDE.md`):
 
 ```markdown
 ## ComputeWarden (heavy-compute gate)
@@ -126,45 +84,126 @@ never gate normal work. Gate only when the project's own CLAUDE.md has
 resource-heavy — pegging most/all cores, holding a large share of RAM, or sustaining heavy
 disk I/O; any duration (full indexing, clean parallel builds, large test fan-outs, ML
 training/inference, media encode, big in-memory analysis). Intensity is about any saturated
-resource, not just CPU. Then computewarden_acquire (owner, description,
-lease_seconds); if not acquired or UNKNOWN, don't start — report the blocker, ask whether to
+resource, not just CPU. Then computewarden_acquire (owner, description, leaseSeconds,
+resources = all of cpu/gpu/ram/network/disk it saturates, in ONE call — never add more via a
+second acquire); if not acquired or UNKNOWN, don't start — report the blocker, ask whether to
 wait/retry or proceed; computewarden_release when done (crash-safe via lease expiry).
 ```
 
-Then, in each project you actually want gated, add a single line to *that project's* CLAUDE.md:
+Then add one line to the CLAUDE.md of each project you want gated:
 
 ```markdown
 ComputeWarden: gate intensive work
 ```
 
-Everything else is left ungated, which is the point.
+## MCP tools
+
+| Tool | What it does |
+|---|---|
+| `computewarden_acquire` | Atomically checks the requested `resources` (default: all) and reserves them. Returns `reservation_id` + expiry, or the conflicting blockers. |
+| `computewarden_renew` | Extends a reservation's lease during long work. |
+| `computewarden_release` | Releases a reservation. Safe to call twice. |
+| `computewarden_status` | `AVAILABLE` / `BUSY` / `UNKNOWN`, `busy_resources`, and every blocker with its owner and resources. |
+| `computewarden_can_run` | Quick check for the given `resources`. Informational only: it reserves nothing, so use acquire before real work. |
+| `computewarden_set_manual_busy` | Holds the machine (or given `resources`) busy for work ComputeWarden can't detect. |
+| `computewarden_clear_manual_busy` | Clears that manual hold. |
+| `computewarden_stats` | Counters since the daemon started. A high `expired_reservations` means agents acquire but don't release. |
+
+All tools return compact JSON, and errors come back as JSON with an `error` field too.
+
+`UNKNOWN` means ComputeWarden couldn't read the process list, so it can't tell what's free.
+Acquire refuses everything until that clears.
 
 ## Configuration
 
-The daemon reads `%ProgramData%\ComputeWarden\config.yaml` (override with the
-`COMPUTEWARDEN_CONFIG` environment variable). If absent, built-in defaults are used. See
-[`config.example.yaml`](config.example.yaml) for the full shape: poll interval, lease bounds,
-debounce, the blocking `process_rules` list, and log level.
+The daemon reads `%ProgramData%\ComputeWarden\config.yaml` (or wherever the
+`COMPUTEWARDEN_CONFIG` environment variable points). Without one it uses defaults: lease
+30s–1h (default 5 min), and MSBuild + CodeCompass as busy processes.
 
-**Hot-reload:** the daemon watches the config file — editing `process_rules` or the debounce
-takes effect within ~1s, no restart needed (add a game or tool to the list and it's live). A
-corrupt edit is logged and ignored, keeping the running rules. Changing `poll_interval_ms`,
-`leases`, `allow_manual_blocker`, or logging still requires a daemon restart.
+The part you'll edit most is the process list:
 
-## Design notes
+```yaml
+process_rules:
+  - name: Overwatch
+    executable: Overwatch.exe          # blocks everything while running
+  - name: CodeCarver
+    executable: CodeCarver.exe
+    resources: [ram, disk]             # memory-heavy: CPU/GPU work can still run
+```
 
-See [`DESIGN.md`](DESIGN.md) for the full implementation plan and rationale, and
-[`OriginalSpec.md`](OriginalSpec.md) for the original specification.
+**Edits apply live.** The daemon watches the file, so changes to `process_rules` and the
+debounce settings take effect within about a second. A broken edit is logged and ignored,
+and the previous rules stay active. Changing the poll interval, lease bounds,
+`allow_manual_blocker`, or logging needs a daemon restart.
 
-## Scope (v1)
+[`config.example.yaml`](config.example.yaml) documents every setting.
 
-**Included:** Windows support, background daemon, process-name monitoring, machine-state
-calculation, exclusive reservations with lease expiry/renewal/release, manual blocker, local
-named-pipe IPC, MCP adapter, structured status, logging, concurrency-safe acquire, tests.
+## Troubleshooting
 
-**Not included (by design):** CPU/GPU/disk/network monitoring, multiple reservation classes,
-distributed coordination, process throttling/killing, GUI, cloud services. The architecture
-leaves room to add resource-based blocker providers later without rework.
+**Where are the logs?** `%ProgramData%\ComputeWarden\logs\daemon.log` (capped at 5 MB, with one
+`.1` backup). It records every acquire, release, and lease expiry, plus process blockers
+appearing and clearing, and config reloads.
+
+**Restart the daemon:** `Stop-Process -Name ComputeWarden.Daemon`. The next tool call starts
+a fresh one. Reservations are in memory, so a restart clears them.
+
+**"Access denied to the ComputeWarden pipe":** the running daemon was started by another user
+or from an elevated (admin) session, and normal sessions can't connect to it. Stop it (from
+that session, or an elevated prompt) and let a normal session start its own.
+
+**"daemon is not running and could not be launched":** `ComputeWarden.Daemon.exe` isn't next
+to `ComputeWarden.Mcp.exe`. Put it there, or set `COMPUTEWARDEN_DAEMON` to its full path.
+
+**Updating:** each open agent session keeps `ComputeWarden.Mcp.exe` locked. Close all
+sessions, stop the daemon, replace both exes, then restart your sessions. Tool parameter
+changes are only picked up by new sessions.
+
+## Limitations
+
+- **Cooperative only.** A program that never asks does whatever it wants.
+- **Resources are declared, not measured.** ComputeWarden doesn't watch CPU or GPU load. It
+  trusts agents to name what they'll saturate, and only knows programs you've listed.
+- **All-or-nothing per resource.** Two jobs that each need 30% of RAM still take turns.
+- **Windows, one user.** The daemon serves the user who started it; there's no network or
+  multi-machine coordination.
+
+## Building from source
+
+Requires the .NET 10 SDK.
+
+```powershell
+dotnet build
+dotnet test
+./publish.ps1            # self-contained win-x64 exes -> publish/
+./publish.ps1 -Install   # ...and copy them to %LOCALAPPDATA%\ComputeWarden\bin
+./release.ps1            # test, bump patch version, zip, tag, and create a GitHub release
+```
+
+The version lives in `Directory.Build.props`.
+
+```
+Claude Code ─┐
+Codex       ─┼─ stdio MCP ─► ComputeWarden.Mcp.exe   (one per agent session)
+Other client ┘                        │
+                         named pipe \\.\pipe\ComputeWarden (current user only)
+                                      ▼
+                           ComputeWarden.Daemon.exe   (one per machine; holds all state)
+                           ├─ Warden: blockers + atomic acquire
+                           ├─ ProcessMonitor: polls processes against config rules
+                           ├─ LeaseSweeper: expires abandoned reservations
+                           └─ config watcher: hot-reloads process rules
+```
+
+| Project | Contents |
+|---|---|
+| `src/ComputeWarden.Core` | The domain logic, with no I/O: `Warden`, blockers, resources, leases, process matching, IPC dispatcher. |
+| `src/ComputeWarden.Daemon` | Background process: pipe server, process polling, YAML config, logging, single-instance guard. |
+| `src/ComputeWarden.Client` | `WardenClient`, a typed client for the pipe protocol. |
+| `src/ComputeWarden.Mcp` | The stdio MCP adapter; starts the daemon on demand. |
+| `tests/ComputeWarden.Tests` | xUnit tests. |
+
+[`DESIGN.md`](DESIGN.md) explains the design decisions (state model, acquire algorithm,
+protocol). [`OriginalSpec.md`](OriginalSpec.md) is the original specification.
 
 ## Contributing
 

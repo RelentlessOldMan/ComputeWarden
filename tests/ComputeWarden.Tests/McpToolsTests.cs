@@ -73,6 +73,26 @@ public class McpToolsTests
     }
 
     [Fact]
+    public async Task Acquire_tool_with_disjoint_resources_runs_in_parallel()
+    {
+        await using var host = StartHostWithTools();
+
+        var a = Parse(await ComputeWardenTools.Acquire("A", "compile", resources: new[] { "cpu", "network" }));
+        var b = Parse(await ComputeWardenTools.Acquire("B", "train", resources: new[] { "gpu", "ram" }));
+        var c = Parse(await ComputeWardenTools.Acquire("C", "encode", resources: new[] { "gpu" }));
+
+        Assert.True((bool)a["acquired"]!);
+        Assert.Equal("[\"cpu\",\"network\"]", a["resources"]!.ToJsonString());
+        Assert.True((bool)b["acquired"]!);
+        Assert.False((bool)c["acquired"]!);
+        Assert.Equal("B", (string)Assert.Single(c["blockers"]!.AsArray())!["owner"]!);
+
+        var status = Parse(await ComputeWardenTools.Status());
+        Assert.Equal("[\"cpu\",\"gpu\",\"ram\",\"network\"]", status["busy_resources"]!.ToJsonString());
+        Assert.True((bool)Parse(await ComputeWardenTools.CanRun(new[] { "disk" }))["can_run"]!);
+    }
+
+    [Fact]
     public async Task Can_run_tool_carries_informational_note()
     {
         await using var host = StartHostWithTools();

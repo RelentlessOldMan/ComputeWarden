@@ -1,7 +1,7 @@
-# ComputeWarden — Implementation Plan (v1)
+# ComputeWarden — Design
 
-> Derived from `OriginalSpec.md`. This document records the concrete design decisions
-> and the build plan for version 1. The spec is the "what"; this is the "how".
+> Derived from `OriginalSpec.md`. This document records the design decisions and why they
+> were made. The spec is the "what"; this is the "how". For usage, see the README.
 
 ## 1. Summary
 
@@ -20,7 +20,7 @@ coordinates well-behaved tools by convention.
 | Daemon lifecycle | First MCP adapter auto-spawns it if missing (race-safe via named mutex); **runs until reboot** (idle-timeout deferred) |
 | Topology | Daemon = single source of truth; thin per-client MCP adapter forwards over a **named pipe** |
 | IPC transport | Named pipe `\\.\pipe\ComputeWarden`, newline-delimited JSON, versioned |
-| Reservations | **Exclusive** (one at a time); `reservation_id` is a **bearer capability** |
+| Reservations | **Exclusive per resource** (cpu/gpu/ram/network/disk; holds conflict only where they overlap, default all); `reservation_id` is a **bearer capability** |
 | Persistence | None for reservations/process blockers; config persisted; manual blocker persistence deferred |
 | Portability | Windows-first; process enumeration + pipe path behind interfaces for a future Linux port |
 
@@ -29,12 +29,19 @@ coordinates well-behaved tools by convention.
 State is **derived**, never stored as a boolean:
 
 ```
-blockers = ProcessProvider.Get() + ReservationProvider.Get() + ManualProvider.Get()
+blockers = reservations + ProcessProvider.Get() + ManualProvider.Get()
 
 if any provider failed in a way that affects confidence:  UNKNOWN
 elif blockers.Any():                                       BUSY
 else:                                                      AVAILABLE
 ```
+
+Every blocker occupies a **resource set** (`cpu | gpu | ram | network | disk`, a flags enum).
+Machine-wide `BUSY` means *something* is held; `busy_resources` says what. Availability for a
+specific request only considers blockers that overlap it. Anything that doesn't name its
+resources (an old client, a process rule without `resources`, a bare manual hold) occupies
+**all** of them, which is exactly the pre-resource "exclusive machine" behavior. Old clients
+and old daemons therefore interoperate conservatively, with no protocol version bump.
 
 - **UNKNOWN** is not a blocker; it means "couldn't compute the blocker set."
   `acquire` under UNKNOWN **refuses** (fail-conservative, spec §32). Agents treat
@@ -48,16 +55,17 @@ else:                                                      AVAILABLE
 record Blocker(
     string   Id,
     BlockerType Type,      // Process | Reservation | Manual
-    string   Source,       // e.g. "ProcessMonitor", "ReservationManager"
+    string   Source,       // e.g. "ProcessBlockerProvider", "ReservationManager"
     string   Description,  // human-readable
     string?  Owner,
-    DateTimeOffset CreatedAt,
+    DateTimeOffset? CreatedAt,
     DateTimeOffset? ExpiresAt,
-    IReadOnlyDictionary<string,string>? Metadata);
+    IReadOnlyDictionary<string,string>? Metadata,
+    ResourceSet Resources = ResourceSet.All);
 ```
 
-`IBlockerProvider { IReadOnlyList<Blocker> GetBlockers(); }` — the extension seam for
-future CPU/disk/GPU providers.
+`IBlockerProvider { ProviderResult GetBlockers(); }` (blockers + a confidence flag) is the
+extension seam for future measured CPU/disk/GPU providers.
 
 ## 5. Acquire algorithm (the critical correctness property)
 
@@ -67,11 +75,12 @@ Single lock, atomic check-and-create (spec §27):
 lock (state):
     expire stale reservations
     blockers = collect from all providers        // uses last process snapshot
-    if state == UNKNOWN:            return { acquired:false, reason:"UNKNOWN", blockers }
-    if blockers.Any():              return { acquired:false, blockers }
-    r = new Reservation(id, owner, desc, lease clamped to [min,max])
+    if any provider unconfident:    return { acquired:false, reason:"UNKNOWN", ... }
+    conflicts = blockers overlapping requested resources (default: all)
+    if conflicts.Any():             return { acquired:false, blockers: conflicts }
+    r = new Reservation(id, owner, desc, resources, lease clamped to [min,max])
     reservations.add(r)
-    return { acquired:true, reservation_id:r.Id, expires_at:r.ExpiresAt, machine_state:BUSY }
+    return { acquired:true, reservationId:r.Id, expiresAt:r.ExpiresAt, resources }
 ```
 
 Notes:
@@ -79,7 +88,13 @@ Notes:
   does *not* trigger a fresh enumeration (spec §7 "avoid excessive enumeration"). The
   cooperative contract only promises "known-safe at acquisition time," not guaranteed
   exclusivity (spec §28).
-- Lease seconds are clamped server-side to `[minimum_seconds, maximum_seconds]`.
+- Lease seconds are clamped server-side to `[minimum_seconds, maximum_seconds]`, never below 1s.
+- UNKNOWN refuses every request, even one for resources nothing appears to hold: if the
+  process list can't be read, nothing is known to be free.
+- There is no "add resources to my reservation" operation. A second acquire is an unrelated
+  reservation, and growing holds piecemeal is the hold-and-wait pattern that lets two agents
+  stall on each other. Agents request everything in one call; if needs change, they release
+  and re-acquire.
 - A process starting *after* a reservation is granted adds a second blocker; the existing
   reservation is **not** revoked (spec §28).
 
@@ -96,8 +111,8 @@ Notes:
 
 ## 7. Manual override
 
-- `set_manual_busy(reason)` / `clear_manual_busy()` create/remove a single MANUAL blocker,
-  visually distinct in status.
+- `set_manual_busy(reason, resources?)` / `clear_manual_busy()` create/remove a single MANUAL
+  blocker, visually distinct in status.
 - May be disabled via config if only admins should control it (spec §17).
 
 ## 8. Process monitoring
@@ -105,7 +120,8 @@ Notes:
 - Poll every `poll_interval_ms` (default 2000). Use a **cheap name-only enumeration**
   (`Process.GetProcesses()` reading `ProcessName`, no per-process handle inspection).
 - Match against enabled `process_rules` by executable name (case-insensitive, with/without
-  `.exe`). Path/cmdline/regex are future fields — schema leaves room, v1 ignores them.
+  `.exe`; a directory in the rule is ignored). Each rule may name the `resources` it
+  occupies (default all). Command-line/regex matching are not implemented.
 - Enumeration failure → provider reports low confidence → state UNKNOWN.
 - **No log spam:** log only transitions (blocker appeared / cleared), never "still running."
 
@@ -113,25 +129,32 @@ Notes:
 
 - Pipe: `\\.\pipe\ComputeWarden`. Restrict ACL to the current user/session.
 - Wire: one JSON object per line (request), one per line (response). `v` field for version.
-- Requests: `STATUS | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY`.
-- Server validates every input: string/metadata size caps, lease bounds, reject unknown ops
-  with a structured error (never crash the pipe loop).
+- Requests: `STATUS | CAN_RUN | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY | STATS`.
+- Server validates every input: string/metadata size caps, lease bounds, resource names;
+  unknown ops get a structured error (never crash the pipe loop). Request lines are capped
+  at 256K characters *while reading*, and idle connections are dropped after 30s.
+- Versioning is additive: the daemon serves any `v` up to its own and ignores unknown
+  fields, because the daemon is long-lived and adapters update independently.
 
 ```jsonc
 // request
-{ "v": 1, "op": "ACQUIRE", "owner": "Claude Code", "description": "indexing", "lease_seconds": 300 }
+{ "v": 1, "op": "ACQUIRE", "owner": "Claude Code", "description": "indexing",
+  "leaseSeconds": 300, "resources": ["cpu", "disk"] }
 // response
-{ "v": 1, "ok": true, "acquired": true, "reservation_id": "7f93…", "expires_at": "…", "machine_state": "BUSY" }
+{ "v": 1, "ok": true, "acquired": true, "resources": ["cpu", "disk"], "reservationId": "7f93…",
+  "expiresAt": "…", "machineState": "BUSY", "reason": null, "blockers": [] }
 ```
 
-## 10. MCP adapter (`cw-mcp`)
+## 10. MCP adapter (`ComputeWarden.Mcp`)
 
-- Stdio MCP server (one per client, spawned by Claude Code et al.).
-- On start: try to connect to the pipe; if absent, acquire the named mutex and spawn the
-  daemon detached, wait for the pipe, then connect. (Mutex prevents double-spawn.)
-- Exposes tools 1:1 with spec §18: `computewarden_status`, `computewarden_can_run`,
-  `computewarden_acquire`, `computewarden_renew`, `computewarden_release`,
-  `computewarden_set_manual_busy`, `computewarden_clear_manual_busy`.
+- Stdio MCP server (one per client, spawned by Claude Code et al.). stdout is the JSON-RPC
+  transport, so all adapter logging goes to stderr.
+- On a tool call: probe the pipe; if nothing is listening, launch the daemon detached and
+  wait (up to 8s) for it to serve. Duplicate launches are harmless: the daemon's
+  single-instance mutex (`Global\ComputeWardenDaemon`) makes extras exit immediately. An
+  ACL-denied pipe (daemon owned by another user / elevated) is reported, not "fixed" by
+  spawning.
+- Exposes tools 1:1 with spec §18, plus `computewarden_stats`.
 - Responses are **structured JSON**, not prose (spec §38).
 - `can_run` is informational only — carries a note that availability isn't guaranteed after
   the call; agents that will do protected work must `acquire`.
@@ -141,17 +164,21 @@ Notes:
 - Location: `%ProgramData%\ComputeWarden\config.yaml` (machine-wide, matches daemon scope).
   Overridable via `COMPUTEWARDEN_CONFIG` env var.
 - Format per spec §25 (server poll interval, lease bounds, `process_detection`,
-  `process_rules`, logging). Hot-reload deferred; missing config → sane defaults + a warning.
+  `process_rules`, logging). Missing config → defaults; corrupt or unreadable → defaults,
+  logged as an error, daemon still starts.
+- **Hot-reload** of `process_rules` + debounce via a file watcher (500ms debounce). A corrupt
+  or momentarily-missing file keeps the current rules. The other settings are read at
+  startup only.
 
 ## 12. Project layout
 
 ```
-ComputeWarden.sln
+ComputeWarden.slnx
 ├── src/
 │   ├── ComputeWarden.Core/        # Blocker, Reservation, providers, state calc, config models
-│   ├── ComputeWarden.Daemon/      # ProcessMonitor, managers, named-pipe server, host
+│   ├── ComputeWarden.Daemon/      # ProcessMonitor, LeaseSweeper, named-pipe server, host, logs
 │   ├── ComputeWarden.Client/      # IPC client library (used by adapter + future CLI)
-│   └── ComputeWarden.Mcp/         # cw-mcp stdio adapter + auto-spawn logic
+│   └── ComputeWarden.Mcp/         # stdio MCP adapter + auto-spawn logic
 └── tests/
     └── ComputeWarden.Tests/       # xUnit
 ```
@@ -160,9 +187,12 @@ Core has **no** OS or IPC dependencies (pure, unit-testable). Daemon/Client/Mcp 
 
 ## 13. Observability (spec §31)
 
-Counters kept in-memory, returned via a `debug`/status field: `total_acquisitions`,
+Counters kept in memory and returned by `computewarden_stats`: `total_acquisitions`,
 `failed_acquisitions`, `expired_reservations`, `current_reservations`,
-`current_process_blockers`, `uptime`. Lifecycle events logged (spec §30).
+`current_process_blockers`, `uptime_seconds`. Lifecycle events (acquire/release/expiry,
+process blockers appearing/clearing, config reloads) go to
+`%ProgramData%\ComputeWarden\logs\daemon.log`, capped at 5 MB with one backup (spec §30).
+An expiry is logged as "owner did not release", the main sign of an agent misusing leases.
 
 ## 14. Test plan (spec §36)
 
@@ -177,17 +207,7 @@ Counters kept in-memory, returned via a `debug`/status field: `total_acquisition
 - Core state/acquire logic tested with a fake clock + fake process provider (no real
   processes needed for the critical concurrency test).
 
-## 15. Build order (milestones)
-
-1. **Core**: models + state calc + ReservationManager with atomic acquire + fake clock.
-   → land the concurrency test here first (it's the whole ballgame).
-2. **Daemon**: real ProcessMonitor + lease sweep + named-pipe server.
-3. **Client**: IPC client library.
-4. **Mcp**: adapter tools + auto-spawn.
-5. **Config + logging + counters.**
-6. **End-to-end**: the spec §42 "definition of done" scenario as an integration test.
-
-## 16. Definition of done (spec §42)
+## 15. Definition of done (spec §42)
 
 Two agents, one machine: A acquires, B is refused and told A is the blocker, A renews then
 releases, B then acquires. If A crashes, its lease expires and the machine frees up. A

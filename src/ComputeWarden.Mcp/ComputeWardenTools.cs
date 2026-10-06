@@ -16,6 +16,18 @@ namespace ComputeWarden.Mcp;
 [McpServerToolType]
 public static class ComputeWardenTools
 {
+    private const string ResourcesHelp =
+        "Resources the work will saturate: any of cpu, gpu, ram, network, disk. Holds conflict " +
+        "only where they overlap, so e.g. cpu+network work can run alongside gpu+ram work. " +
+        "Omit for all (the whole machine). Declare every resource it really saturates — " +
+        "under-declaring lets conflicting work start.";
+
+    private const string OneCallHelp =
+        " Request ALL resources the job needs in this ONE call: a later acquire is a separate, " +
+        "unrelated reservation (holding one resource while waiting on another can stall agents " +
+        "on each other, and it can be refused by your own hold). If needs change, release and " +
+        "re-acquire the full set.";
+
     private static readonly JsonSerializerOptions Json = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
@@ -25,7 +37,8 @@ public static class ComputeWardenTools
     [McpServerTool(Name = "computewarden_status")]
     [Description("Returns the complete current machine coordination state: AVAILABLE, BUSY, or " +
                  "UNKNOWN, whether intensive work can run, and the list of blockers (detected " +
-                 "processes, reservations, manual holds) explaining why.")]
+                 "processes, reservations, manual holds) explaining why. busy_resources lists which " +
+                 "of cpu/gpu/ram/network/disk are currently held.")]
     public static Task<string> Status()
         => Run(async client =>
         {
@@ -34,6 +47,7 @@ public static class ComputeWardenTools
             {
                 state = StateString(s.State),
                 canRunIntensive = s.CanRunIntensive,
+                busyResources = Resources.ToNames(s.BusyResources),
                 blockers = Blockers(s.Blockers),
             };
         });
@@ -42,10 +56,11 @@ public static class ComputeWardenTools
     [Description("Convenience availability check. Informational ONLY — it does not reserve the " +
                  "machine and availability is not guaranteed after the call returns. Before " +
                  "beginning protected intensive work, call computewarden_acquire instead.")]
-    public static Task<string> CanRun()
+    public static Task<string> CanRun(
+        [Description(ResourcesHelp)] string[]? resources = null)
         => Run(async client =>
         {
-            var canRun = await client.CanRunAsync();
+            var canRun = await client.CanRunAsync(resources);
             return new
             {
                 canRun,
@@ -54,23 +69,25 @@ public static class ComputeWardenTools
         });
 
     [McpServerTool(Name = "computewarden_acquire")]
-    [Description("Atomically checks all blockers and, if the machine is AVAILABLE, reserves it for " +
-                 "intensive work. Returns the reservation (with expiry) on success, or the current " +
-                 "blockers on failure. Save reservation_id; renew it during long work and release it " +
-                 "when done (use finally/cleanup semantics).")]
+    [Description("Atomically checks blockers on the requested resources and, if none are held, " +
+                 "reserves them for intensive work. Returns the reservation (with expiry) on success, " +
+                 "or the conflicting blockers on failure. Save reservation_id; renew it during long work and release it " +
+                 "when done (use finally/cleanup semantics)." + OneCallHelp)]
     public static Task<string> Acquire(
         [Description("Who is acquiring, e.g. 'Claude Code'.")] string owner,
         [Description("What the intensive work is, e.g. 'Indexing repository'.")] string description,
         [Description("Requested lease seconds; clamped to server bounds. Omit for the server default.")] int? leaseSeconds = null,
-        [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null)
+        [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null,
+        [Description(ResourcesHelp)] string[]? resources = null)
         => Run(async client =>
         {
-            var r = await client.AcquireAsync(owner, description, leaseSeconds, metadata);
+            var r = await client.AcquireAsync(owner, description, leaseSeconds, metadata, resources);
             var now = DateTimeOffset.UtcNow;
             return new
             {
                 acquired = r.Acquired,
                 reservationId = r.ReservationId,
+                resources = r.Acquired ? Resources.ToNames(r.Resources) : null,
                 expiresAt = r.ExpiresAt,
                 leaseRemainingSeconds = Remaining(r.ExpiresAt, now),
                 machineState = StateString(r.MachineState),
@@ -112,10 +129,11 @@ public static class ComputeWardenTools
     [Description("Creates a manual blocker marking the machine BUSY for work ComputeWarden cannot " +
                  "auto-detect (e.g. disk maintenance). May be disabled by server configuration.")]
     public static Task<string> SetManualBusy(
-        [Description("Human-readable reason the machine is manually held busy.")] string reason)
+        [Description("Human-readable reason the machine is manually held busy.")] string reason,
+        [Description("Resources to hold (cpu, gpu, ram, network, disk). Omit for all.")] string[]? resources = null)
         => Run(async client =>
         {
-            var b = await client.SetManualBusyAsync(reason);
+            var b = await client.SetManualBusyAsync(reason, resources);
             return new { ok = true, blocker = BlockerDto(b, DateTimeOffset.UtcNow) };
         });
 
@@ -161,17 +179,32 @@ public static class ComputeWardenTools
         {
             return JsonSerializer.Serialize(new { error = ex.Message }, Json);
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
+            // Connect timeouts carry no useful message; a response timeout explains itself.
             return JsonSerializer.Serialize(new
             {
-                error = "Could not reach the ComputeWarden daemon",
-                hint = "The daemon may still be starting; retry shortly.",
+                error = ex.Message.Contains("did not respond") ? ex.Message : "Could not reach the ComputeWarden daemon",
+                hint = "Retry shortly; if it persists, check %ProgramData%\\ComputeWarden\\logs\\daemon.log.",
             }, Json);
         }
         catch (IOException ex)
         {
             return JsonSerializer.Serialize(new { error = $"IPC error: {ex.Message}" }, Json);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                error = "Access denied to the ComputeWarden pipe",
+                hint = "The daemon belongs to another user or an elevated session; stop it so a normal session can start its own.",
+            }, Json);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Last resort: keep the "errors are JSON" contract instead of surfacing the SDK's
+            // opaque "An error occurred invoking ..." text.
+            return JsonSerializer.Serialize(new { error = $"Unexpected error: {ex.Message}" }, Json);
         }
     }
 
@@ -188,6 +221,7 @@ public static class ComputeWardenTools
     {
         type = TypeString(b.Type),
         description = b.Description,
+        resources = Resources.ToNames(b.Resources),
         owner = b.Owner,
         leaseRemainingSeconds = Remaining(b.ExpiresAt, now),
         metadata = b.Metadata is { Count: > 0 } ? b.Metadata : null,

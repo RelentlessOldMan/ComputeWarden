@@ -41,17 +41,22 @@ public sealed class ProcessMonitor : IAsyncDisposable
         {
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
-                _provider.Refresh();
-                ReconcileForLogging();
+                // One bad poll must not end polling: a dead loop would freeze the last snapshot
+                // and keep reporting it as confident, i.e. silently wrong state.
+                try
+                {
+                    _provider.Refresh();
+                    ReconcileForLogging();
+                }
+                catch (Exception ex)
+                {
+                    _log.Error("Process poll failed; will retry next interval", ex);
+                }
             }
         }
         catch (OperationCanceledException)
         {
             // normal shutdown
-        }
-        catch (Exception ex)
-        {
-            _log.Error("Process monitor loop terminated unexpectedly", ex);
         }
     }
 

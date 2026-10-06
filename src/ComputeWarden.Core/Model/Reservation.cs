@@ -15,6 +15,7 @@ public sealed class Reservation
     public DateTimeOffset LastRenewedAt { get; internal set; }
     public DateTimeOffset ExpiresAt { get; internal set; }
     public IReadOnlyDictionary<string, string> Metadata { get; }
+    public ResourceSet Resources { get; }
 
     public Reservation(
         string id,
@@ -22,7 +23,8 @@ public sealed class Reservation
         string description,
         DateTimeOffset createdAt,
         DateTimeOffset expiresAt,
-        IReadOnlyDictionary<string, string>? metadata = null)
+        IReadOnlyDictionary<string, string>? metadata = null,
+        ResourceSet resources = ResourceSet.All)
     {
         Id = id;
         Owner = owner;
@@ -31,6 +33,7 @@ public sealed class Reservation
         LastRenewedAt = createdAt;
         ExpiresAt = expiresAt;
         Metadata = metadata ?? new Dictionary<string, string>();
+        Resources = resources;
     }
 
     public bool IsExpiredAt(DateTimeOffset now) => ExpiresAt <= now;
@@ -44,5 +47,6 @@ public sealed class Reservation
         Owner: Owner,
         CreatedAt: CreatedAt,
         ExpiresAt: ExpiresAt,
-        Metadata: Metadata);
+        Metadata: Metadata,
+        Resources: Resources);
 }

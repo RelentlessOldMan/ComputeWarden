@@ -54,7 +54,7 @@ public sealed class RequestDispatcher
             return request.Op.ToUpperInvariant() switch
             {
                 IpcOps.Status => HandleStatus(),
-                IpcOps.CanRun => HandleCanRun(),
+                IpcOps.CanRun => HandleCanRun(request),
                 IpcOps.Acquire => HandleAcquire(request),
                 IpcOps.Renew => HandleRenew(request),
                 IpcOps.Release => HandleRelease(request),
@@ -84,19 +84,23 @@ public sealed class RequestDispatcher
         {
             o["state"] = StateString(status.State);
             o["canRunIntensive"] = status.CanRunIntensive;
+            o["busyResources"] = ResourceArray(status.BusyResources);
             o["blockers"] = Blockers(status.Blockers);
         });
     }
 
-    private string HandleCanRun()
-        => Ok(o => o["canRun"] = _warden.CanRun());
+    private string HandleCanRun(IpcRequest r)
+        => Ok(o => o["canRun"] = _warden.CanRun(Resources.Parse(r.Resources)));
 
     private string HandleAcquire(IpcRequest r)
     {
-        var result = _warden.Acquire(r.Owner ?? string.Empty, r.Description ?? string.Empty, r.LeaseSeconds, r.Metadata);
+        var result = _warden.Acquire(
+            r.Owner ?? string.Empty, r.Description ?? string.Empty, r.LeaseSeconds, r.Metadata,
+            Resources.Parse(r.Resources));
         return Ok(o =>
         {
             o["acquired"] = result.Acquired;
+            if (result.Acquired) o["resources"] = ResourceArray(result.Resources);
             o["reservationId"] = result.ReservationId;
             o["expiresAt"] = Iso(result.ExpiresAt);
             o["machineState"] = StateString(result.MachineState);
@@ -133,7 +137,7 @@ public sealed class RequestDispatcher
         if (string.IsNullOrWhiteSpace(r.Reason))
             return Error("'reason' is required");
 
-        var blocker = _warden.SetManualBusy(r.Reason);
+        var blocker = _warden.SetManualBusy(r.Reason, Resources.Parse(r.Resources));
         return Ok(o => o["blocker"] = BlockerJson(blocker));
     }
 
@@ -193,6 +197,7 @@ public sealed class RequestDispatcher
             ["owner"] = b.Owner,
             ["createdAt"] = Iso(b.CreatedAt),
             ["expiresAt"] = Iso(b.ExpiresAt),
+            ["resources"] = ResourceArray(b.Resources),
         };
         if (b.Metadata is { Count: > 0 })
         {
@@ -202,6 +207,14 @@ public sealed class RequestDispatcher
             o["metadata"] = meta;
         }
         return o;
+    }
+
+    private static JsonArray ResourceArray(ResourceSet set)
+    {
+        var array = new JsonArray();
+        foreach (var name in Resources.ToNames(set))
+            array.Add(name);
+        return array;
     }
 
     private static string? Iso(DateTimeOffset? value) => value?.ToString("o");

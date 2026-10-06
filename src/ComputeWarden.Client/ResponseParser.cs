@@ -33,7 +33,8 @@ internal static class ResponseParser
     public static StatusResult Status(JsonElement root) => new(
         State: State(root, "state"),
         CanRunIntensive: Bool(root, "canRunIntensive"),
-        Blockers: Blockers(root));
+        Blockers: Blockers(root),
+        BusyResources: ResourcesOpt(root, "busyResources") ?? ResourceSet.None);
 
     public static AcquireResult Acquire(JsonElement root) => new(
         Acquired: Bool(root, "acquired"),
@@ -41,7 +42,8 @@ internal static class ResponseParser
         ExpiresAt: DateOpt(root, "expiresAt"),
         MachineState: State(root, "machineState"),
         Reason: String(root, "reason"),
-        Blockers: Blockers(root));
+        Blockers: Blockers(root),
+        Resources: ResourcesOpt(root, "resources") ?? ResourceSet.None);
 
     public static RenewResult Renew(JsonElement root) => new(
         Renewed: Bool(root, "renewed"),
@@ -68,7 +70,9 @@ internal static class ResponseParser
         Owner: String(e, "owner"),
         CreatedAt: DateOpt(e, "createdAt"),
         ExpiresAt: DateOpt(e, "expiresAt"),
-        Metadata: Metadata(e));
+        Metadata: Metadata(e),
+        // A daemon predating resources sends none: its blockers hold the whole machine.
+        Resources: ResourcesOpt(e, "resources") ?? ResourceSet.All);
 
     private static IReadOnlyList<Blocker> Blockers(JsonElement root)
     {
@@ -88,6 +92,20 @@ internal static class ResponseParser
         foreach (var prop in m.EnumerateObject())
             dict[prop.Name] = prop.Value.GetString() ?? string.Empty;
         return dict;
+    }
+
+    private static ResourceSet? ResourcesOpt(JsonElement e, string name)
+    {
+        if (!e.TryGetProperty(name, out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return null;
+        var set = ResourceSet.None;
+        foreach (var item in arr.EnumerateArray())
+        {
+            // Tolerate names from a newer daemon that this client doesn't know.
+            try { set |= Resources.Parse(new[] { item.GetString() ?? string.Empty }); }
+            catch (ArgumentException) { }
+        }
+        return set;
     }
 
     private static bool Bool(JsonElement e, string name)
