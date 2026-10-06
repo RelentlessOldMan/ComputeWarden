@@ -154,9 +154,11 @@ that session, or an elevated prompt) and let a normal session start its own.
 **"daemon is not running and could not be launched":** `ComputeWarden.Daemon.exe` isn't next
 to `ComputeWarden.Mcp.exe`. Put it there, or set `COMPUTEWARDEN_DAEMON` to its full path.
 
-**Updating:** each open agent session keeps `ComputeWarden.Mcp.exe` locked. Close all
-sessions, stop the daemon, replace both exes, then restart your sessions. Tool parameter
-changes are only picked up by new sessions.
+**Updating:** each open agent session keeps `ComputeWarden.Mcp.exe` locked, so it can't be
+overwritten, but Windows does allow renaming it. Stop the daemon, rename the old adapter
+aside (e.g. to `ComputeWarden.Mcp.exe.old`), copy both new exes in, and delete the old one
+later. `./publish.ps1 -Install` does all of this when building from source. Open sessions
+keep using the old adapter until they restart.
 
 ## Limitations
 
