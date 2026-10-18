@@ -354,6 +354,68 @@ public class SharingIpcTests
     }
 
     [Fact]
+    public async Task Cw_wait_returns_when_the_claim_may_start()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        var holder = await client.AcquireAsync(new ClaimRequest("H", "render", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        var queued = await client.AcquireAsync(new ClaimRequest("Q", "train", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        Assert.Equal(Grant.Queued, queued.Advice!.Grant);
+        var output = new StringWriter();
+        var errors = new StringWriter();
+
+        var waiting = Cli.Cli.RunAsync(new[] { "wait", queued.ReservationId! }, client, output, errors);
+        await Task.Delay(300);
+        Assert.False(waiting.IsCompleted);
+        await client.ReleaseAsync(holder.ReservationId!);
+
+        Assert.Equal(0, await waiting.Within());
+        Assert.Contains("Your turn: full.", output.ToString());
+        Assert.Contains("or the slot passes to the next in line", output.ToString());
+
+        // cw wait only checked the ticket in; the owner's own renew starts the claim with its real lease.
+        Assert.Equal(Grant.Queued, host.Warden.LastGrant(queued.ReservationId!));
+        var started = await client.RenewAsync(queued.ReservationId!);
+        Assert.Equal(Grant.Full, host.Warden.LastGrant(queued.ReservationId!));
+        Assert.True(started.ExpiresAt > DateTimeOffset.UtcNow.AddSeconds(200), $"expires {started.ExpiresAt:o}");
+    }
+
+    [Fact]
+    public async Task Cw_wait_gives_up_after_max_and_reports_a_lost_claim()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        await client.AcquireAsync(new ClaimRequest("H", "render", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        var queued = await client.AcquireAsync(new ClaimRequest("Q", "train", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        var output = new StringWriter();
+        var errors = new StringWriter();
+
+        Assert.Equal(Cli.Cli.StillQueued, await Cli.Cli.RunAsync(new[] { "wait", queued.ReservationId!, "--max", "1s" }, client, output, errors).Within());
+        Assert.Contains("Still queued after 1s", output.ToString());
+        Assert.Equal(Grant.Queued, (await client.RenewAsync(queued.ReservationId!)).Advice!.Grant); // still in line
+
+        Assert.Equal(1, await Cli.Cli.RunAsync(new[] { "wait", "no-such-claim" }, client, output, errors).Within());
+        Assert.Contains("Claim gone", errors.ToString());
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "wait" }, client, output, errors));
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "wait", "x", "--max", "soon" }, client, output, errors));
+    }
+
+    [Fact]
+    public async Task Cw_wait_retries_an_unreachable_daemon_then_says_so()
+    {
+        var client = new WardenClient("ComputeWarden-Test-" + Guid.NewGuid().ToString("N"), connectTimeoutMs: 50);
+        var output = new StringWriter();
+        var errors = new StringWriter();
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+
+        Assert.Equal(Cli.Cli.Unreachable, await Cli.Cli.RunAsync(new[] { "wait", "abc" }, client, output, errors).Within());
+
+        Assert.True(timer.Elapsed >= TimeSpan.FromSeconds(6), $"gave up after {timer.Elapsed}"); // backed off 1+2+4 s
+        Assert.Contains("run cw wait again", errors.ToString());
+        Assert.DoesNotContain("Claim gone", errors.ToString());
+    }
+
+    [Fact]
     public async Task Cw_starts_the_daemon_only_when_it_needs_one()
     {
         var launches = 0;

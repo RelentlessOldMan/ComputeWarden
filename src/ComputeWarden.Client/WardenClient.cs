@@ -103,7 +103,9 @@ public sealed class WardenClient
     /// Wait (up to 60s) for the claim's grant to change before answering, e.g. for a game to
     /// exit. Lets a throttled or queued agent react at once without busy polling.
     /// </param>
-    public async Task<RenewResult> RenewAsync(string reservationId, int? leaseSeconds = null, int? waitSeconds = null, CancellationToken ct = default)
+    /// <param name="probe">Check in without starting the claim: for a background waiter, not the owner.</param>
+    public async Task<RenewResult> RenewAsync(string reservationId, int? leaseSeconds = null, int? waitSeconds = null,
+        CancellationToken ct = default, bool probe = false)
     {
         var request = new IpcRequest
         {
@@ -111,6 +113,7 @@ public sealed class WardenClient
             ReservationId = reservationId,
             LeaseSeconds = leaseSeconds,
             WaitSeconds = waitSeconds is > 0 ? Math.Min(waitSeconds.Value, RequestDispatcher.MaxWaitSeconds) : null,
+            Probe = probe ? true : null,
         };
         var wait = request.WaitSeconds is int w ? TimeSpan.FromSeconds(w) : TimeSpan.Zero;
         return ResponseParser.Renew(await SendAsync(request, ct, _responseTimeout + wait));

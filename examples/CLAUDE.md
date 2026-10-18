@@ -33,6 +33,6 @@ saturate), but they shouldn't restate or contradict the policy below.
 - **Follow `advice.grant`:**
   - `full`: run normally.
   - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
-  - `queued`: don't start. Call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
+  - `queued`: don't start. Run `cw wait <reservation_id>` in the background and do other work meanwhile. When it exits 0, renew and start right away: the slot passes on if you don't renew within the time it prints. Exit 3 (still queued) or 4 (daemon unreachable) means run it again; exit 1 means the claim is gone, so acquire again. If you can't run background commands, call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
 - **Long work:** `estimateSeconds` sets the lease, so err high. Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
 - **User only:** set `userPriority` (skip the line), call `computewarden_set_mode`, or set a manual hold only when the user explicitly says so.

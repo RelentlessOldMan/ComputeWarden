@@ -180,7 +180,7 @@ public sealed class RequestDispatcher
 
     private string HandleRenew(IpcRequest r)
     {
-        var result = _warden.Renew(r.ReservationId ?? string.Empty, r.LeaseSeconds);
+        var result = _warden.Renew(r.ReservationId ?? string.Empty, r.LeaseSeconds, r.Probe == true);
         return Ok(o =>
         {
             o["renewed"] = result.Renewed;

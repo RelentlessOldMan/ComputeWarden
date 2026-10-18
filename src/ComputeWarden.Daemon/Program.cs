@@ -13,9 +13,7 @@ try
     var logPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "ComputeWarden", "logs", "daemon.log");
-    log = new CompositeLog(
-        new ConsoleLog(loaded.Config.LogLevel),
-        new FileLog(logPath, loaded.Config.LogLevel));
+    log = new CompositeLog(new ConsoleLog(loaded.Config.LogLevel), new FileLog(logPath, loaded.Config.LogLevel));
 }
 catch
 {
@@ -56,13 +54,19 @@ if (!owns)
     return 0;
 }
 
+// Optional live panel in RelentlessMonitor, set up only by the daemon that serves the pipe.
+// Without its client DLL this is disabled and does nothing.
+using var monitor = MonitorBridge.Create(MonitorPublisher.App, MonitorPublisher.Layout);
+if (monitor.Enabled) log = new CompositeLog(log, new MonitorLog(monitor));
+log.Info($"RelentlessMonitor: {monitor.Status}");
+
 // NOTE: we deliberately do NOT call ReleaseMutex(). After `await`, the continuation runs on a
 // threadpool thread, and Mutex.ReleaseMutex() throws when called from a thread other than the one
 // that acquired it. Disposing the Mutex (via `using`) on process exit releases the OS handle from
 // any thread; if it ends up "abandoned", the next daemon start handles AbandonedMutexException above.
 try
 {
-    await using var host = new WardenHost(loaded.Config, log, configPath: ConfigLoader.ResolvePath());
+    await using var host = new WardenHost(loaded.Config, log, configPath: ConfigLoader.ResolvePath(), monitor: monitor);
     host.Start();
 
     using var shutdown = new CancellationTokenSource();

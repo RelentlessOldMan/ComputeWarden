@@ -305,7 +305,16 @@ acquire(owner, description, resources, kind: "shared" | "exclusive",
 - A queued ticket's renew returns its position, or its promotion to `full`. Tickets must
   check in every `queue_checkin_seconds` (default 120), or they drop out of line, so a
   crashed agent can't stall the queue. The ticket's lease is the check-in window until it
-  starts; then it gets its real lease.
+  starts. A renew marked `probe` (what `cw wait` sends) checks the ticket in and reports its
+  advice, but never starts the claim, even when its turn has come: it stays a ticket with the
+  check-in window until its owner renews, and that renew starts it with its real lease. So an
+  owner that is woken and never starts drops out as a ticket within one window, and the slot
+  passes to the next in line. Until then, waiters behind it count its full estimate.
+- **`cw wait <id>`:** long-polls a queued claim's probe renew in a loop and exits when it may
+  start (0), when the claim is gone (1), after `--max` (default 1h) still queued (3), or when
+  the daemon stays unreachable after a few retries (4). An agent runs
+  it as a background command, so it does other work and is woken on exit instead of polling.
+  The cap means a waiter whose session died can't keep a dead ticket in line for ever.
 - **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
   grant differs from the last one it was told, or the wait runs out. The claim is kept alive
   for the wait (plus 15 s), so a short lease or check-in window can't run out mid-wait. The

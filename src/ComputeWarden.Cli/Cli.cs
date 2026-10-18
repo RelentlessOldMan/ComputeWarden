@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using ComputeWarden.Client;
 using ComputeWarden.Core;
+using ComputeWarden.Core.Ipc;
 using ComputeWarden.Core.Model;
 
 namespace ComputeWarden.Cli;
@@ -9,6 +10,7 @@ namespace ComputeWarden.Cli;
 /// <summary>
 /// <c>cw</c>: the user's own controls. Shows what's running and sets the user mode
 /// ("y'all go slow and steady", "full bore allowed"), which agents only do on the user's word.
+/// Also <c>cw wait</c>, which agents run in the background to hear when a queued claim may start.
 /// </summary>
 internal static class Cli
 {
@@ -24,6 +26,12 @@ internal static class Cli
                                        cw mode open
                                        cw mode hold 30m "recording a video"
                                        cw mode auto
+          cw wait <reservationId> [--max <duration>]
+                                     Wait until a queued claim may start, keeping it alive in line,
+                                     then print its advice. For agents: run it in the background.
+                                     Gives up after --max (default 1h). Exit codes: 0 your turn,
+                                     3 still queued (run it again), 1 claim gone (acquire again),
+                                     4 daemon unreachable (run it again).
         Modes:
           auto     Normal rules: games limit everyone; agents share by the line.
           steady   Everyone runs throttled (slow and steady). Nobody goes full.
@@ -67,6 +75,9 @@ internal static class Cli
                     stdout.WriteLine($"Mode set: {Describe(set, DateTimeOffset.UtcNow)}");
                     return 0;
 
+                case "wait":
+                    return await WaitAsync(args.Skip(1).ToArray(), client, stdout, stderr);
+
                 case "help" or "-h" or "--help" or "/?":
                     stdout.WriteLine(Usage);
                     return 0;
@@ -96,6 +107,89 @@ internal static class Cli
         {
             stderr.WriteLine($"cw failed: {ex.Message}");
             return 1;
+        }
+    }
+
+    public const int StillQueued = 3;
+    public const int Unreachable = 4;
+    private const int WaitRetries = 3;
+
+    /// <summary>
+    /// Long-polls a queued claim until it may start. Each poll renews the ticket, so the claim
+    /// keeps its place for as long as this runs; <c>--max</c> bounds that, so a waiter whose
+    /// session died can't keep a dead claim in line forever.
+    /// </summary>
+    private static async Task<int> WaitAsync(string[] args, WardenClient client, TextWriter stdout, TextWriter stderr)
+    {
+        string? id = null;
+        var maxSeconds = 3600;
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] is "--max")
+            {
+                if (i + 1 >= args.Length || !TryParseDuration(args[++i], out maxSeconds))
+                {
+                    stderr.WriteLine("--max needs a duration, e.g. 30m or 2h (at most 7d).");
+                    return 2;
+                }
+            }
+            else if (id is null) id = args[i];
+            else { stderr.WriteLine($"Unexpected '{args[i]}'. Usage: cw wait <reservationId> [--max <duration>]"); return 2; }
+        }
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            stderr.WriteLine("Usage: cw wait <reservationId> [--max <duration>]");
+            return 2;
+        }
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(maxSeconds);
+        var failures = 0;
+        while (true)
+        {
+            var left = deadline - DateTimeOffset.UtcNow;
+            var wait = (int)Math.Clamp(Math.Ceiling(left.TotalSeconds), 0, RequestDispatcher.MaxWaitSeconds);
+            RenewResult renewed;
+            try
+            {
+                // A probe: it keeps the ticket checked in but leaves starting the claim to its owner.
+                renewed = await client.RenewAsync(id, waitSeconds: wait > 0 ? wait : null, probe: true);
+                failures = 0;
+            }
+            catch (Exception ex) when (ex is TimeoutException or IOException)
+            {
+                // A busy pipe or a slow reply isn't a lost claim: retry, since the ticket outlives a few seconds.
+                if (++failures > WaitRetries)
+                {
+                    stderr.WriteLine($"Could not reach the ComputeWarden daemon ({ex.Message}). The claim may still be in line: run cw wait again.");
+                    return Unreachable;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(1 << (failures - 1)));
+                continue;
+            }
+            if (!renewed.Renewed)
+            {
+                stderr.WriteLine($"Claim gone ({renewed.Reason ?? "no reason given"}): acquire again.");
+                return 1;
+            }
+
+            var advice = renewed.Advice;
+            if (advice is null || advice.Grant != Grant.Queued)
+            {
+                var grant = advice is null ? "full" : Warden.GrantName(advice.Grant);
+                stdout.WriteLine($"Your turn: {grant}.");
+                if (advice?.Reason is { } why) stdout.WriteLine($"Because: {why}");
+                if (advice?.How is { } how) stdout.WriteLine($"How: {how}");
+                if (renewed.ExpiresAt is { } expires)
+                    stdout.WriteLine($"Start now and renew within {Span(Math.Max(0, (int)(expires - DateTimeOffset.UtcNow).TotalSeconds))}, " +
+                                     "or the slot passes to the next in line.");
+                return 0;
+            }
+
+            if (wait == 0)
+            {
+                stdout.WriteLine($"Still queued after {Span(maxSeconds)}{(advice.Reason is { } r ? $" ({r})" : "")}. Run cw wait again to keep waiting.");
+                return StillQueued;
+            }
         }
     }
 

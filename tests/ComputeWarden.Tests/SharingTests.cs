@@ -342,6 +342,90 @@ public class SharingTests
         Assert.Equal(rig.Clock.UtcNow.AddSeconds(530), rig.Warden.Renew(r.ReservationId!).ExpiresAt);
     }
 
+    [Fact]
+    public void Probe_hears_its_turn_without_starting_the_claim()
+    {
+        var rig = new Rig(new SharingOptions { QueueCheckinSeconds = 30 });
+        var a = rig.Exclusive("A");
+        var b = rig.Exclusive("B", whenBusy: WhenBusy.Wait, estimate: 400);
+        rig.Warden.Release(a.ReservationId!);
+
+        // The background waiter's renew: told "go", but the claim is still a ticket with its window.
+        var woken = rig.Warden.Renew(b.ReservationId!, probe: true);
+        Assert.Equal(Grant.Full, woken.Advice!.Grant);
+        Assert.Equal(rig.Clock.UtcNow.AddSeconds(30), woken.ExpiresAt);
+        Assert.Equal(Grant.Queued, rig.Warden.LastGrant(b.ReservationId!));
+
+        // The owner's renew starts it, with the full lease from its estimate (400 * 1.25 + 30).
+        rig.Clock.AdvanceSeconds(10);
+        Assert.Equal(rig.Clock.UtcNow.AddSeconds(530), rig.Warden.Renew(b.ReservationId!).ExpiresAt);
+        Assert.Equal(Grant.Full, rig.Warden.LastGrant(b.ReservationId!));
+    }
+
+    [Fact]
+    public void Owner_that_hears_its_turn_itself_gets_the_full_lease_at_once()
+    {
+        var rig = new Rig(new SharingOptions { QueueCheckinSeconds = 30 });
+        var a = rig.Exclusive("A");
+        var b = rig.Exclusive("B", whenBusy: WhenBusy.Wait, estimate: 400);
+        rig.Warden.Release(a.ReservationId!);
+
+        Assert.Equal(rig.Clock.UtcNow.AddSeconds(530), rig.Warden.Renew(b.ReservationId!).ExpiresAt);
+    }
+
+    [Fact]
+    public void Probe_on_a_running_claim_is_an_ordinary_renew()
+    {
+        var rig = new Rig();
+        var r = rig.Shared(estimate: 400);
+        rig.Clock.AdvanceSeconds(100);
+
+        Assert.Equal(rig.Clock.UtcNow.AddSeconds(530), rig.Warden.Renew(r.ReservationId!, probe: true).ExpiresAt);
+    }
+
+    [Fact]
+    public void Woken_claim_that_never_starts_drops_out_as_a_ticket_and_passes_the_slot_on()
+    {
+        var rig = new Rig(new SharingOptions { QueueCheckinSeconds = 30 });
+        var a = rig.Exclusive("A");
+        var b = rig.Exclusive("B", whenBusy: WhenBusy.Wait, estimate: 3000);
+        var c = rig.Exclusive("C", whenBusy: WhenBusy.Wait);
+        rig.Warden.Release(a.ReservationId!);
+        Assert.Equal(Grant.Full, rig.Warden.Renew(b.ReservationId!, probe: true).Advice!.Grant); // B's waiter hears "go"...
+
+        // ...and while B hasn't started, C is told B's whole estimate, not just B's short window.
+        var waiting = rig.Warden.Renew(c.ReservationId!).Advice!;
+        Assert.Equal(Grant.Queued, waiting.Grant);
+        Assert.True(waiting.Queue!.EstWaitSeconds >= 3000, $"est {waiting.Queue.EstWaitSeconds}");
+
+        rig.Clock.AdvanceSeconds(20);
+        Assert.Equal(Grant.Queued, rig.Renew(c));
+        rig.Clock.AdvanceSeconds(20); // B's owner never renewed to start
+
+        Assert.False(rig.Warden.Renew(b.ReservationId!).Renewed);
+        Assert.True(rig.Log.Contains("Queue ticket dropped (no check-in): B"));
+        Assert.Equal(0, rig.Warden.GetStats().ExpiredReservations);
+        Assert.Equal(Grant.Full, rig.Renew(c));
+    }
+
+    [Fact]
+    public void Waiters_on_separate_resources_wake_together_but_not_on_the_same_one()
+    {
+        var rig = new Rig();
+        var holder = rig.Exclusive("H", ResourceSet.Gpu | ResourceSet.Disk);
+        var gpu1 = rig.Exclusive("G1", ResourceSet.Gpu, WhenBusy.Wait);
+        var gpu2 = rig.Exclusive("G2", ResourceSet.Gpu, WhenBusy.Wait);
+        var disk = rig.Exclusive("D", ResourceSet.Disk, WhenBusy.Wait);
+        Assert.Equal(Grant.Queued, rig.Renew(gpu1));
+        Assert.Equal(Grant.Queued, rig.Renew(disk));
+
+        rig.Warden.Release(holder.ReservationId!);
+
+        Assert.Equal(Grant.Full, rig.Warden.PeekGrant(gpu1.ReservationId!));
+        Assert.Equal(Grant.Full, rig.Warden.PeekGrant(disk.ReservationId!));
+        Assert.Equal(Grant.Queued, rig.Warden.PeekGrant(gpu2.ReservationId!));
+    }
+
     // ---- User mode ------------------------------------------------------
 
     [Fact]

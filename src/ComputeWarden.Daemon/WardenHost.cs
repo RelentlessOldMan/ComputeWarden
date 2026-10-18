@@ -9,7 +9,8 @@ namespace ComputeWarden.Daemon;
 
 /// <summary>
 /// Composition root: wires the warden, providers, process monitor, lease sweeper, and pipe
-/// server together from a <see cref="WardenConfig"/>, and manages their lifetime.
+/// server together from a <see cref="WardenConfig"/>, and manages their lifetime. Given an enabled
+/// <see cref="IMonitorSink"/>, it also publishes a live panel to RelentlessMonitor.
 ///
 /// If a config file path is supplied, the host watches it and hot-reloads the process rules,
 /// debounce, and sharing settings on change — so editing the exe list takes effect without a restart. (Lease bounds,
@@ -21,6 +22,7 @@ public sealed class WardenHost : IAsyncDisposable
     private readonly LeaseSweeper _sweeper;
     private readonly NamedPipeServer _pipeServer;
     private readonly ProcessBlockerProvider _processProvider;
+    private readonly MonitorPublisher? _publisher;
     private readonly ILog _log;
     private readonly string? _configPath;
 
@@ -36,7 +38,8 @@ public sealed class WardenHost : IAsyncDisposable
         IProcessLister? processLister = null,
         IClock? clock = null,
         string? pipeName = null,
-        string? configPath = null)
+        string? configPath = null,
+        IMonitorSink? monitor = null)
     {
         _log = log;
         _configPath = configPath;
@@ -54,6 +57,7 @@ public sealed class WardenHost : IAsyncDisposable
         _monitor = new ProcessMonitor(_processProvider, config.ProcessDetection.PollIntervalMs, log);
         _sweeper = new LeaseSweeper(Warden, TimeSpan.FromSeconds(5), log);
         _pipeServer = new NamedPipeServer(pipeName ?? IpcProtocol.PipeName, dispatcher, log);
+        if (monitor is { Enabled: true }) _publisher = new MonitorPublisher(monitor, Warden, dispatcher, clock);
     }
 
     public void Start()
@@ -63,6 +67,7 @@ public sealed class WardenHost : IAsyncDisposable
         _sweeper.Start();
         _pipeServer.Start();
         StartConfigWatcher();
+        _publisher?.Start();
         _log.Info("ComputeWarden daemon started");
     }
 
@@ -150,6 +155,7 @@ public sealed class WardenHost : IAsyncDisposable
             _configWatcher.Dispose();
         }
         lock (_reloadGate) { _reloadDebounce?.Dispose(); _reloadDebounce = null; }
+        if (_publisher is not null) await _publisher.DisposeAsync();
         await _pipeServer.DisposeAsync();
         await _sweeper.DisposeAsync();
         await _monitor.DisposeAsync();

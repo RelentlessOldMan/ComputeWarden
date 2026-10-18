@@ -62,6 +62,10 @@ yes or no:
   - A queued claim becomes full when its turn comes.
 - **Waiting is cheap.** `renew` with `waitSeconds` (max 60) holds the answer until the advice
   changes. Queue tickets must check in at least every 2 minutes, or they drop out of line.
+  Agents with background shells run `cw wait <reservation_id>` instead: it keeps the ticket
+  alive, exits when the claim may start, and leaves the agent free to do other work meanwhile.
+  `cw wait` only checks the ticket in: the claim starts when its owner renews. A woken claim
+  has `queue_checkin_seconds` (default 2 minutes) to do that, or its slot passes to the next in line.
 - **The line is first come, first served.** At most 3 throttled claims are allowed on each
   contended resource; later ones queue, and a freed slot goes to the earliest of them. Work
   already running is never told to stop, only to shrink. The GPU can't be shared, so GPU
@@ -154,7 +158,7 @@ Each command costs two small tool calls (acquire and release):
 - **Follow `advice.grant`:**
   - `full`: run normally.
   - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
-  - `queued`: don't start. Call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
+  - `queued`: don't start. Run `cw wait <reservation_id>` in the background and do other work meanwhile. When it exits 0, renew and start right away: the slot passes on if you don't renew within the time it prints. Exit 3 (still queued) or 4 (daemon unreachable) means run it again; exit 1 means the claim is gone, so acquire again. If you can't run background commands, call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
 - **Long work:** `estimateSeconds` sets the lease, so err high. Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
 - **User only:** set `userPriority` (skip the line), call `computewarden_set_mode`, or set a manual hold only when the user explicitly says so.
 ```
@@ -221,6 +225,27 @@ sharing:
 ```
 
 [`config.example.yaml`](config.example.yaml) documents every setting.
+
+## Live panel (optional)
+
+If [RelentlessMonitor](https://github.com/RelentlessOldMan/RelentlessMonitor) is installed, the
+daemon shows up in it as a ComputeWarden panel with:
+
+- the machine state;
+- the mode;
+- busy resources;
+- running games and other blockers;
+- every claim with its grant and lease;
+- a feed of the daemon's log (claims, releases, promotions, expiries).
+
+`rmon request ComputeWarden.status` returns the same JSON as `computewarden_status`.
+
+There is nothing to configure, and ComputeWarden takes no dependency on RelentlessMonitor. The
+daemon looks for `RelentlessMonitor.Client.dll` when it starts. It checks `%RELENTLESSMONITOR_CLIENT%`
+first, then the folder next to the daemon, then `%LOCALAPPDATA%\RelentlessMonitor\client`
+(RelentlessMonitor's `publish.ps1 -InstallClient` puts it there). If the DLL isn't found, the panel is
+off and the daemon runs exactly the same. The log's startup lines say which happened. After
+installing the client, restart the daemon to pick it up.
 
 ## Troubleshooting
 

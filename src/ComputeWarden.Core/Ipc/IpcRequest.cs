@@ -56,6 +56,9 @@ public sealed class IpcRequest
     /// <summary>Renew: wait up to this long for the claim's grant to change before answering.</summary>
     public int? WaitSeconds { get; set; }
 
+    /// <summary>Renew: check in without starting the claim (a background waiter, not the owner).</summary>
+    public bool? Probe { get; set; }
+
     /// <summary>Set mode: auto, steady, open, or hold.</summary>
     public string? Mode { get; set; }
 

@@ -298,7 +298,8 @@ public static class ComputeWardenTools
         {
             Grant.Full => "Run at full size. Renew before the lease runs out; renew returns new advice if a game starts.",
             Grant.Throttled => "Start now, but small: follow throttle/how. Between steps, renew (waitSeconds keeps the claim alive while it waits) to hear when you can go full.",
-            _ => "Don't start yet. Renew with waitSeconds: 60 to wait for your turn and keep your place.",
+            _ => "Don't start yet. Run `cw wait <reservation_id>` in the background and do other work; it keeps your " +
+                 "place and exits when it's your turn; then renew to start. Without background commands, renew with waitSeconds: 60 instead.",
         },
         reason = a.Reason,
         contended = a.Contended == ResourceSet.None ? null : Resources.ToNames(a.Contended),

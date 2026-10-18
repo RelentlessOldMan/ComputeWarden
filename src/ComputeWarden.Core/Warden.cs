@@ -271,7 +271,12 @@ public sealed class Warden
     /// a game starting or stopping, and how a queued ticket checks in. The id acts as a bearer
     /// capability.
     /// </summary>
-    public RenewResult Renew(string reservationId, int? leaseSeconds = null)
+    /// <param name="probe">
+    /// Check in and report the advice without starting the claim: what a background waiter
+    /// (<c>cw wait</c>) sends. A ticket whose turn has come stays unstarted, with only the
+    /// check-in window, until its owner renews; so an owner that never starts passes the slot on.
+    /// </param>
+    public RenewResult Renew(string reservationId, int? leaseSeconds = null, bool probe = false)
     {
         lock (_gate)
         {
@@ -284,6 +289,13 @@ public sealed class Warden
 
             var now = _clock.UtcNow;
             var advice = Evaluate(r, x, now);
+            if (probe && !r.Started && advice.Grant != Grant.Queued)
+            {
+                r.LastRenewedAt = now;
+                r.ExpiresAt = now.AddSeconds(Math.Max(1, _sharing.QueueCheckinSeconds));
+                _log.Debug($"Waiter told {GrantName(advice.Grant)}: [{Short(r.Id)}] has until {r.ExpiresAt:o} to start");
+                return RenewResult.Success(r.ExpiresAt, advice);
+            }
             var previous = r.LastGrant;
             var wasStarted = r.Started;
             Apply(r, advice, now, leaseSeconds);
