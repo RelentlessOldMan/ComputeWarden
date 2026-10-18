@@ -60,6 +60,7 @@ $payload = @(
     (Join-Path $pub "ComputeWarden.Mcp.exe"),
     (Join-Path $pub "cw.exe"),
     (Join-Path $root "config.example.yaml"),
+    (Join-Path $root "examples\CLAUDE.md"),
     (Join-Path $root ".mcp.json.example"),
     (Join-Path $root "README.md"),
     (Join-Path $root "LICENSE")

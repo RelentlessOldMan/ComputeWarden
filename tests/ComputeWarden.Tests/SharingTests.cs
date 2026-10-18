@@ -323,7 +323,7 @@ public class SharingTests
         Assert.Equal(1, rig.Warden.Renew(c.ReservationId!).Advice!.Queue!.Position);
         Assert.True(rig.Log.Contains("Queue ticket dropped (no check-in): B"));
         Assert.Equal(0, rig.Warden.GetStats().ExpiredReservations);
-        Assert.NotNull(a);
+        Assert.True(rig.Warden.Renew(a.ReservationId!).Renewed); // the holder is unaffected
     }
 
     [Fact]
@@ -572,4 +572,215 @@ public class SharingTests
     [InlineData("unshareable: [vram]")]
     public void Bad_sharing_values_are_rejected(string line)
         => Assert.ThrowsAny<YamlException>(() => ConfigLoader.Parse("sharing:\n  " + line + "\n"));
+
+    // ---- Review regressions ---------------------------------------------
+
+    [Fact]
+    public void Open_mode_keeps_the_game_throttle_cap()
+    {
+        var rig = new Rig();
+        rig.StartGame();
+        rig.Warden.SetMode(UserMode.Open);
+        rig.Shared("A");
+        rig.Shared("B");
+        rig.Shared("C");
+
+        Assert.Equal(Grant.Queued, rig.Shared("D").Advice!.Grant);
+    }
+
+    [Fact]
+    public void Hold_mode_still_holds_when_the_state_is_unknown()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Hold);
+        rig.Processes.Result = ProviderResult.Unhealthy;
+
+        Assert.Equal(Grant.Queued, rig.Shared().Advice!.Grant);
+    }
+
+    [Fact]
+    public void Unknown_state_still_caps_throttled_starts()
+    {
+        var rig = new Rig();
+        rig.Processes.Result = ProviderResult.Unhealthy;
+        rig.Shared("A");
+        rig.Shared("B");
+        rig.Shared("C");
+
+        Assert.Equal(Grant.Queued, rig.Shared("D").Advice!.Grant);
+    }
+
+    [Fact]
+    public void Wait_claim_promoted_before_checking_in_is_never_told_to_run_small()
+    {
+        var rig = new Rig();
+        var h = rig.Exclusive("H", ResourceSet.Cpu);
+        var w = rig.Exclusive("W", ResourceSet.Cpu, WhenBusy.Wait);
+        Assert.Equal(Grant.Queued, w.Advice!.Grant);
+        rig.Warden.Release(h.ReservationId!);
+        rig.Warden.GetStatus(); // promotes W to the hold
+
+        rig.StartGame();
+
+        Assert.Equal(Grant.Queued, rig.Renew(w));
+        rig.StopGame();
+        Assert.Equal(Grant.Full, rig.Renew(w));
+    }
+
+    [Fact]
+    public void Queue_estimate_is_unknown_when_a_claim_ahead_waits_on_a_game()
+    {
+        var rig = new Rig();
+        rig.StartGame(resources: ResourceSet.Gpu);
+        rig.Exclusive("A", ResourceSet.Cpu | ResourceSet.Gpu, WhenBusy.Wait, estimate: 60);
+
+        var b = rig.Exclusive("B", ResourceSet.Cpu, WhenBusy.Wait);
+
+        Assert.Equal(Grant.Queued, b.Advice!.Grant);
+        Assert.Null(b.Advice.Queue!.EstWaitSeconds);
+    }
+
+    [Fact]
+    public void Throttle_cap_is_counted_per_resource()
+    {
+        var rig = new Rig();
+        rig.StartGame(resources: ResourceSet.Cpu | ResourceSet.Ram | ResourceSet.Disk);
+        rig.Shared("A", ResourceSet.Cpu);
+        rig.Shared("B", ResourceSet.Ram);
+        rig.Shared("C", ResourceSet.Disk);
+
+        Assert.Equal(Grant.Throttled, rig.Shared("D").Advice!.Grant); // 2 of 3 slots on each
+    }
+
+    [Fact]
+    public void Freed_throttle_slot_goes_to_the_earlier_waiter_not_a_newcomer()
+    {
+        var rig = new Rig();
+        rig.StartGame();
+        var a = rig.Shared("A");
+        rig.Shared("B");
+        rig.Shared("C");
+        var d = rig.Shared("D");
+        Assert.Equal(Grant.Queued, d.Advice!.Grant);
+        rig.Warden.Release(a.ReservationId!);
+
+        var e = rig.Shared("E");
+
+        Assert.Equal(Grant.Queued, e.Advice!.Grant);
+        Assert.Equal("D", Assert.Single(e.Advice.Queue!.Ahead).Owner);
+        Assert.Equal(2, e.Advice.Queue.Position);
+        Assert.Equal(Grant.Throttled, rig.Renew(d));
+    }
+
+    [Fact]
+    public void Long_poll_keeps_the_claim_alive_while_it_waits()
+    {
+        var rig = new Rig();
+        rig.StartGame();
+        rig.Shared("A");
+        rig.Shared("B");
+        rig.Shared("C");
+        var d = rig.Shared("D"); // queued: 120s check-in window
+        rig.Clock.AdvanceSeconds(100);
+
+        Assert.Equal(Grant.Queued, rig.Warden.BeginWait(d.ReservationId!, 60));
+        rig.Clock.AdvanceSeconds(60);
+
+        Assert.True(rig.Warden.Renew(d.ReservationId!).Renewed);
+    }
+
+    [Fact]
+    public void Unstarted_holder_counts_its_whole_job_in_queue_estimates()
+    {
+        var rig = new Rig();
+        var h = rig.Exclusive("H", ResourceSet.Cpu, estimate: 10);
+        var w = rig.Exclusive("W", ResourceSet.Cpu, WhenBusy.Wait, estimate: 300);
+        rig.Warden.Release(h.ReservationId!);
+        rig.Warden.GetStatus(); // W holds but hasn't checked in
+
+        var x = rig.Exclusive("X", ResourceSet.Cpu, WhenBusy.Wait);
+
+        Assert.True(x.Advice!.Queue!.EstWaitSeconds >= 300);
+    }
+
+    [Fact]
+    public void Legacy_acquire_is_refused_while_a_blocked_waiter_is_in_line()
+    {
+        var rig = new Rig();
+        rig.Exclusive("A", ResourceSet.Cpu);
+        rig.Exclusive("B", ResourceSet.Cpu | ResourceSet.Disk, WhenBusy.Wait); // waits on A's cpu; disk is free
+
+        var legacy = rig.Warden.Acquire("legacy", "copy", resources: ResourceSet.Disk);
+
+        Assert.False(legacy.Acquired);
+    }
+
+    [Fact]
+    public void Free_waiter_is_not_promoted_past_an_earlier_overlapping_waiter()
+    {
+        var rig = new Rig();
+        rig.Exclusive("A", ResourceSet.Cpu);
+        rig.Exclusive("B", ResourceSet.Cpu | ResourceSet.Disk, WhenBusy.Wait);
+
+        var c = rig.Exclusive("C", ResourceSet.Disk, WhenBusy.Wait);
+
+        Assert.Equal(Grant.Queued, c.Advice!.Grant);
+        Assert.Equal("B", Assert.Single(c.Advice.Queue!.Ahead).Owner);
+    }
+
+    [Fact]
+    public void Steady_throttles_an_exclusive_holder_on_renew()
+    {
+        var rig = new Rig();
+        var h = rig.Exclusive("H");
+        Assert.Equal(Grant.Full, h.Advice!.Grant);
+
+        rig.Warden.SetMode(UserMode.Steady);
+
+        Assert.Equal(Grant.Throttled, rig.Renew(h));
+    }
+
+    [Fact]
+    public void Nobody_is_promoted_while_the_state_is_unknown()
+    {
+        var rig = new Rig();
+        var a = rig.Exclusive("A", ResourceSet.Cpu);
+        var b = rig.Exclusive("B", ResourceSet.Cpu, WhenBusy.Wait);
+        rig.Processes.Result = ProviderResult.Unhealthy;
+        rig.Warden.Release(a.ReservationId!);
+
+        Assert.Equal(Grant.Queued, rig.Renew(b));
+        rig.Processes.Result = ProviderResult.Empty;
+        Assert.Equal(Grant.Full, rig.Renew(b));
+    }
+
+    [Fact]
+    public void Mode_scoped_to_a_resource_leaves_the_others_alone()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Steady, resources: ResourceSet.Cpu);
+
+        Assert.Equal(Grant.Full, rig.Shared("A", ResourceSet.Disk).Advice!.Grant);
+        Assert.Equal(Grant.Throttled, rig.Shared("B", ResourceSet.Cpu).Advice!.Grant);
+    }
+
+    [Fact]
+    public void Steady_runs_gpu_work_small_instead_of_queuing_it()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Steady);
+
+        Assert.Equal(Grant.Throttled, rig.Shared("A", ResourceSet.Gpu).Advice!.Grant);
+        Assert.Equal(Grant.Throttled, rig.Exclusive("B", ResourceSet.All).Advice!.Grant);
+    }
+
+    [Fact]
+    public void Steady_still_queues_gpu_work_behind_a_game()
+    {
+        var rig = new Rig();
+        rig.StartGame();
+        rig.Warden.SetMode(UserMode.Steady);
+
+        Assert.Equal(Grant.Queued, rig.Shared("A", ResourceSet.Gpu).Advice!.Grant);
+    }
 }

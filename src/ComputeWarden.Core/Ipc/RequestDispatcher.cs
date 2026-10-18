@@ -12,7 +12,7 @@ namespace ComputeWarden.Core.Ipc;
 /// </summary>
 public sealed class RequestDispatcher
 {
-    /// <summary>Longest a renew may wait for its grant to change; well inside the queue check-in window.</summary>
+    /// <summary>Longest a renew may wait for its grant to change. The claim is kept alive while it waits.</summary>
     public const int MaxWaitSeconds = 60;
 
     private static readonly JsonSerializerOptions ParseOptions = new()
@@ -41,8 +41,9 @@ public sealed class RequestDispatcher
     {
         if (TryReadWait(requestLine) is { } w)
         {
-            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(Math.Min(w.Seconds, MaxWaitSeconds));
-            var last = _warden.LastGrant(w.Id);
+            var seconds = Math.Min(w.Seconds, MaxWaitSeconds);
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(seconds);
+            var last = _warden.BeginWait(w.Id, seconds);
             while (last is not null)
             {
                 var now = _warden.PeekGrant(w.Id);

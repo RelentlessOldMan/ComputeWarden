@@ -28,7 +28,8 @@ ComputeWarden tracks **blockers**, meaning reasons some resource is in use:
 Each blocker occupies some of `cpu`, `gpu`, `ram`, `network`, and `disk`. An agent calls
 **acquire** with the resources its job will saturate, and it gets a reservation only if no
 blocker overlaps them. A CPU+network job and a GPU+RAM job can run side by side; two GPU
-jobs take turns. Leaving out `resources` means all of them, i.e. the whole machine.
+jobs take turns. Leaving out `resources` means all of them, i.e. the whole machine (for a
+shared claim it means cpu+ram+disk instead).
 
 **Ask for everything in one call.** Request every resource a job needs up front (`[ram, disk]`,
 not `ram` now and `disk` later). Holding one resource while waiting on another is how two
@@ -61,13 +62,14 @@ yes or no:
   - A queued claim becomes full when its turn comes.
 - **Waiting is cheap.** `renew` with `waitSeconds` (max 60) holds the answer until the advice
   changes. Queue tickets must check in at least every 2 minutes, or they drop out of line.
-- **The line is first come, first served.** At most 3 throttled claims are allowed per
-  contended resource; later ones queue. Work already running is never told to stop, only to
-  shrink. The GPU can't be shared, so GPU work queues behind a game instead.
+- **The line is first come, first served.** At most 3 throttled claims are allowed on each
+  contended resource; later ones queue, and a freed slot goes to the earliest of them. Work
+  already running is never told to stop, only to shrink. The GPU can't be shared, so GPU
+  work queues behind a game (or another agent's GPU job) instead.
 - **Skipping the line:** `userPriority` puts a claim at the front of the line, but it never
   preempts a holder. Agents set it only when you tell them your work comes first.
-- **Estimates:** `estimateSeconds`, `cores` and `ramGb` feed wait estimates and `cw status`.
-  The estimate also sets the claim's lease.
+- **Estimates:** `estimateSeconds` feeds others' wait estimates and sets the claim's lease.
+  `cores` and `ramGb` are optional and recorded only.
 
 ### The mode: your override
 
@@ -85,11 +87,11 @@ cw mode auto                     # back to normal rules
 | Mode | Effect |
 |---|---|
 | `auto` | The rules above. |
-| `steady` | Everyone runs throttled; nobody goes full. |
-| `open` | No throttling between agents. Exclusive holds still keep two heavy jobs apart. |
+| `steady` | Everyone runs throttled; nobody goes full. The 3-per-resource cap applies, and `whenBusy: wait` claims wait for the mode to end. |
+| `open` | No throttling between agents. Exclusive holds still keep two heavy jobs apart. A game's throttling and cap still apply. |
 | `hold` | New work is queued; work already running is throttled. |
 
-A mode can take a duration (90m, 2h, 1h30m, 1d), a reason (shown to agents in their advice),
+A mode can take a duration (90m, 2h, 1h30m, 1d; a unit is required, at most 7d), a reason (shown to agents in their advice),
 and `--resources cpu,ram` to cover only some resources. **No mode overrides a running
 game.** Inside a Claude Code session you can run it as `! cw mode open`.
 
@@ -130,14 +132,15 @@ starts the daemon in the background, and it then runs until reboot.
 You should get something like:
 
 ```json
-{"state":"AVAILABLE","can_run_intensive":true,"busy_resources":[],"blockers":[]}
+{"state":"AVAILABLE","can_run_intensive":true,"busy_resources":[],"mode":{"mode":"auto"},"blockers":[],"claims":[]}
 ```
 
 ## Getting agents to use it
 
-Agents only help if they report their work. Add this to your agent's global instructions
-(for Claude Code, `~/.claude/CLAUDE.md`). Each command costs two small tool calls
-(acquire and release):
+Agents only help if they report their work. Add this to your agent's **global** instructions
+(Claude Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`), so every session on the
+machine follows it, not just one project's. A copy is in [`examples/CLAUDE.md`](examples/CLAUDE.md).
+Each command costs two small tool calls (acquire and release):
 
 ```markdown
 ## ComputeWarden (shared machine)
@@ -172,7 +175,8 @@ Those acquires are all-or-nothing and are refused while anyone is in line for th
 All tools return compact JSON, and errors come back as JSON with an `error` field too.
 
 `UNKNOWN` means ComputeWarden couldn't read the process list, so it can't tell what's free.
-Shared work is throttled, and new exclusive and legacy acquires wait until that clears.
+Shared work is throttled (as if a game held its resources), new exclusive claims are queued,
+and legacy acquires are refused until that clears. Manual holds and hold mode still apply.
 
 ## Configuration
 
@@ -272,7 +276,7 @@ Other client ┘                        │       cw.exe (you) ─┐
                            ├─ Warden: blockers, claims, the line, advice, mode
                            ├─ ProcessMonitor: polls processes against config rules
                            ├─ LeaseSweeper: expires abandoned reservations
-                           └─ config watcher: hot-reloads process rules
+                           └─ config watcher: hot-reloads process rules and sharing
 ```
 
 | Project | Contents |

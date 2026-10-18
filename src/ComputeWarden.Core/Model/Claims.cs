@@ -43,7 +43,7 @@ public enum UserMode
     /// <summary>"Y'all go slow and steady": everything throttled, nobody full.</summary>
     Steady,
 
-    /// <summary>"Full bore allowed with a lease": no throttling between agents, no throttle cap.</summary>
+    /// <summary>"Full bore allowed with a lease": no throttling or throttle cap between agents. A game still throttles, with its cap.</summary>
     Open,
 
     /// <summary>"Nobody start anything": every new claim is queued.</summary>

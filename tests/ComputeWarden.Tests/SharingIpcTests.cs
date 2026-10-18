@@ -193,14 +193,15 @@ public class SharingIpcTests
         await client.SetModeAsync(UserMode.Auto);
         var renew = await renewing;
         Assert.True(renew.Renewed);
-        Assert.True(renew.Advice is null || renew.Advice.Grant == Grant.Full);
+        Assert.Equal(Grant.Full, renew.Advice!.Grant); // answered on the change, not after 30s
 
         var queued = await client.AcquireAsync(new ClaimRequest("B", "x", ClaimKind.Exclusive, ResourceSet.Gpu));
         var waiting = await client.AcquireAsync(new ClaimRequest("C", "y", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait, UserPriority: "user said so"));
         Assert.Equal(Grant.Full, queued.Advice!.Grant);
         Assert.Equal(Grant.Queued, waiting.Advice!.Grant);
         Assert.Equal(1, waiting.Advice.Queue!.Position);
-        Assert.Equal("B", waiting.Advice.Queue.Ahead.Count == 0 ? "B" : waiting.Advice.Queue.Ahead[0].Owner);
+        Assert.Empty(waiting.Advice.Queue.Ahead); // B holds; it isn't ahead in line
+        Assert.Contains("B holds gpu", waiting.Advice.Reason);
     }
 
     // ---- MCP tools ------------------------------------------------------
@@ -258,7 +259,7 @@ public class SharingIpcTests
         var errors = new StringWriter();
 
         Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "mode", "steady", "2h", "gaming", "tonight" }, client, output, errors));
-        Assert.Contains("Mode set: steady, 2h left: gaming tonight", output.ToString());
+        Assert.Matches(@"Mode set: steady, (2h|1h59m) left: gaming tonight", output.ToString()); // a second may pass
 
         await client.AcquireAsync(new ClaimRequest("Codex", "full test suite", ClaimKind.Exclusive, ResourceSet.Cpu, WhenBusy.Wait));
         output.GetStringBuilder().Clear();
@@ -311,7 +312,6 @@ public class SharingIpcTests
     [InlineData("1h30m", 5400)]
     [InlineData("1d", 86400)]
     [InlineData("45s", 45)]
-    [InlineData("30", 1800)]
     public void Cw_parses_durations(string text, int seconds)
     {
         Assert.True(Cli.Cli.TryParseDuration(text, out var parsed));
@@ -324,6 +324,10 @@ public class SharingIpcTests
     [InlineData("8d")]
     [InlineData("gaming")]
     [InlineData("2x")]
+    [InlineData("30")]
+    [InlineData("1.5h")]
+    [InlineData("2h30")]
+    [InlineData("99999999999999999999h")]
     public void Cw_rejects_bad_durations(string text)
         => Assert.False(Cli.Cli.TryParseDuration(text, out _));
 
@@ -340,6 +344,13 @@ public class SharingIpcTests
         Assert.Null(open.DurationSeconds);
         Assert.Null(open.Reason);
 
+        Assert.False(Cli.Cli.TryParseMode(new[] { "open", "10d" }, out _, out _));
+        Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "1.5h" }, out _, out _));
+        Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "for", "8d" }, out _, out _));
+        Assert.False(Cli.Cli.TryParseMode(new[] { "hold", "2", "players" }, out _, out _));
+        Assert.True(Cli.Cli.TryParseMode(new[] { "steady", "two", "players" }, out var words, out _));
+        Assert.Null(words.DurationSeconds);
+        Assert.Equal("two players", words.Reason);
         Assert.False(Cli.Cli.TryParseMode(new[] { "auto", "2h" }, out _, out var error));
         Assert.Contains("auto takes no duration", error);
         Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "--resources", "cpu,bogus" }, out _, out _));

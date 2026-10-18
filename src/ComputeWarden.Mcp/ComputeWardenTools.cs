@@ -20,7 +20,8 @@ public static class ComputeWardenTools
     private const string ResourcesHelp =
         "Resources the work will saturate: any of cpu, gpu, ram, network, disk. Holds conflict " +
         "only where they overlap, so e.g. cpu+network work can run alongside gpu+ram work. " +
-        "Omit for all (the whole machine). Declare every resource it really saturates — " +
+        "Omit for the default: cpu+ram+disk for kind=shared, the whole machine otherwise. " +
+        "Declare every resource it really saturates — " +
         "under-declaring lets conflicting work start.";
 
     private const string OneCallHelp =
@@ -86,7 +87,7 @@ public static class ComputeWardenTools
     public static Task<string> Acquire(
         [Description("Who is acquiring, e.g. 'Claude Code'.")] string owner,
         [Description("What the work is, e.g. 'dotnet test ComputeWarden.slnx'.")] string description,
-        [Description("Requested lease seconds; clamped to server bounds. Omit to derive it from estimate_seconds (or the server default).")] int? leaseSeconds = null,
+        [Description("Requested lease seconds; clamped to server bounds. Omit to derive it from estimateSeconds (or the server default).")] int? leaseSeconds = null,
         [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null,
         [Description(ResourcesHelp)] string[]? resources = null,
         [Description("shared (everyday build/test/run) or exclusive (heavy job). Omit only for the legacy all-or-nothing acquire.")] string? kind = null,
@@ -106,7 +107,7 @@ public static class ComputeWardenTools
             {
                 r = await client.AcquireAsync(new ClaimRequest(
                     owner, description, ParseKind(kind),
-                    resources is null ? ResourceSet.None : Resources.Parse(resources),
+                    resources is null or { Length: 0 } ? ResourceSet.None : Resources.Parse(resources),
                     ParseWhenBusy(whenBusy), leaseSeconds, estimateSeconds, cores, ramGb, userPriority, metadata));
             }
 
@@ -130,7 +131,7 @@ public static class ComputeWardenTools
     [Description("Renews a reservation's lease and returns the warden's current advice for it: this " +
                  "is how running work learns a game started (drop to throttled) or ended (go full), and " +
                  "how a queued claim checks back (renew within the check-in window or it drops out of " +
-                 "line). Pass wait_seconds to wait for the advice to change instead of polling. Returns " +
+                 "line). Pass waitSeconds to wait for the advice to change instead of polling. Returns " +
                  "renewed=false if the reservation no longer exists (e.g. it already expired).")]
     public static Task<string> Renew(
         [Description("The reservation_id returned by computewarden_acquire.")] string reservationId,
@@ -158,7 +159,7 @@ public static class ComputeWardenTools
                  "starts new work. No mode ever overrides a running priority process (a game).")]
     public static Task<string> SetMode(
         [Description("auto, steady, open, or hold.")] string mode,
-        [Description("Revert to auto after this many seconds (e.g. 7200 for '2 hours'). Omit to keep it until changed.")] int? durationSeconds = null,
+        [Description("Revert to auto after this many seconds (e.g. 7200 for '2 hours'; at most 7 days). Omit to keep it until changed.")] int? durationSeconds = null,
         [Description("The user's reason, e.g. 'gaming tonight'.")] string? reason = null,
         [Description("Resources the mode covers (cpu, gpu, ram, network, disk). Omit for all.")] string[]? resources = null)
         => Run(async client =>
@@ -287,8 +288,8 @@ public static class ComputeWardenTools
         next = a.Grant switch
         {
             Grant.Full => "Run at full size. Renew before the lease runs out; renew returns new advice if a game starts.",
-            Grant.Throttled => "Run now, but small: follow throttle/how. Renew (with wait_seconds) to hear when you can go full.",
-            _ => "Don't start yet. Renew within the lease (wait_seconds lets you wait for your turn) to keep your place.",
+            Grant.Throttled => "Start now, but small: follow throttle/how. Between steps, renew (waitSeconds keeps the claim alive while it waits) to hear when you can go full.",
+            _ => "Don't start yet. Renew with waitSeconds: 60 to wait for your turn and keep your place.",
         },
         reason = a.Reason,
         contended = a.Contended == ResourceSet.None ? null : Resources.ToNames(a.Contended),
@@ -338,7 +339,7 @@ public static class ComputeWardenTools
         "" or "throttle" => WhenBusy.Throttle,
         "wait" => WhenBusy.Wait,
         "refuse" => WhenBusy.Refuse,
-        _ => throw new WardenClientException($"Unknown when_busy '{whenBusy}' (expected throttle, wait, or refuse)"),
+        _ => throw new WardenClientException($"Unknown whenBusy '{whenBusy}' (expected throttle, wait, or refuse)"),
     };
 
     private static UserMode ParseMode(string mode) => mode.Trim().ToLowerInvariant() switch

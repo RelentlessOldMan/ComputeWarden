@@ -264,20 +264,31 @@ acquire(owner, description, resources, kind: "shared" | "exclusive",
    in line wants them. Otherwise it gets `throttled` or `queued`, per `whenBusy`
    (default `throttle`).
 3. A **shared** claim gets `full` unless a priority or exclusive claim overlaps it, in
-   which case it gets `throttled`. Shared claims block neither each other nor exclusive
-   claims; they're short and polite, and they're told to shrink on their next check.
-4. **Throttle cap:** at most `max_throttled_per_resource` (default 3) throttled claims per
-   contended resource. Beyond that, a request is queued. The cap applies only to *new*
-   starts: **work that has started is never told `queued`**, only `throttled`. It can't
-   un-start, and telling it to stop would just be ignored.
+   which case it gets `throttled`. It is only queued before it starts: by a hold, by an
+   unshareable resource (rule 1), or by the throttle cap (rule 4). Shared claims block
+   neither each other nor exclusive claims; they're short and polite, and they're told to
+   shrink on their next check.
+4. **Throttle cap:** at most `max_throttled_per_resource` (default 3) throttled claims on
+   each contended resource, counted per resource (one throttled claim each on cpu, ram, and
+   disk leaves two slots on each). Beyond that, a new request is queued. Shared tickets
+   queued by the cap keep their order: a freed slot goes to the earliest waiter, not to a
+   newcomer. The cap applies only to *new* starts: **work that has started is never told
+   `queued`**, only `throttled`. It can't un-start, and telling it to stop would just be
+   ignored.
 5. **The line is first come, first served.** A newcomer can't get `full` ahead of an
-   earlier waiter for an overlapping resource. A queued ticket is promoted to `full` when it
-   checks in at the head of the line and its resources are free.
+   earlier waiter for an overlapping resource. A waiting exclusive claim is promoted to the
+   hold as soon as it's at the front and its resources are free (on any request or the
+   5-second sweep). It then holds them through its check-in window, so a waiting agent
+   should renew with `waitSeconds`, which hears the promotion at once. A `whenBusy: wait`
+   claim is never told `throttled` before it starts: if a game or steady mode arrives
+   between its promotion and its check-in, it stays `queued`, keeping its hold.
 6. **Skipping the line:** `userPriority` puts the request at the front of the line. It
    never takes resources from current holders (advisory), and it is logged and shown in
    status. Agents set it only when the user has told them they have priority.
-7. **UNKNOWN:** exclusive claims are queued or refused as today; shared claims are
-   throttled.
+7. **UNKNOWN:** exclusive claims are queued or refused as today, and nobody is promoted.
+   Shared claims are treated as if a game held all their resources: throttled, with the
+   cap, and queued if they need the gpu. Holds and hold mode still apply, since they're
+   known even when the process list isn't.
 8. **Legacy acquires** (no `kind`) are also refused when anyone is in line for an
    overlapping resource. They can't jump the queue.
 
@@ -294,8 +305,9 @@ acquire(owner, description, resources, kind: "shared" | "exclusive",
   crashed agent can't stall the queue. The ticket's lease is the check-in window until it
   starts; then it gets its real lease.
 - **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
-  grant differs from the last one it was told, or the wait runs out. The dispatcher polls
-  `Warden.PeekGrant` once a second, which renews nothing, and then does the real renew. So
+  grant differs from the last one it was told, or the wait runs out. The claim is kept alive
+  for the wait (plus 15 s), so a short lease or check-in window can't run out mid-wait. The
+  dispatcher polls `Warden.PeekGrant` once a second, and then does the real renew. So
   waiting agents don't burn tokens polling, and a game exit reaches them within about a
   second. An unknown id answers at once.
 
@@ -308,9 +320,9 @@ limited, in every mode.
 | Mode | Says | Effect |
 |---|---|---|
 | `hold` | "Nobody start anything." | Every new claim is queued; work already running is throttled (rule 4). |
-| `steady` | "Y'all go slow and steady." | Everything gets `throttled`; nobody gets `full`. Exclusive claims are throttled or queued, per `whenBusy`. |
+| `steady` | "Y'all go slow and steady." | Everything gets `throttled`; nobody gets `full`, and the throttle cap applies. The gpu runs throttled too unless someone else is on it. Exclusive claims are throttled or queued, per `whenBusy`, and none is promoted to a hold until the mode ends. |
 | `auto` | (default) | The rules above. |
-| `open` | "Full bore allowed with a lease." | No throttling between agents: shared work runs `full` beside exclusive leases, with no throttle cap between agents. A game still throttles, and its cap still applies. Exclusive leases still keep two heavy jobs off the same resource. |
+| `open` | "Full bore allowed with a lease." | No throttling between agents: shared work runs `full` beside exclusive leases, with no throttle cap between agents. A game still throttles, and its cap still applies (checked per resource). Exclusive leases still keep two heavy jobs off the same resource. |
 
 - A mode can take `resources` (e.g. `steady` for cpu only), an optional duration (`steady`
   for 2h, then back to `auto`), and a reason. The reason is shown to agents in their advice:
@@ -330,11 +342,12 @@ limited, in every mode.
 
 ### Estimates
 
-Agents supply `estimateSeconds`, `cores`, and `ramGb`. These aren't used for core
-arithmetic. They feed queue wait estimates (time left on the jobs ahead), status ("3 shared
-jobs, ~12 cores claimed, throttled by Overwatch"), and the default lease length: once
-started, a claim with an estimate and no `leaseSeconds` gets `ceil(estimate × 1.25) + 30`
-seconds, clamped to the lease bounds.
+Agents supply `estimateSeconds`, and optionally `cores` and `ramGb`. None is used for core
+arithmetic. The estimate feeds queue wait estimates (time left on the holder plus the jobs
+ahead; a promoted holder that hasn't checked in yet counts its whole estimate) and the
+default lease length: once started, a claim with an estimate and no `leaseSeconds` gets
+`ceil(estimate × 1.25) + 30` seconds, clamped to the lease bounds. `cores` and `ramGb` are
+recorded for future use; nothing shows them yet.
 
 ### Config (defaults)
 
@@ -366,14 +379,19 @@ global CLAUDE.md rule becomes:
 
 ### Example
 
+Overwatch is configured as `[cpu, gpu, ram]`; shared builds default to cpu+ram+disk.
+
 ```
 10:00  A: shared build (cpu)            → full
-10:01  B: exclusive test fan-out (cpu)  → full     (A's next check: throttled)
+10:01  B: exclusive test fan-out (cpu), estimate 5 min
+                                        → full     (A's next check: throttled by B)
 10:02  C: exclusive indexing (cpu,disk), whenBusy: wait
                                         → queued #1, ~5 min
-10:03  User starts Overwatch            → B's renew: throttled; new shared work: throttled
-10:04  D, E, F: shared builds           → throttled ×3 (cap reached)
-10:05  G: shared build                  → queued #2
-10:07  B releases; C checks in          → still queued (Overwatch is priority)
-10:40  Overwatch exits                  → C promoted to full on next check; G gets full
+10:03  User starts Overwatch            → B's renew: throttled; A's: throttled
+10:04  D: shared build                  → throttled (cpu slots: A, B, D: the cap of 3)
+10:05  E: shared build                  → queued #1 (throttle slots full on cpu); no estimate
+10:07  B releases                       → a cpu slot frees: E's renew says throttled.
+                                          C stays queued (Overwatch is priority)
+10:40  Overwatch exits                  → C is promoted and its renew says full;
+                                          D and E stay throttled by C's hold on cpu,disk
 ```

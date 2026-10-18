@@ -319,6 +319,26 @@ public sealed class Warden
                 : null;
     }
 
+    /// <summary>
+    /// Starts a long-polling renew: keeps the claim alive for the wait (the renew itself only
+    /// lands at the end), and returns the grant it was last given; null if it no longer exists.
+    /// </summary>
+    public Grant? BeginWait(string reservationId, int waitSeconds)
+    {
+        lock (_gate)
+        {
+            PruneExpiredLocked();
+            if (string.IsNullOrEmpty(reservationId) || !_reservations.TryGetValue(reservationId, out var r))
+                return null;
+            var until = _clock.UtcNow.AddSeconds(waitSeconds + WaitMarginSeconds);
+            if (r.ExpiresAt < until) r.ExpiresAt = until;
+            return r.LastGrant;
+        }
+    }
+
+    /// <summary>Slack on top of a long-poll's wait, covering the reply's trip back.</summary>
+    private const int WaitMarginSeconds = 15;
+
     /// <summary>Releases a claim. Idempotent — releasing an unknown id is not an error.</summary>
     public ReleaseResult Release(string reservationId)
     {
@@ -509,15 +529,18 @@ public sealed class Warden
         Advice Defer(ResourceSet contended, string? reason)
             => c.Started ? Throttled(contended, reason) : Queued(c, x, ahead, contended, now, reason);
 
-        if (!x.Confident)
-        {
-            const string unknown = "machine state is UNKNOWN (the process list can't be read)";
-            return c.Kind == ClaimKind.Shared ? Throttled(res, unknown) : Defer(res, unknown);
-        }
-
+        // Holds are known even when the process list isn't, so they come first.
         var hold = x.Hold & res;
         if (hold != ResourceSet.None)
             return Defer(hold, HoldReason(x, hold));
+
+        if (!x.Confident)
+        {
+            // A game may be running unseen: treat everything as contended by one.
+            var unknown = new List<string> { "machine state is UNKNOWN (the process list can't be read)" };
+            if (c.Kind == ClaimKind.Exclusive) return Defer(res, Join(unknown));
+            return Contended(c, x, ahead, res, priorityLike: res, steadyOnly: ResourceSet.None, unknown, now);
+        }
 
         var priority = x.Priority & res;
         var steady = x.Steady & res;
@@ -527,12 +550,14 @@ public sealed class Warden
         others &= res;
 
         ResourceSet contended;
+        var steadyOnly = ResourceSet.None; // slowed only by steady mode: nobody else is on it
         var reasons = new List<string>();
         if (c.Kind == ClaimKind.Exclusive && !c.Holding)
         {
             var waitedFor = Occupied(ahead) & res;
             contended = priority | steady | others | waitedFor;
             if (contended == ResourceSet.None) contended = res; // not promoted, so something is in the way
+            steadyOnly = steady & ~(priority | others | waitedFor);
             Explain(reasons, x, c, priority, steady, others);
             if (ahead.Count > 0) reasons.Add($"{ahead.Count} ahead in line");
             if (c.WhenBusy == WhenBusy.Wait)
@@ -541,31 +566,54 @@ public sealed class Warden
         else if (c.Kind == ClaimKind.Exclusive)
         {
             contended = priority | steady;
+            steadyOnly = steady & ~priority;
             Explain(reasons, x, c, priority, steady, ResourceSet.None);
+            // Promoted before it checked in, then a game or steady mode arrived: it asked never to run small.
+            if (!c.Started && c.WhenBusy == WhenBusy.Wait && contended != ResourceSet.None)
+                return Queued(c, x, ahead, contended, now, Join(reasons));
         }
         else
         {
             var blocking = others & ~x.Open;
             contended = priority | steady | blocking;
+            steadyOnly = steady & ~(priority | blocking);
             Explain(reasons, x, c, priority, steady, blocking);
         }
 
         if (contended == ResourceSet.None) return Advice.Full;
+        return Contended(c, x, ahead, contended, priority | steady, steadyOnly, reasons, now);
+    }
 
+    /// <summary>
+    /// Advice for a claim that can't run full on <paramref name="contended"/>: throttled, or
+    /// queued when the resource can't be shared or its throttle slots are full.
+    /// <paramref name="priorityLike"/> is the part a game, steady mode, or UNKNOWN causes, which open mode never lifts.
+    /// <paramref name="steadyOnly"/> is slowed only by steady mode: nothing else uses it, so even the gpu runs (small).
+    /// </summary>
+    private Advice Contended(Reservation c, Context x, List<Reservation> ahead, ResourceSet contended,
+        ResourceSet priorityLike, ResourceSet steadyOnly, List<string> reasons, DateTimeOffset now)
+    {
         var sharing = _sharing;
-        var unshareable = contended & sharing.Unshareable;
+        var unshareable = contended & sharing.Unshareable & ~steadyOnly;
         if (unshareable != ResourceSet.None)
         {
             reasons.Add($"{string.Join("/", Resources.ToNames(unshareable))} can't be shared right now");
-            return Defer(contended, Join(reasons));
+            return c.Started ? Throttled(contended, Join(reasons)) : Queued(c, x, ahead, contended, now, Join(reasons));
         }
 
         // The cap only limits new starts: running work keeps going (throttled at worst).
-        if (!c.Started && (contended & ~x.Open) != ResourceSet.None &&
-            ThrottledCount(c, contended) >= sharing.MaxThrottledPerResource)
+        // Open mode lifts it between agents, but never where a game (or steady/UNKNOWN) contends.
+        var capped = priorityLike | (contended & ~x.Open);
+        if (!c.Started && capped != ResourceSet.None)
         {
-            reasons.Add($"throttle slots full ({sharing.MaxThrottledPerResource} per resource)");
-            return Queued(c, x, ahead, contended, now, Join(reasons));
+            var waiting = EarlierWaiting(c, capped);
+            var full = FullSlots(c, capped, waiting, sharing.MaxThrottledPerResource);
+            if (full != ResourceSet.None)
+            {
+                reasons.Add($"throttle slots full on {string.Join("/", Resources.ToNames(full))} ({sharing.MaxThrottledPerResource} per resource)");
+                if (c.Kind == ClaimKind.Shared) ahead = waiting;
+                return Queued(c, x, ahead, contended, now, Join(reasons));
+            }
         }
 
         return Throttled(contended, Join(reasons));
@@ -613,9 +661,35 @@ public sealed class Warden
         return Join(reasons) + "; don't start new work on these resources";
     }
 
-    private int ThrottledCount(Reservation c, ResourceSet contended)
-        => _reservations.Values.Count(r =>
-            r != c && r.Started && r.LastGrant == Grant.Throttled && Resources.Overlaps(r.Resources, contended));
+    /// <summary>
+    /// Shared tickets that arrived before <paramref name="c"/> and are still waiting for a slot on
+    /// <paramref name="capped"/>: a newcomer doesn't take a freed slot ahead of them.
+    /// </summary>
+    private List<Reservation> EarlierWaiting(Reservation c, ResourceSet capped)
+        => _reservations.Values
+            .Where(r => r != c && r.Kind == ClaimKind.Shared && !r.Started && r.LastGrant == Grant.Queued &&
+                        r.Seq < c.Seq && Resources.Overlaps(r.Resources, capped))
+            .OrderBy(r => r.Seq)
+            .ToList();
+
+    /// <summary>The resources in <paramref name="capped"/> whose throttle slots are all taken, counted per resource.</summary>
+    private ResourceSet FullSlots(Reservation c, ResourceSet capped, List<Reservation> waiting, int max)
+    {
+        var full = ResourceSet.None;
+        foreach (var bit in Bits(capped))
+        {
+            var used = waiting.Count(r => Resources.Overlaps(r.Resources, bit)) + _reservations.Values.Count(r =>
+                r != c && r.Started && r.LastGrant == Grant.Throttled && Resources.Overlaps(r.Resources, bit));
+            if (used >= max) full |= bit;
+        }
+        return full;
+    }
+
+    private static IEnumerable<ResourceSet> Bits(ResourceSet set)
+    {
+        for (var bit = 1; bit != 0 && bit <= (int)set; bit <<= 1)
+            if (((int)set & bit) != 0) yield return (ResourceSet)bit;
+    }
 
     private Advice Throttled(ResourceSet contended, string? reason)
     {
@@ -631,12 +705,11 @@ public sealed class Warden
 
     private Advice Queued(Reservation c, Context x, List<Reservation> ahead, ResourceSet contended, DateTimeOffset now, string? reason)
     {
-        int? position = c.InLine ? x.Line.IndexOf(c) + 1 : null;
-        if (position == 0) position = null;
+        int? position = c.InLine || ahead.Count > 0 ? ahead.Count + 1 : null;
 
-        // Waits behind a game, a hold, or steady mode have no end we can predict.
+        // Waits behind a game, a hold, or steady mode (directly or through a claim ahead) have no end we can predict.
         int? estimate = null;
-        if (!Resources.Overlaps(c.Resources, x.Priority | x.Hold | x.Steady) && x.Confident)
+        if (!Resources.Overlaps(c.Resources | Occupied(ahead), x.Priority | x.Hold | x.Steady) && x.Confident)
         {
             var remaining = 0;
             foreach (var h in x.Holders)
@@ -654,6 +727,7 @@ public sealed class Warden
     private static int Remaining(Reservation h, DateTimeOffset now)
     {
         var leaseLeft = Math.Max(0, (int)(h.ExpiresAt - now).TotalSeconds);
+        if (!h.Started) return leaseLeft + (h.EstimateSeconds ?? h.LeaseSeconds); // promoted, not checked in yet
         if (h.EstimateSeconds is int e && h.StartedAt is { } started)
             return Math.Clamp((int)(started.AddSeconds(e) - now).TotalSeconds, 0, leaseLeft);
         return leaseLeft;

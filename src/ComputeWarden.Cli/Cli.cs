@@ -18,8 +18,8 @@ internal static class Cli
           cw status                  Mode, what holds each resource, and every agent claim.
           cw mode                    Show the current mode.
           cw mode <mode> [for] [<duration>] [<reason>...] [--resources cpu,ram,...]
-                                     Set the mode. Duration like 90m, 2h, 1h30m, 1d; omit to keep
-                                     it until changed. Examples:
+                                     Set the mode. Duration like 90m, 2h, 1h30m, 1d (at most 7d);
+                                     omit to keep it until changed. Examples:
                                        cw mode steady 2h gaming
                                        cw mode open
                                        cw mode hold 30m "recording a video"
@@ -79,7 +79,7 @@ internal static class Cli
         }
         catch (Exception ex) when (ex is TimeoutException or IOException)
         {
-            stderr.WriteLine("Could not reach the ComputeWarden daemon. It starts with the first Claude/Codex session that uses it.");
+            stderr.WriteLine("Could not reach the ComputeWarden daemon, and starting it didn't work. Is ComputeWarden.Daemon.exe next to cw.exe?");
             return 1;
         }
         catch (UnauthorizedAccessException)
@@ -90,6 +90,11 @@ internal static class Cli
         catch (WardenClientException ex)
         {
             stderr.WriteLine(ex.Message);
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            stderr.WriteLine($"cw failed: {ex.Message}");
             return 1;
         }
     }
@@ -146,9 +151,20 @@ internal static class Cli
 
             if (duration is null && reason.Count == 0)
             {
-                if (a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && TryParseDuration(args[i + 1], out _))
+                var afterFor = a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length;
+                var token = afterFor ? args[i + 1] : a;
+                // Anything that looks like a duration must be one: a typo must not make the mode permanent.
+                if (afterFor || LooksLikeDuration(token))
+                {
+                    if (!TryParseDuration(token, out var seconds))
+                    {
+                        error = $"Bad duration '{token}' (use e.g. 90m, 2h, 1h30m, 1d; at most 7d).";
+                        return false;
+                    }
+                    duration = seconds;
+                    if (afterFor) i++;
                     continue;
-                if (TryParseDuration(a, out var seconds)) { duration = seconds; continue; }
+                }
             }
             reason.Add(a);
         }
@@ -168,30 +184,29 @@ internal static class Cli
         @"^(?:(?<d>\d+)d)?(?:(?<h>\d+)h)?(?:(?<m>\d+)m)?(?:(?<s>\d+)s)?$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-    /// <summary>Parses 90m, 2h, 1h30m, 1d, 45s. A bare number is minutes.</summary>
+    /// <summary>Starts with a digit: meant as a duration ("2h", "1.5h", "10d"), so it must parse as one.</summary>
+    private static bool LooksLikeDuration(string text) => text.Length > 0 && char.IsAsciiDigit(text[0]);
+
+    /// <summary>Parses 90m, 2h, 1h30m, 1d, 45s (a unit is required), at most 7 days.</summary>
     public static bool TryParseDuration(string text, out int seconds)
     {
         seconds = 0;
         if (string.IsNullOrEmpty(text)) return false;
-        if (int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var minutes))
-        {
-            seconds = minutes * 60;
-            return minutes > 0 && minutes <= 7 * 24 * 60;
-        }
         var m = DurationPattern.Match(text);
         if (!m.Success) return false;
+        const long max = 7 * 24 * 3600;
         long total = 0;
-        total += Part(m, "d") * 86400;
-        total += Part(m, "h") * 3600;
-        total += Part(m, "m") * 60;
-        total += Part(m, "s");
-        if (total <= 0 || total > 7 * 24 * 3600) return false;
+        foreach (var (group, unit) in new[] { ("d", 86400L), ("h", 3600L), ("m", 60L), ("s", 1L) })
+        {
+            if (!m.Groups[group].Success) continue;
+            if (!long.TryParse(m.Groups[group].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var n) || n > max)
+                return false;
+            total += n * unit;
+        }
+        if (total <= 0 || total > max) return false;
         seconds = (int)total;
         return true;
     }
-
-    private static long Part(Match m, string group)
-        => m.Groups[group].Success ? long.Parse(m.Groups[group].Value, CultureInfo.InvariantCulture) : 0;
 
     // ---- Output ---------------------------------------------------------
 
