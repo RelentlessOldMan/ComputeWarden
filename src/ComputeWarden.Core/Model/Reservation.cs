@@ -22,10 +22,10 @@ public sealed class Reservation
     public int? EstimateSeconds { get; init; }
     public int? Cores { get; init; }
     public double? RamGb { get; init; }
-    public string? UserPriority { get; init; }
+    public string? UserPriority { get; internal set; }
 
-    /// <summary>Arrival order, for first-come-first-served in line.</summary>
-    public long Seq { get; init; }
+    /// <summary>Arrival order, for first-come-first-served in line. The user can reorder waiting claims.</summary>
+    public long Seq { get; internal set; }
 
     /// <summary>Lease length to apply once the claim is running (tickets use the check-in window until then).</summary>
     public int LeaseSeconds { get; init; }

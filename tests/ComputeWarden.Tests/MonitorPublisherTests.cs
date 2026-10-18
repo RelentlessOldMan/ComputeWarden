@@ -16,22 +16,51 @@ public class MonitorPublisherTests
         public readonly List<(string Id, object? Value)> Sets = new();
         public readonly List<(string Id, string Text, string Level)> Logs = new();
         public readonly Dictionary<string, Func<JsonElement?, object?>> Provided = new();
+        public readonly Dictionary<string, Func<JsonElement?, object?>> Actions = new();
+        public readonly Dictionary<string, Action<string>> Choices = new();
+        public readonly Dictionary<string, Action<IReadOnlyList<string>>> Flags = new();
+        public readonly Dictionary<string, Action<string>> Picks = new();
+        public MonitorSender? Sender { get; set; } = new("monitor:3", "monitor", "RelentlessEye", "PC");
 
         public void Start() => Started = true;
         public void Set(string id, object? value) => Sets.Add((id, value));
         public void Log(string id, string text, string level = "info") => Logs.Add((id, text, level));
         public void Provide(string name, Func<JsonElement?, object?> handler, string? description = null) => Provided[name] = handler;
+        public void OnAction(string widgetId, Func<JsonElement?, object?> handler) => Actions[widgetId] = handler;
+        public readonly List<object> Layouts = new();
+        public void SetLayout(object layout) => Layouts.Add(layout);
+        public void OnChoice(string widgetId, Action<string> handler) => Choices[widgetId] = handler;
+        public void OnFlags(string widgetId, Action<IReadOnlyList<string>> handler) => Flags[widgetId] = handler;
+        public void OnPick(string widgetId, Action<string> handler) => Picks[widgetId] = handler;
         public void Dispose() { }
 
+        public object? Pick(string mode) => Actions[MonitorPublisher.ModePick](JsonSerializer.SerializeToElement(mode));
+
         public string? Last(string id) => Sets.LastOrDefault(s => s.Id == id).Value as string;
+        public JsonElement Table() => JsonSerializer.SerializeToElement(Sets.Last(s => s.Id == MonitorPublisher.ClaimsTable).Value);
+        public JsonElement[] Rows() => Table().GetProperty("rows").EnumerateArray().ToArray();
+        public string[] Who() => Rows().Select(r => Text(r, "who")).ToArray();
+        public JsonElement Row(string who) => Rows().Single(r => Text(r, "who") == who);
+        public string? Picked() => Table().TryGetProperty("picked", out var p) ? p.GetString() : null;
+        public string Layout() => JsonSerializer.Serialize(Layouts.LastOrDefault() ?? MonitorPublisher.Layout); // none sent: still the start layout
+
+        // A cell is plain text or {text, color, dot, tip}.
+        public static string? Text(JsonElement row, string key)
+            => !row.TryGetProperty(key, out var cell) ? null
+                : cell.ValueKind == JsonValueKind.String ? cell.GetString()
+                : cell.TryGetProperty("text", out var t) ? t.GetString() : null;
+
+        public static string? Dot(JsonElement row, string key)
+            => row.TryGetProperty(key, out var cell) && cell.TryGetProperty("dot", out _) ? cell.GetProperty("color").GetString() : null;
     }
 
-    private static (Warden Warden, FakeSink Sink, MonitorPublisher Publisher, FakeBlockerProvider Games) NewPublisher(FakeClock clock)
+    private static (Warden Warden, FakeSink Sink, MonitorPublisher Publisher, FakeBlockerProvider Games) NewPublisher(
+        FakeClock clock, CapturingLog? log = null)
     {
         var games = new FakeBlockerProvider();
         var warden = TestFactory.NewWarden(clock, null, games);
         var sink = new FakeSink();
-        var publisher = new MonitorPublisher(sink, warden, new RequestDispatcher(warden), clock, TimeSpan.FromHours(1));
+        var publisher = new MonitorPublisher(sink, warden, new RequestDispatcher(warden), clock, TimeSpan.FromHours(1), log);
         return (warden, sink, publisher, games);
     }
 
@@ -45,9 +74,12 @@ public class MonitorPublisherTests
         Assert.True(sink.Started);
         Assert.Equal("available", sink.Last("state"));
         Assert.Equal("auto", sink.Last("mode"));
+        Assert.Equal("auto", sink.Last("mode_detail"));
+        Assert.Equal("until changed", sink.Last("mode_for"));
         Assert.Equal("none", sink.Last("busy"));
         Assert.Equal("none", sink.Last("blockers"));
-        Assert.Equal("none", sink.Last("claims"));
+        Assert.Empty(sink.Rows());
+        Assert.Null(sink.Picked());
     }
 
     [Fact]
@@ -68,9 +100,13 @@ public class MonitorPublisherTests
         Assert.Equal("busy", sink.Last("state"));
         Assert.Equal("Game.exe is running", sink.Last("blockers"));
         Assert.Contains("cpu", sink.Last("busy"));
-        var claims = sink.Last("claims")!;
-        Assert.Contains("Claude Code (repo): dotnet test (shared, throttled, cpu+ram+disk", claims);
-        Assert.Contains("m)", claims);
+        var row = sink.Row("repo");
+        Assert.Equal("running throttled", FakeSink.Text(row, "state"));
+        Assert.Equal("dotnet test", FakeSink.Text(row, "what"));
+        Assert.Matches("^[0-9]+m$", FakeSink.Text(row, "lease"));
+        // A dot under each resource it needs, orange while throttled.
+        Assert.Equal(new[] { "orange", null, "orange", null, "orange" },
+            new[] { "cpu", "gpu", "ram", "net", "disk" }.Select(k => FakeSink.Dot(row, k)));
     }
 
     [Fact]
@@ -83,10 +119,104 @@ public class MonitorPublisherTests
 
         publisher.Start();
 
-        var lines = sink.Last("claims")!.Split('\n');
-        Assert.Equal(2, lines.Length);
-        Assert.Contains("(exclusive, full, gpu", lines[0]);
-        Assert.Contains("(exclusive, queued #1, gpu", lines[1]);
+        Assert.Equal(new[] { "A", "B" }, sink.Who());
+        Assert.Equal("running full, exclusive", FakeSink.Text(sink.Row("A"), "state"));
+        Assert.Equal("green", FakeSink.Dot(sink.Row("A"), "gpu"));
+        Assert.Null(FakeSink.Dot(sink.Row("A"), "cpu"));
+        Assert.Equal("queued #1, exclusive", FakeSink.Text(sink.Row("B"), "state"));
+        Assert.Equal("gray", FakeSink.Dot(sink.Row("B"), "gpu"));
+    }
+
+    [Fact]
+    public void Panel_shows_move_buttons_only_while_jobs_wait_and_moves_the_picked_row()
+    {
+        var clock = new FakeClock();
+        var log = new CapturingLog();
+        var (warden, sink, publisher, _) = NewPublisher(clock, log);
+        var a = warden.Acquire(new ClaimRequest("Claude Code (A)", "a", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait)).ReservationId!;
+        publisher.Start();
+        Assert.DoesNotContain("line_front", sink.Layout());
+
+        var b = warden.Acquire(new ClaimRequest("Claude Code (B)", "b", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait)).ReservationId!;
+        var c = warden.Acquire(new ClaimRequest("Claude Code (C)", "c", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait)).ReservationId!;
+        publisher.Publish();
+        Assert.Contains("line_front", sink.Layout());
+        Assert.Equal(new[] { "A", "B", "C" }, sink.Who());
+        Assert.Equal("queued #2, exclusive", FakeSink.Text(sink.Row("C"), "state"));
+
+        Assert.Throws<InvalidOperationException>(() => publisher.MoveJob(LineMove.Up)); // nothing picked yet
+        Assert.Throws<InvalidOperationException>(() => sink.Picks[MonitorPublisher.ClaimsTable](a)); // running: can't move
+        sink.Picks[MonitorPublisher.ClaimsTable](c);
+        sink.Actions["line_front"](null);
+
+        Assert.Equal(new[] { c, b }, warden.GetWaiting().Select(w => w.Id));
+        Assert.Equal(new[] { "A", "C", "B" }, sink.Who()); // the table follows the line
+        Assert.Equal(c, sink.Picked()); // and the pick follows the job
+        Assert.True(log.Contains("Line change from RelentlessEye (monitor:3) on the monitor panel"));
+
+        // When the line empties, the buttons go and the pick is dropped.
+        warden.Release(b);
+        warden.Release(c);
+        publisher.Publish();
+        Assert.DoesNotContain("line_front", sink.Layout());
+        Assert.Null(sink.Picked());
+    }
+
+    [Fact]
+    public void Only_a_monitor_can_reorder_the_line()
+    {
+        var (warden, sink, publisher, _) = NewPublisher(new FakeClock());
+        warden.Acquire(new ClaimRequest("A", "a", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        var b = warden.Acquire(new ClaimRequest("B", "b", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait)).ReservationId!;
+        warden.Acquire(new ClaimRequest("C", "c", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        publisher.Start();
+        sink.Picks[MonitorPublisher.ClaimsTable](b);
+
+        sink.Sender = new MonitorSender("PC/SomeAgent", "app", "SomeAgent", "PC");
+        Assert.Throws<InvalidOperationException>(() => sink.Actions["line_down"](null));
+        Assert.Throws<InvalidOperationException>(() => sink.Picks[MonitorPublisher.ClaimsTable](b));
+        Assert.Equal("B", warden.GetWaiting()[0].Owner);
+    }
+
+    [Fact]
+    public void Claim_rows_say_whose_turn_it_is_and_which_have_gone_quiet()
+    {
+        var clock = new FakeClock();
+        var (warden, sink, publisher, _) = NewPublisher(clock);
+        var a = warden.Acquire(new ClaimRequest("A", "a", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait)).ReservationId!;
+        warden.Acquire(new ClaimRequest("B", "b", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait));
+        warden.Release(a);
+        warden.Acquire(new ClaimRequest("C", "c", ClaimKind.Shared, EstimateSeconds: 3600));
+
+        publisher.Start();
+
+        Assert.Equal(new[] { "C", "B" }, sink.Who()); // running first, then its-turn
+        Assert.Equal("its turn, not started, exclusive", FakeSink.Text(sink.Row("B"), "state"));
+        Assert.Equal("blue", FakeSink.Dot(sink.Row("B"), "gpu"));
+        Assert.StartsWith("running ", FakeSink.Text(sink.Row("C"), "state"));
+        Assert.DoesNotContain("quiet", FakeSink.Text(sink.Row("C"), "lease"));
+
+        clock.Advance(MonitorPublisher.QuietAfter + TimeSpan.FromMinutes(1));
+        publisher.Publish();
+        Assert.EndsWith(", quiet 16m", FakeSink.Text(sink.Row("C"), "lease"));
+    }
+
+    [Fact]
+    public void Claim_rows_shorten_owners_and_keep_the_whole_description()
+    {
+        var clock = new FakeClock();
+        var (warden, sink, publisher, _) = NewPublisher(clock);
+        var longText = new string('x', 100);
+        warden.Acquire(new ClaimRequest("Claude Code (Repo)", longText, ClaimKind.Shared, EstimateSeconds: 300));
+        warden.Acquire(new ClaimRequest("codex", "lint", ClaimKind.Shared, EstimateSeconds: 300));
+
+        publisher.Start();
+
+        Assert.Equal(new[] { "Repo", "codex" }, sink.Who());
+        var row = sink.Row("Repo");
+        Assert.Equal("Claude Code (Repo)", row.GetProperty("who").GetProperty("tip").GetString());
+        Assert.Equal(longText, FakeSink.Text(row, "what")); // the panel cuts it to fit, with a tooltip
+        Assert.Equal(32, row.GetProperty("id").GetString()!.Length);
     }
 
     [Fact]
@@ -97,7 +227,78 @@ public class MonitorPublisherTests
 
         publisher.Start();
 
-        Assert.Equal("hold (gpu): streaming", sink.Last("mode"));
+        Assert.Equal("hold", sink.Last("mode"));
+        Assert.Equal("hold (gpu): streaming", sink.Last("mode_detail"));
+    }
+
+    [Fact]
+    public void Panel_sets_the_mode_with_the_picked_duration_and_resources()
+    {
+        var clock = new FakeClock();
+        var log = new CapturingLog();
+        var (warden, sink, publisher, _) = NewPublisher(clock, log);
+        publisher.Start();
+
+        sink.Choices["mode_for"]("2h");
+        sink.Flags["mode_res"](new[] { "gpu" });
+        sink.Pick("steady");
+
+        var mode = warden.GetMode();
+        Assert.Equal(UserMode.Steady, mode.Mode);
+        Assert.Equal(ResourceSet.Gpu, mode.Resources);
+        Assert.Equal(clock.UtcNow.AddHours(2), mode.ExpiresAt);
+        Assert.Equal("steady", sink.Last("mode")); // the panel shows the daemon's real mode at once
+        Assert.True(log.Contains("Mode change from RelentlessEye (monitor:3) on the monitor panel"));
+    }
+
+    [Fact]
+    public void Panel_auto_ignores_the_duration_and_none_ticked_means_all()
+    {
+        var clock = new FakeClock();
+        var (warden, sink, publisher, _) = NewPublisher(clock);
+        publisher.Start();
+        sink.Choices["mode_for"]("30m");
+        sink.Flags["mode_res"](Array.Empty<string>());
+
+        sink.Pick("hold");
+        Assert.Equal(ResourceSet.All, warden.GetMode().Resources);
+        Assert.Equal(clock.UtcNow.AddMinutes(30), warden.GetMode().ExpiresAt);
+
+        sink.Pick("auto");
+        Assert.Equal(UserMode.Auto, warden.GetMode().Mode);
+        Assert.Null(warden.GetMode().ExpiresAt);
+        Assert.Equal("auto", sink.Last("mode"));
+    }
+
+    [Fact]
+    public void Only_a_monitor_can_set_the_mode_never_another_app()
+    {
+        var log = new CapturingLog();
+        var (warden, sink, publisher, _) = NewPublisher(new FakeClock(), log);
+        publisher.Start();
+
+        sink.Sender = new MonitorSender("PC/SomeAgent", "app", "SomeAgent", "PC");
+        Assert.Throws<InvalidOperationException>(() => sink.Pick("hold"));
+        Assert.Throws<InvalidOperationException>(() => sink.Choices["mode_for"]("8h"));
+        Assert.Throws<InvalidOperationException>(() => sink.Flags["mode_res"](new[] { "cpu" }));
+        sink.Sender = null; // an old client or hub can't say who sent it
+        Assert.Throws<InvalidOperationException>(() => sink.Pick("hold"));
+
+        Assert.Equal(UserMode.Auto, warden.GetMode().Mode);
+        Assert.True(log.Contains("Refused a request from SomeAgent (PC/SomeAgent) to set the mode"));
+        Assert.True(log.Contains("Refused a request from an unknown sender to set the mode"));
+    }
+
+    [Fact]
+    public void Panel_refuses_an_unknown_mode_or_duration()
+    {
+        var (warden, sink, _, _) = NewPublisher(new FakeClock());
+
+        Assert.Throws<ArgumentException>(() => sink.Pick("turbo"));
+        Assert.Throws<ArgumentException>(() => sink.Actions["mode"](null));
+        Assert.Throws<ArgumentException>(() => sink.Choices["mode_for"]("forever"));
+        Assert.Throws<ArgumentException>(() => sink.Flags["mode_res"](new[] { "quantum" }));
+        Assert.Equal(UserMode.Auto, warden.GetMode().Mode);
     }
 
     [Fact]
@@ -167,6 +368,12 @@ public class MonitorPublisherTests
         }
         public void Log(string id, string text, string level = "info") { }
         public void Provide(string name, Func<JsonElement?, object?> handler, string? description = null) { }
+        public void OnAction(string widgetId, Func<JsonElement?, object?> handler) { }
+        public void SetLayout(object layout) { }
+        public void OnChoice(string widgetId, Action<string> handler) { }
+        public void OnFlags(string widgetId, Action<IReadOnlyList<string>> handler) { }
+        public void OnPick(string widgetId, Action<string> handler) { }
+        public MonitorSender? Sender => null;
         public void Dispose() { }
     }
 
@@ -192,12 +399,12 @@ public class MonitorPublisherTests
     [Fact]
     public void Bridge_without_the_client_dll_is_disabled_and_inert()
     {
-        var old = Environment.GetEnvironmentVariable("RELENTLESSMONITOR_CLIENT");
-        Environment.SetEnvironmentVariable("RELENTLESSMONITOR_CLIENT", Path.Combine(Path.GetTempPath(), "no-such-" + Guid.NewGuid().ToString("N")));
+        var old = Environment.GetEnvironmentVariable("RELENTLESSEYE_CLIENT");
+        Environment.SetEnvironmentVariable("RELENTLESSEYE_CLIENT", Path.Combine(Path.GetTempPath(), "no-such-" + Guid.NewGuid().ToString("N")));
         try
         {
             if (File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "RelentlessMonitor", "client", "RelentlessMonitor.Client.dll")))
+                    "RelentlessEye", "client", "RelentlessEye.Client.dll")))
                 return; // installed on this machine: the bridge would rightly find it
 
             using var bridge = MonitorBridge.Create(MonitorPublisher.App, MonitorPublisher.Layout);
@@ -207,10 +414,13 @@ public class MonitorPublisherTests
             bridge.Start();
             bridge.Set("state", "busy");
             bridge.Log(MonitorPublisher.EventsFeed, "x");
+            bridge.OnChoice(MonitorPublisher.ModeFor, _ => { });
+            bridge.OnPick(MonitorPublisher.ClaimsTable, _ => { });
+            Assert.Null(bridge.Sender);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("RELENTLESSMONITOR_CLIENT", old);
+            Environment.SetEnvironmentVariable("RELENTLESSEYE_CLIENT", old);
         }
     }
 
@@ -221,6 +431,12 @@ public class MonitorPublisherTests
         public void Set(string id, object? value) => throw new InvalidOperationException();
         public void Log(string id, string text, string level = "info") => throw new InvalidOperationException();
         public void Provide(string name, Func<JsonElement?, object?> handler, string? description = null) { }
+        public void OnAction(string widgetId, Func<JsonElement?, object?> handler) { }
+        public void SetLayout(object layout) { }
+        public void OnChoice(string widgetId, Action<string> handler) { }
+        public void OnFlags(string widgetId, Action<IReadOnlyList<string>> handler) { }
+        public void OnPick(string widgetId, Action<string> handler) { }
+        public MonitorSender? Sender => null;
         public void Dispose() { }
     }
 }

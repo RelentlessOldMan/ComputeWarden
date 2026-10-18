@@ -153,13 +153,13 @@ Each command costs two small tool calls (acquire and release):
 ```markdown
 ## ComputeWarden (shared machine)
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
-- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes, even if it failed.
+- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
 - **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"` with `estimateSeconds`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`. Release it even if it fails.
 - **Follow `advice.grant`:**
   - `full`: run normally.
   - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
   - `queued`: don't start. Run `cw wait <reservation_id>` in the background and do other work meanwhile. When it exits 0, renew and start right away: the slot passes on if you don't renew within the time it prints. Exit 3 (still queued) or 4 (daemon unreachable) means run it again; exit 1 means the claim is gone, so acquire again. If you can't run background commands, call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
-- **Long work:** `estimateSeconds` sets the lease, so err high. Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
+- **Long work:** `estimateSeconds` sets the lease, so err high for the run itself (not the session). Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
 - **User only:** set `userPriority` (skip the line), call `computewarden_set_mode`, or set a manual hold only when the user explicitly says so.
 ```
 
@@ -228,24 +228,40 @@ sharing:
 
 ## Live panel (optional)
 
-If [RelentlessMonitor](https://github.com/RelentlessOldMan/RelentlessMonitor) is installed, the
-daemon shows up in it as a ComputeWarden panel with:
+If [RelentlessEye](https://github.com/RelentlessOldMan/RelentlessEye) is installed, the daemon
+shows up in it as a Compute Warden panel with:
 
 - the machine state;
 - the mode;
 - busy resources;
 - running games and other blockers;
-- every claim with its grant and lease;
+- a table of claims: who, where each one is (running full or throttled, its turn but not
+  started, or queued with its place in line), a colored dot under each resource it needs
+  (cpu, gpu, ram, net, disk), the lease left, and what it's doing. A claim with no check-in
+  for 15 minutes or more is flagged "quiet": the work may be finished or stuck;
 - a feed of the daemon's log (claims, releases, promotions, expiries).
 
-`rmon request ComputeWarden.status` returns the same JSON as `computewarden_status`.
+`reye request ComputeWarden.status` returns the same JSON as `computewarden_status`.
 
-There is nothing to configure, and ComputeWarden takes no dependency on RelentlessMonitor. The
-daemon looks for `RelentlessMonitor.Client.dll` when it starts. It checks `%RELENTLESSMONITOR_CLIENT%`
-first, then the folder next to the daemon, then `%LOCALAPPDATA%\RelentlessMonitor\client`
-(RelentlessMonitor's `publish.ps1 -InstallClient` puts it there). If the DLL isn't found, the panel is
-off and the daemon runs exactly the same. The log's startup lines say which happened. After
-installing the client, restart the daemon to pick it up.
+You can also set the mode from the panel. Pick **For** (until changed, 30m, 2h or 8h) and
+**Resources** (none ticked means all) first, then pick the mode. Open and hold ask you to confirm.
+The panel always shows the mode the daemon actually has.
+
+While jobs are waiting to start, you can reorder the line: click a queued job's row, then **Move
+picked to front**, **Move up** or **Move down**. The new order is the real one: the job at the
+front gets the resources next. Moving a job ahead of one with user priority gives it priority
+too; moving a priority job behind plain ones takes its priority away.
+
+Only a monitor (the panel or `reye`) can set the mode or reorder the line. Requests from apps
+connected to the hub, such as agent sessions, are refused and logged, since both are the user's
+call. Setting the mode needs RelentlessEye 1.1 or later; the claims table needs 1.2.
+
+There is nothing to configure, and ComputeWarden takes no dependency on RelentlessEye. The daemon
+looks for `RelentlessEye.Client.dll` when it starts. It checks `%RELENTLESSEYE_CLIENT%` first, then
+the folder next to the daemon, then `%LOCALAPPDATA%\RelentlessEye\client` (RelentlessEye's
+`publish.ps1 -InstallClient` puts it there). If the DLL isn't found, the panel is off and the
+daemon runs exactly the same. The log's startup lines say which happened. After installing the
+client, restart the daemon to pick it up.
 
 ## Troubleshooting
 

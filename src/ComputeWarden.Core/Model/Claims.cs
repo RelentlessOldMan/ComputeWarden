@@ -31,6 +31,14 @@ public enum Grant
     Queued,
 }
 
+/// <summary>Where the user moves a waiting claim in the line.</summary>
+public enum LineMove
+{
+    Front,
+    Up,
+    Down,
+}
+
 /// <summary>
 /// The machine-wide setting only the user sets. It adjusts how agents treat each other; it
 /// never loosens a priority claim (a running game always limits everyone on its resources).
@@ -96,7 +104,22 @@ public sealed record ClaimInfo(
     int? Cores,
     double? RamGb,
     string? UserPriority,
-    int? Position);
+    int? Position,
+    ClaimPhase Phase = ClaimPhase.Running,
+    DateTimeOffset? LastCheckIn = null);
+
+/// <summary>Where a claim is, as the user sees it. Filled in by status; other uses leave the default.</summary>
+public enum ClaimPhase
+{
+    /// <summary>Started: the owner was told it may run, and took it.</summary>
+    Running,
+
+    /// <summary>Its turn has come (its resources are kept for it), but the owner hasn't started yet.</summary>
+    Ready,
+
+    /// <summary>Waiting in line to start.</summary>
+    Waiting,
+}
 
 /// <summary>
 /// An agent's request to do work, with its own estimate of what that work needs.

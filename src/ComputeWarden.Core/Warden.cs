@@ -83,10 +83,11 @@ public sealed class Warden
         lock (_gate)
         {
             var x = BuildLocked();
+            var now = _clock.UtcNow;
             var state = DetermineState(x.Confident, x.Blockers);
             var claims = _reservations.Values
                 .OrderBy(r => r.Seq)
-                .Select(r => Info(r, x))
+                .Select(r => Info(r, x) with { Phase = PhaseLocked(r, x, now), LastCheckIn = r.LastRenewedAt })
                 .ToList();
             return new StatusResult(
                 state, state == MachineState.Available, x.Blockers, Occupied(x.Blockers), _mode, claims);
@@ -400,6 +401,85 @@ public sealed class Warden
             _log.Info($"User mode set to {ModeName(_mode.Mode)} {Names(_mode.Resources)}{until}{why}");
             return _mode;
         }
+    }
+
+    /// <summary>
+    /// Claims that haven't started yet and are waiting their turn, first in line first. Running
+    /// claims and exclusive claims already holding their resources aren't in it.
+    /// </summary>
+    public IReadOnlyList<ClaimInfo> GetWaiting()
+    {
+        lock (_gate)
+        {
+            var x = BuildLocked();
+            var now = _clock.UtcNow;
+            return WaitingLocked(x, now)
+                .Select(r => Info(r, x) with { Phase = ClaimPhase.Waiting, LastCheckIn = r.LastRenewedAt })
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Moves a waiting claim in the line. Only the user should do this. The waiting claims keep
+    /// their arrival numbers between them, handed out in the new order, so every queue rule (the
+    /// exclusive line, throttle-slot tickets) sees the new order. User-priority claims stay first:
+    /// moving a claim in among them gives it priority, and moving one out of them takes it away.
+    /// Returns the claim's new place (1 = next), or null if it isn't waiting.
+    /// </summary>
+    public int? MoveInLine(string reservationId, LineMove move)
+    {
+        lock (_gate)
+        {
+            PruneExpiredLocked();
+            var waiting = WaitingLocked(BuildLocked(), _clock.UtcNow);
+            var from = waiting.FindIndex(r => r.Id == reservationId);
+            if (from < 0) return null;
+            var to = move switch
+            {
+                LineMove.Front => 0,
+                LineMove.Up => Math.Max(0, from - 1),
+                LineMove.Down => Math.Min(waiting.Count - 1, from + 1),
+                _ => throw new ArgumentOutOfRangeException(nameof(move)),
+            };
+            if (to == from) return to + 1;
+
+            var seqs = waiting.Select(r => r.Seq).OrderBy(s => s).ToList();
+            var c = waiting[from];
+            waiting.RemoveAt(from);
+            waiting.Insert(to, c);
+            if (c.UserPriority is null && to + 1 < waiting.Count && waiting[to + 1].UserPriority is not null)
+                c.UserPriority = "moved up the line by the user";
+            else if (c.UserPriority is not null && to > 0 && waiting[to - 1].UserPriority is null)
+                c.UserPriority = null;
+            for (int i = 0; i < waiting.Count; i++) waiting[i].Seq = seqs[i];
+
+            _log.Info($"User moved {c.Owner} \"{Trunc(c.Description)}\" [{Short(c.Id)}] {MoveName(move)} the line: now #{to + 1} of {waiting.Count}");
+            return to + 1;
+        }
+    }
+
+    private static string MoveName(LineMove move) => move switch
+    {
+        LineMove.Front => "to the front of",
+        LineMove.Up => "up",
+        _ => "down",
+    };
+
+    // The line as the user sees it: claims still waiting for their turn, first in line first.
+    private List<Reservation> WaitingLocked(Context x, DateTimeOffset now)
+        => _reservations.Values
+            .Where(r => PhaseLocked(r, x, now) == ClaimPhase.Waiting)
+            .OrderBy(r => r.UserPriority is null ? 1 : 0)
+            .ThenBy(r => r.Seq)
+            .ToList();
+
+    // A claim whose turn has come but that hasn't started (an exclusive one promoted to hold, or a
+    // ticket that heard its turn through `cw wait`) keeps its resources until it starts or lapses.
+    private ClaimPhase PhaseLocked(Reservation r, Context x, DateTimeOffset now)
+    {
+        if (r.Started) return ClaimPhase.Running;
+        if (r.Holding || Evaluate(r, x, now).Grant != Grant.Queued) return ClaimPhase.Ready;
+        return ClaimPhase.Waiting;
     }
 
     public ModeState GetMode()

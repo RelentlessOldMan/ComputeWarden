@@ -54,11 +54,11 @@ if (!owns)
     return 0;
 }
 
-// Optional live panel in RelentlessMonitor, set up only by the daemon that serves the pipe.
+// Optional live panel in RelentlessEye, set up only by the daemon that serves the pipe.
 // Without its client DLL this is disabled and does nothing.
 using var monitor = MonitorBridge.Create(MonitorPublisher.App, MonitorPublisher.Layout);
 if (monitor.Enabled) log = new CompositeLog(log, new MonitorLog(monitor));
-log.Info($"RelentlessMonitor: {monitor.Status}");
+log.Info($"RelentlessEye: {monitor.Status}");
 
 // NOTE: we deliberately do NOT call ReleaseMutex(). After `await`, the continuation runs on a
 // threadpool thread, and Mutex.ReleaseMutex() throws when called from a thread other than the one

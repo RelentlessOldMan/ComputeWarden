@@ -10,7 +10,7 @@ namespace ComputeWarden.Daemon;
 /// <summary>
 /// Composition root: wires the warden, providers, process monitor, lease sweeper, and pipe
 /// server together from a <see cref="WardenConfig"/>, and manages their lifetime. Given an enabled
-/// <see cref="IMonitorSink"/>, it also publishes a live panel to RelentlessMonitor.
+/// <see cref="IMonitorSink"/>, it also publishes a live panel to RelentlessEye.
 ///
 /// If a config file path is supplied, the host watches it and hot-reloads the process rules,
 /// debounce, and sharing settings on change — so editing the exe list takes effect without a restart. (Lease bounds,
@@ -57,7 +57,7 @@ public sealed class WardenHost : IAsyncDisposable
         _monitor = new ProcessMonitor(_processProvider, config.ProcessDetection.PollIntervalMs, log);
         _sweeper = new LeaseSweeper(Warden, TimeSpan.FromSeconds(5), log);
         _pipeServer = new NamedPipeServer(pipeName ?? IpcProtocol.PipeName, dispatcher, log);
-        if (monitor is { Enabled: true }) _publisher = new MonitorPublisher(monitor, Warden, dispatcher, clock);
+        if (monitor is { Enabled: true }) _publisher = new MonitorPublisher(monitor, Warden, dispatcher, clock, log: log);
     }
 
     public void Start()
