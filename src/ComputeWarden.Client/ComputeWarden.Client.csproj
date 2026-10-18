@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ComputeWarden.Core\ComputeWarden.Core.csproj" />
+    <InternalsVisibleTo Include="ComputeWarden.Tests" />
   </ItemGroup>
 
   <PropertyGroup>

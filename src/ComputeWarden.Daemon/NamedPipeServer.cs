@@ -135,7 +135,8 @@ public sealed class NamedPipeServer : IAsyncDisposable
                     if (line is null) break;
                     if (line.Length == 0) continue;
 
-                    await writer.WriteLineAsync(_dispatcher.Handle(line).AsMemory(), _cts.Token);
+                    var response = await _dispatcher.HandleAsync(line, _cts.Token);
+                    await writer.WriteLineAsync(response.AsMemory(), _cts.Token);
                 }
             }
         }

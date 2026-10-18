@@ -8,9 +8,14 @@ told "no, A is indexing the repo", so it waits or asks its human. Meanwhile agen
 GPU and goes ahead, because nobody holds it. When A finishes (or crashes), its hold expires
 and B can start.
 
-ComputeWarden coordinates; it never enforces. Nothing is killed, throttled, or
-reprioritized. It only helps tools that ask (over [MCP](https://modelcontextprotocol.io)) and
-respect the answer.
+It also handles everyday work. Agents report their builds, tests and runs, and the warden says
+how big each may run right now: **full**, **throttled** (one core, low priority) or
+**queued**. While you're gaming, everyone keeps it small. When the game exits, their next
+check-in says full and they go full speed, without you telling each session by hand.
+
+ComputeWarden coordinates; it never enforces. Nothing is killed, capped, or reprioritized:
+"throttled" is advice the agent applies to its own next command. It only helps tools that
+ask (over [MCP](https://modelcontextprotocol.io)) and respect the answer.
 
 ## How it works
 
@@ -34,14 +39,72 @@ and re-acquire the full set.
 Reservations are leases: renew during long work, release when done. If the agent crashes,
 the lease runs out and the resources free themselves. There are no stuck flags to clean up.
 
+## Sharing the machine
+
+An acquire with a `kind` is a **claim**, and the answer is **advice** rather than a plain
+yes or no:
+
+| Claim | For | Gets |
+|---|---|---|
+| **Priority** | Programs in your config (games, etc.) | **Your lease.** While one runs, every agent on its resources is limited. Nothing overrides it. |
+| **Exclusive** | An agent's heavy job (indexing, test fan-out) | One holder per resource. Others wait in line or run throttled (`whenBusy: throttle` / `wait`). |
+| **Shared** | An agent's everyday build, test or run | Never refused. Full when nothing heavy overlaps; throttled when a game or an exclusive holder does. Defaults to `cpu, ram, disk`. |
+
+- **Advice:**
+  - `full` means run normally.
+  - `throttled` comes with `max_cores`, `priority`, `max_ram_gb` and a concrete `how`
+    (e.g. `dotnet build -m:1`).
+  - `queued` gives your place in line and an estimated wait.
+- **Advice is live.** Each renew returns the current advice:
+  - A game starting turns full into throttled.
+  - A game exiting turns throttled into full.
+  - A queued claim becomes full when its turn comes.
+- **Waiting is cheap.** `renew` with `waitSeconds` (max 60) holds the answer until the advice
+  changes. Queue tickets must check in at least every 2 minutes, or they drop out of line.
+- **The line is first come, first served.** At most 3 throttled claims are allowed per
+  contended resource; later ones queue. Work already running is never told to stop, only to
+  shrink. The GPU can't be shared, so GPU work queues behind a game instead.
+- **Skipping the line:** `userPriority` puts a claim at the front of the line, but it never
+  preempts a holder. Agents set it only when you tell them your work comes first.
+- **Estimates:** `estimateSeconds`, `cores` and `ramGb` feed wait estimates and `cw status`.
+  The estimate also sets the claim's lease.
+
+### The mode: your override
+
+`cw` is a small CLI for you. Agents set the mode (`computewarden_set_mode`) only when you
+tell them to.
+
+```powershell
+cw                               # status: mode, games, and every agent claim
+cw mode steady 2h gaming tonight # "y'all go slow and steady" for two hours
+cw mode open                     # "full bore allowed with a lease"
+cw mode hold 30m recording       # nobody starts anything new
+cw mode auto                     # back to normal rules
+```
+
+| Mode | Effect |
+|---|---|
+| `auto` | The rules above. |
+| `steady` | Everyone runs throttled; nobody goes full. |
+| `open` | No throttling between agents. Exclusive holds still keep two heavy jobs apart. |
+| `hold` | New work is queued; work already running is throttled. |
+
+A mode can take a duration (90m, 2h, 1h30m, 1d), a reason (shown to agents in their advice),
+and `--resources cpu,ram` to cover only some resources. **No mode overrides a running
+game.** Inside a Claude Code session you can run it as `! cw mode open`.
+
 ## Install
 
 Windows x64. Self-contained, so you don't need the .NET runtime.
 
 1. Download the latest `ComputeWarden-vX.Y.Z-win-x64.zip` from
    [Releases](https://github.com/RelentlessOldMan/ComputeWarden/releases).
-2. Extract `ComputeWarden.Mcp.exe` and `ComputeWarden.Daemon.exe` into one folder, e.g.
-   `%LOCALAPPDATA%\ComputeWarden\bin`. The two must stay side by side.
+2. Extract `ComputeWarden.Mcp.exe`, `ComputeWarden.Daemon.exe` and `cw.exe` into one
+   folder, e.g. `%LOCALAPPDATA%\ComputeWarden\bin`. The adapter and daemon must stay side by
+   side. Add the folder to your PATH to run `cw` from any terminal:
+   ```powershell
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$env:LOCALAPPDATA\ComputeWarden\bin", "User")
+   ```
 3. Register the MCP server with your agent:
 
    **Claude Code** (user scope = available in every project):
@@ -72,39 +135,36 @@ You should get something like:
 
 ## Getting agents to use it
 
-Agents only help if they ask, and you don't want them gating every `git status`. What works
-well is making it **opt-in per project**, limited to work that really saturates the machine.
-Add this to your agent's global instructions (for Claude Code, `~/.claude/CLAUDE.md`):
+Agents only help if they report their work. Add this to your agent's global instructions
+(for Claude Code, `~/.claude/CLAUDE.md`). Each command costs two small tool calls
+(acquire and release):
 
 ```markdown
-## ComputeWarden (heavy-compute gate)
-`computewarden_*` MCP tools cooperatively coordinate machine-saturating work. Default OFF —
-never gate normal work. Gate only when the project's own CLAUDE.md has
-`ComputeWarden: gate intensive work` (or the user asks) AND the op is one known to be
-resource-heavy — pegging most/all cores, holding a large share of RAM, or sustaining heavy
-disk I/O; any duration (full indexing, clean parallel builds, large test fan-outs, ML
-training/inference, media encode, big in-memory analysis). Intensity is about any saturated
-resource, not just CPU. Then computewarden_acquire (owner, description, leaseSeconds,
-resources = all of cpu/gpu/ram/network/disk it saturates, in ONE call — never add more via a
-second acquire); if not acquired or UNKNOWN, don't start — report the blocker, ask whether to
-wait/retry or proceed; computewarden_release when done (crash-safe via lease expiry).
+## ComputeWarden (shared machine)
+`computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools or daemon are unavailable, work normally.
+- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, plus owner, description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes.
+- **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`.
+- **Follow `advice.grant`:**
+  - `full`: run normally.
+  - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, low priority).
+  - `queued`: don't start. Call `computewarden_renew` with `waitSeconds: 60` until the grant changes.
+- **Long work:** renew within the lease. When the grant changes, size the next step to match. A switch to `full` means go full speed.
+- **User only:** set `userPriority` (skip the line) or call `computewarden_set_mode` only when the user explicitly says so.
 ```
 
-Then add one line to the CLAUDE.md of each project you want gated:
-
-```markdown
-ComputeWarden: gate intensive work
-```
+Older wording that only gates heavy work with a plain acquire (no `kind`) still works.
+Those acquires are all-or-nothing and are refused while anyone is in line for their resources.
 
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
-| `computewarden_acquire` | Atomically checks the requested `resources` (default: all) and reserves them. Returns `reservation_id` + expiry, or the conflicting blockers. |
-| `computewarden_renew` | Extends a reservation's lease during long work. |
-| `computewarden_release` | Releases a reservation. Safe to call twice. |
-| `computewarden_status` | `AVAILABLE` / `BUSY` / `UNKNOWN`, `busy_resources`, and every blocker with its owner and resources. |
-| `computewarden_can_run` | Quick check for the given `resources`. Informational only: it reserves nothing, so use acquire before real work. |
+| `computewarden_acquire` | Reports work. With `kind` (`shared` / `exclusive`), always creates a claim and returns `advice` (`full` / `throttled` / `queued`, with reason, throttle limits, `how`, and place in line). Without `kind`, it's the legacy all-or-nothing reserve: `reservation_id` or the conflicting blockers. |
+| `computewarden_renew` | Extends the lease and returns current advice. `waitSeconds` (max 60) waits for the advice to change first. |
+| `computewarden_release` | Releases a claim. Safe to call twice. |
+| `computewarden_status` | `AVAILABLE` / `BUSY` / `UNKNOWN`, `busy_resources`, every blocker, the current `mode`, and every agent claim. |
+| `computewarden_can_run` | Quick check for the given `resources`. Informational only: it reserves nothing. |
+| `computewarden_set_mode` | Sets the user mode (`auto` / `steady` / `open` / `hold`), with optional duration, reason, and resources. **User only:** agents call it only on your word. |
 | `computewarden_set_manual_busy` | Holds the machine (or given `resources`) busy for work ComputeWarden can't detect. |
 | `computewarden_clear_manual_busy` | Clears that manual hold. |
 | `computewarden_stats` | Counters since the daemon started. A high `expired_reservations` means agents acquire but don't release. |
@@ -112,7 +172,7 @@ ComputeWarden: gate intensive work
 All tools return compact JSON, and errors come back as JSON with an `error` field too.
 
 `UNKNOWN` means ComputeWarden couldn't read the process list, so it can't tell what's free.
-Acquire refuses everything until that clears.
+Shared work is throttled, and new exclusive and legacy acquires wait until that clears.
 
 ## Configuration
 
@@ -131,10 +191,22 @@ process_rules:
     resources: [ram, disk]             # memory-heavy: CPU/GPU work can still run
 ```
 
-**Edits apply live.** The daemon watches the file, so changes to `process_rules` and the
-debounce settings take effect within about a second. A broken edit is logged and ignored,
+**Edits apply live.** The daemon watches the file, so changes to `process_rules`, the
+debounce settings, and `sharing` take effect within about a second. A broken edit is logged and ignored,
 and the previous rules stay active. Changing the poll interval, lease bounds,
 `allow_manual_blocker`, or logging needs a daemon restart.
+
+How small "throttled" is, and how many throttled claims fit, are in `sharing`:
+
+```yaml
+sharing:
+  throttle_max_cores: 1
+  throttle_priority: below_normal   # or idle
+  throttle_max_ram_gb: 2
+  max_throttled_per_resource: 3     # beyond this, new claims queue
+  unshareable: [gpu]                # queued, not throttled, while contended
+  queue_checkin_seconds: 120
+```
 
 [`config.example.yaml`](config.example.yaml) documents every setting.
 
@@ -145,7 +217,10 @@ and the previous rules stay active. Changing the poll interval, lease bounds,
 appearing and clearing, and config reloads.
 
 **Restart the daemon:** `Stop-Process -Name ComputeWarden.Daemon`. The next tool call starts
-a fresh one. Reservations are in memory, so a restart clears them.
+a fresh one. Claims and the mode are in memory, so a restart clears them.
+
+**What is everyone doing?** Run `cw`. It shows the mode, running games, and every agent
+claim with its advice, place in line, and lease.
 
 **"Access denied to the ComputeWarden pipe":** the running daemon was started by another user
 or from an elevated (admin) session, and normal sessions can't connect to it. Stop it (from
@@ -165,7 +240,10 @@ keep using the old adapter until they restart.
 - **Cooperative only.** A program that never asks does whatever it wants.
 - **Resources are declared, not measured.** ComputeWarden doesn't watch CPU or GPU load. It
   trusts agents to name what they'll saturate, and only knows programs you've listed.
-- **All-or-nothing per resource.** Two jobs that each need 30% of RAM still take turns.
+- **Advice, not limits.** A throttled agent shrinks its *next* command; a process already
+  running at full size keeps going until it finishes.
+- **Coarse sharing.** Exclusive claims are one holder per resource. Throttled means a fixed
+  small size (1 core by default), not a fair split of what's free.
 - **Windows, one user.** The daemon serves the user who started it; there's no network or
   multi-machine coordination.
 
@@ -186,11 +264,12 @@ The version lives in `Directory.Build.props`.
 ```
 Claude Code ─┐
 Codex       ─┼─ stdio MCP ─► ComputeWarden.Mcp.exe   (one per agent session)
-Other client ┘                        │
+Other client ┘                        │       cw.exe (you) ─┐
+                                      │◄────────────────────┘
                          named pipe \\.\pipe\ComputeWarden (current user only)
                                       ▼
                            ComputeWarden.Daemon.exe   (one per machine; holds all state)
-                           ├─ Warden: blockers + atomic acquire
+                           ├─ Warden: blockers, claims, the line, advice, mode
                            ├─ ProcessMonitor: polls processes against config rules
                            ├─ LeaseSweeper: expires abandoned reservations
                            └─ config watcher: hot-reloads process rules
@@ -202,6 +281,7 @@ Other client ┘                        │
 | `src/ComputeWarden.Daemon` | Background process: pipe server, process polling, YAML config, logging, single-instance guard. |
 | `src/ComputeWarden.Client` | `WardenClient`, a typed client for the pipe protocol. |
 | `src/ComputeWarden.Mcp` | The stdio MCP adapter; starts the daemon on demand. |
+| `src/ComputeWarden.Cli` | `cw`: status and the user mode from a terminal. |
 | `tests/ComputeWarden.Tests` | xUnit tests. |
 
 [`DESIGN.md`](DESIGN.md) explains the design decisions (state model, acquire algorithm,

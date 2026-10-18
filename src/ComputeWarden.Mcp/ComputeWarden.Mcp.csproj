@@ -19,6 +19,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- publish.ps1 -Install renames a running adapter aside. A single-file exe otherwise
+         loads bundled assemblies lazily from its own path, so after the rename its first
+         tool call fails. Extracting everything at startup makes the rename safe. -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
   </PropertyGroup>
 
 </Project>

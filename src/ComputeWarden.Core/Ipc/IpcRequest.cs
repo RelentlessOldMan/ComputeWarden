@@ -11,6 +11,7 @@ public static class IpcOps
     public const string SetManualBusy = "SET_MANUAL_BUSY";
     public const string ClearManualBusy = "CLEAR_MANUAL_BUSY";
     public const string Stats = "STATS";
+    public const string SetMode = "SET_MODE";
 }
 
 /// <summary>
@@ -35,6 +36,31 @@ public sealed class IpcRequest
     /// daemon that ignores this field errs conservative.
     /// </summary>
     public List<string>? Resources { get; set; }
+
+    /// <summary>
+    /// Claim kind for acquire: "shared" or "exclusive". Absent means a legacy acquire (exclusive,
+    /// refused when busy), so older clients behave exactly as before.
+    /// </summary>
+    public string? Kind { get; set; }
+
+    /// <summary>For an exclusive claim: "throttle" (default), "wait", or "refuse".</summary>
+    public string? WhenBusy { get; set; }
+
+    public int? EstimateSeconds { get; set; }
+    public int? Cores { get; set; }
+    public double? RamGb { get; set; }
+
+    /// <summary>Why this claim skips the line. Only on the user's explicit word.</summary>
+    public string? UserPriority { get; set; }
+
+    /// <summary>Renew: wait up to this long for the claim's grant to change before answering.</summary>
+    public int? WaitSeconds { get; set; }
+
+    /// <summary>Set mode: auto, steady, open, or hold.</summary>
+    public string? Mode { get; set; }
+
+    /// <summary>Set mode: revert to auto after this long (absent: until changed).</summary>
+    public int? DurationSeconds { get; set; }
 }
 
 public static class IpcProtocol

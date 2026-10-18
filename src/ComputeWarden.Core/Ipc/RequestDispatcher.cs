@@ -8,10 +8,13 @@ namespace ComputeWarden.Core.Ipc;
 /// Translates a single JSON request line into a JSON response line by dispatching to the
 /// <see cref="Warden"/>. Pure transport-agnostic logic: no pipes here, so it is fully unit
 /// testable. The named-pipe server is a thin wrapper that reads a line, calls
-/// <see cref="Handle"/>, and writes the result.
+/// <see cref="HandleAsync"/>, and writes the result.
 /// </summary>
 public sealed class RequestDispatcher
 {
+    /// <summary>Longest a renew may wait for its grant to change; well inside the queue check-in window.</summary>
+    public const int MaxWaitSeconds = 60;
+
     private static readonly JsonSerializerOptions ParseOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -19,11 +22,53 @@ public sealed class RequestDispatcher
 
     private readonly Warden _warden;
     private readonly bool _allowManualBlocker;
+    private readonly TimeSpan _pollInterval;
 
-    public RequestDispatcher(Warden warden, bool allowManualBlocker = true)
+    public RequestDispatcher(Warden warden, bool allowManualBlocker = true, TimeSpan? pollInterval = null)
     {
         _warden = warden;
         _allowManualBlocker = allowManualBlocker;
+        _pollInterval = pollInterval ?? TimeSpan.FromSeconds(1);
+    }
+
+    /// <summary>
+    /// Like <see cref="Handle"/>, but a renew with <c>waitSeconds</c> first waits (up to
+    /// <see cref="MaxWaitSeconds"/>) for the claim's grant to change from the one it was last
+    /// given, so a throttled or queued agent hears about a game exiting right away instead of
+    /// polling.
+    /// </summary>
+    public async Task<string> HandleAsync(string requestLine, CancellationToken cancellationToken = default)
+    {
+        if (TryReadWait(requestLine) is { } w)
+        {
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(Math.Min(w.Seconds, MaxWaitSeconds));
+            var last = _warden.LastGrant(w.Id);
+            while (last is not null)
+            {
+                var now = _warden.PeekGrant(w.Id);
+                if (now is null || now != last) break;
+                var left = deadline - DateTimeOffset.UtcNow;
+                if (left <= TimeSpan.Zero) break;
+                await Task.Delay(left < _pollInterval ? left : _pollInterval, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        return Handle(requestLine);
+    }
+
+    private static (string Id, int Seconds)? TryReadWait(string requestLine)
+    {
+        try
+        {
+            var request = JsonSerializer.Deserialize<IpcRequest>(requestLine, ParseOptions);
+            if (request is { WaitSeconds: > 0, ReservationId.Length: > 0 } &&
+                string.Equals(request.Op, IpcOps.Renew, StringComparison.OrdinalIgnoreCase))
+                return (request.ReservationId, request.WaitSeconds.Value);
+        }
+        catch (JsonException)
+        {
+            // Handle reports it.
+        }
+        return null;
     }
 
     public string Handle(string requestLine)
@@ -61,6 +106,7 @@ public sealed class RequestDispatcher
                 IpcOps.SetManualBusy => HandleSetManual(request),
                 IpcOps.ClearManualBusy => HandleClearManual(),
                 IpcOps.Stats => HandleStats(),
+                IpcOps.SetMode => HandleSetMode(request),
                 _ => Error($"Unknown op '{request.Op}'"),
             };
         }
@@ -86,6 +132,8 @@ public sealed class RequestDispatcher
             o["canRunIntensive"] = status.CanRunIntensive;
             o["busyResources"] = ResourceArray(status.BusyResources);
             o["blockers"] = Blockers(status.Blockers);
+            if (status.Mode is { } mode) o["mode"] = ModeJson(mode);
+            o["claims"] = ClaimsJson(status.Claims ?? Array.Empty<ClaimInfo>());
         });
     }
 
@@ -94,12 +142,28 @@ public sealed class RequestDispatcher
 
     private string HandleAcquire(IpcRequest r)
     {
-        var result = _warden.Acquire(
-            r.Owner ?? string.Empty, r.Description ?? string.Empty, r.LeaseSeconds, r.Metadata,
-            Resources.Parse(r.Resources));
+        var resources = Resources.Parse(r.Resources);
+        var result = string.IsNullOrWhiteSpace(r.Kind)
+            // Legacy acquire: exclusive, refused when busy.
+            ? _warden.Acquire(r.Owner ?? string.Empty, r.Description ?? string.Empty, r.LeaseSeconds, r.Metadata, resources)
+            : _warden.Acquire(new ClaimRequest(
+                r.Owner ?? string.Empty,
+                r.Description ?? string.Empty,
+                ParseKind(r.Kind),
+                r.Resources is null or { Count: 0 } ? ResourceSet.None : resources, // None: the kind's default
+                ParseWhenBusy(r.WhenBusy),
+                r.LeaseSeconds,
+                r.EstimateSeconds,
+                r.Cores,
+                r.RamGb,
+                r.UserPriority,
+                r.Metadata));
+
         return Ok(o =>
         {
             o["acquired"] = result.Acquired;
+            if (result.Kind is { } kind) o["kind"] = Warden.KindName(kind);
+            if (result.Advice is { } advice) o["advice"] = AdviceJson(advice);
             if (result.Acquired) o["resources"] = ResourceArray(result.Resources);
             o["reservationId"] = result.ReservationId;
             o["expiresAt"] = Iso(result.ExpiresAt);
@@ -117,7 +181,14 @@ public sealed class RequestDispatcher
             o["renewed"] = result.Renewed;
             o["expiresAt"] = Iso(result.ExpiresAt);
             o["reason"] = result.Reason;
+            if (result.Advice is { } advice) o["advice"] = AdviceJson(advice);
         });
+    }
+
+    private string HandleSetMode(IpcRequest r)
+    {
+        var state = _warden.SetMode(ParseMode(r.Mode), Resources.Parse(r.Resources), r.DurationSeconds, r.Reason);
+        return Ok(o => o["mode"] = ModeJson(state));
     }
 
     private string HandleRelease(IpcRequest r)
@@ -163,7 +234,97 @@ public sealed class RequestDispatcher
         });
     }
 
+    // ---- Parsing --------------------------------------------------------
+
+    private static ClaimKind ParseKind(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "shared" => ClaimKind.Shared,
+        "exclusive" => ClaimKind.Exclusive,
+        _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared or exclusive)"),
+    };
+
+    private static WhenBusy ParseWhenBusy(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
+    {
+        "" or "throttle" => WhenBusy.Throttle,
+        "wait" => WhenBusy.Wait,
+        "refuse" => WhenBusy.Refuse,
+        _ => throw new ArgumentException($"Unknown whenBusy '{value}' (expected throttle, wait, or refuse)"),
+    };
+
+    private static UserMode ParseMode(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
+    {
+        "auto" => UserMode.Auto,
+        "steady" => UserMode.Steady,
+        "open" => UserMode.Open,
+        "hold" => UserMode.Hold,
+        _ => throw new ArgumentException($"Unknown mode '{value}' (expected auto, steady, open, or hold)"),
+    };
+
     // ---- JSON helpers ---------------------------------------------------
+
+    private static JsonObject AdviceJson(Advice a)
+    {
+        var o = new JsonObject
+        {
+            ["grant"] = Warden.GrantName(a.Grant),
+            ["reason"] = a.Reason,
+            ["contended"] = ResourceArray(a.Contended),
+        };
+        if (a.Throttle is { } t)
+        {
+            o["throttle"] = new JsonObject
+            {
+                ["maxCores"] = t.MaxCores,
+                ["priority"] = t.Priority,
+                ["maxRamGb"] = t.MaxRamGb,
+            };
+        }
+        if (a.How is { } how) o["how"] = how;
+        if (a.Queue is { } q)
+        {
+            o["queue"] = new JsonObject
+            {
+                ["position"] = q.Position,
+                ["ahead"] = ClaimsJson(q.Ahead),
+                ["estWaitSeconds"] = q.EstWaitSeconds,
+            };
+        }
+        return o;
+    }
+
+    private static JsonArray ClaimsJson(IReadOnlyList<ClaimInfo> claims)
+    {
+        var array = new JsonArray();
+        foreach (var c in claims)
+        {
+            array.Add(new JsonObject
+            {
+                ["id"] = c.Id,
+                ["owner"] = c.Owner,
+                ["description"] = c.Description,
+                ["kind"] = Warden.KindName(c.Kind),
+                ["resources"] = ResourceArray(c.Resources),
+                ["grant"] = Warden.GrantName(c.Grant),
+                ["holding"] = c.Holding,
+                ["expiresAt"] = Iso(c.ExpiresAt),
+                ["estimateSeconds"] = c.EstimateSeconds,
+                ["cores"] = c.Cores,
+                ["ramGb"] = c.RamGb,
+                ["userPriority"] = c.UserPriority,
+                ["position"] = c.Position,
+            });
+        }
+        return array;
+    }
+
+    private static JsonObject ModeJson(ModeState m) => new()
+    {
+        ["mode"] = Warden.ModeName(m.Mode),
+        ["resources"] = ResourceArray(m.Resources),
+        ["reason"] = m.Reason,
+        ["setAt"] = Iso(m.SetAt),
+        ["expiresAt"] = Iso(m.ExpiresAt),
+    };
 
     private static string Ok(Action<JsonObject> fill)
     {

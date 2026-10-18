@@ -11,8 +11,8 @@ namespace ComputeWarden.Daemon;
 /// Composition root: wires the warden, providers, process monitor, lease sweeper, and pipe
 /// server together from a <see cref="WardenConfig"/>, and manages their lifetime.
 ///
-/// If a config file path is supplied, the host watches it and hot-reloads the process rules +
-/// debounce on change — so editing the exe list takes effect without a restart. (Lease bounds,
+/// If a config file path is supplied, the host watches it and hot-reloads the process rules,
+/// debounce, and sharing settings on change — so editing the exe list takes effect without a restart. (Lease bounds,
 /// manual-blocker toggle, log level, and the poll interval are still applied only at startup.)
 /// </summary>
 public sealed class WardenHost : IAsyncDisposable
@@ -47,7 +47,7 @@ public sealed class WardenHost : IAsyncDisposable
         _processProvider = new ProcessBlockerProvider(
             processLister, config.ProcessRules, config.ProcessDetection, clock);
 
-        Warden = new Warden(clock, config.Leases, config.Limits, manual, new[] { _processProvider }, log);
+        Warden = new Warden(clock, config.Leases, config.Limits, manual, new[] { _processProvider }, log, config.Sharing);
 
         var dispatcher = new RequestDispatcher(Warden, config.AllowManualBlocker);
 
@@ -99,6 +99,7 @@ public sealed class WardenHost : IAsyncDisposable
         }
 
         _processProvider.UpdateRules(loaded.Config.ProcessRules, loaded.Config.ProcessDetection);
+        Warden.UpdateSharing(loaded.Config.Sharing);
         var active = loaded.Config.ProcessRules.Count(r => r.Enabled);
         _log.Info($"Configuration reloaded: {active} process rule(s) active");
     }

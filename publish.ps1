@@ -30,6 +30,10 @@ Write-Host "Publishing MCP adapter -> $out"
 dotnet publish (Join-Path $root "src/ComputeWarden.Mcp/ComputeWarden.Mcp.csproj") @common
 if ($LASTEXITCODE -ne 0) { throw "mcp publish failed" }
 
+Write-Host "Publishing cw (user CLI) -> $out"
+dotnet publish (Join-Path $root "src/ComputeWarden.Cli/ComputeWarden.Cli.csproj") @common
+if ($LASTEXITCODE -ne 0) { throw "cw publish failed" }
+
 if ($Install) {
     $bin = Join-Path $env:LOCALAPPDATA "ComputeWarden\bin"
     Write-Host "Installing to $bin"
@@ -80,6 +84,10 @@ if ($Install) {
         Write-Warning "Close Claude/Codex sessions and re-run -Install to update those."
     }
     Write-Host "Installed to $bin (MCP points at ComputeWarden.Mcp.exe there)."
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (($userPath -split ';') -contains $bin)) {
+        Write-Host "Tip: add $bin to your PATH to run 'cw' from any terminal."
+    }
     return
 }
 

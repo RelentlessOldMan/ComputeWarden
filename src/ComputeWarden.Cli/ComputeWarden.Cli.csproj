@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ComputeWarden.Core\ComputeWarden.Core.csproj" />
+    <ProjectReference Include="..\ComputeWarden.Client\ComputeWarden.Client.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ComputeWarden.Tests" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The user types this: keep it short. -->
+    <AssemblyName>cw</AssemblyName>
+  </PropertyGroup>
+
+</Project>

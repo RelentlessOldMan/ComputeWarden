@@ -58,6 +58,7 @@ $zip = Join-Path $root "ComputeWarden-v$Version-win-x64.zip"
 $payload = @(
     (Join-Path $pub "ComputeWarden.Daemon.exe"),
     (Join-Path $pub "ComputeWarden.Mcp.exe"),
+    (Join-Path $pub "cw.exe"),
     (Join-Path $root "config.example.yaml"),
     (Join-Path $root ".mcp.json.example"),
     (Join-Path $root "README.md"),

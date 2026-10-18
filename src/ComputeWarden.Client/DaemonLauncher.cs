@@ -1,11 +1,12 @@
 using System.Diagnostics;
 
-namespace ComputeWarden.Mcp;
+namespace ComputeWarden.Client;
 
 /// <summary>
 /// Locates and launches the ComputeWarden daemon detached, so it outlives this adapter and
 /// becomes the machine-wide authority. The daemon's own single-instance mutex makes a
-/// duplicate launch harmless (the extra process exits immediately).
+/// duplicate launch harmless (the extra process exits immediately). Used by the MCP adapter
+/// and by cw, both of which ship next to the daemon.
 /// </summary>
 public static class DaemonLauncher
 {
@@ -16,6 +17,9 @@ public static class DaemonLauncher
         {
             var (fileName, arguments) = Resolve();
             if (fileName is null) return false;
+            var workingDirectory = Path.GetDirectoryName(fileName) is { Length: > 0 } d && Directory.Exists(d)
+                ? d
+                : AppContext.BaseDirectory;
 
             var psi = new ProcessStartInfo
             {
@@ -24,7 +28,7 @@ public static class DaemonLauncher
                 CreateNoWindow = true,
                 RedirectStandardOutput = false,
                 RedirectStandardError = false,
-                WorkingDirectory = AppContext.BaseDirectory,
+                WorkingDirectory = workingDirectory,
             };
             foreach (var arg in arguments) psi.ArgumentList.Add(arg);
 
@@ -44,17 +48,29 @@ public static class DaemonLauncher
         if (!string.IsNullOrWhiteSpace(overridePath))
             return FromPath(overridePath);
 
-        // 2. Alongside this adapter (the normal published layout).
-        var dir = AppContext.BaseDirectory;
+        // 2. Alongside this exe (the normal published layout). Check the exe's own folder first:
+        //    a self-extracting single-file app's BaseDirectory is its temp extraction folder.
         var exeName = OperatingSystem.IsWindows() ? "ComputeWarden.Daemon.exe" : "ComputeWarden.Daemon";
-        var exe = Path.Combine(dir, exeName);
-        if (File.Exists(exe)) return (exe, Array.Empty<string>());
+        foreach (var dir in SearchDirectories())
+        {
+            var exe = Path.Combine(dir, exeName);
+            if (File.Exists(exe)) return (exe, Array.Empty<string>());
+        }
 
         // 3. Framework-dependent build: run the dll via the dotnet host.
-        var dll = Path.Combine(dir, "ComputeWarden.Daemon.dll");
-        if (File.Exists(dll)) return ("dotnet", new[] { dll });
+        foreach (var dir in SearchDirectories())
+        {
+            var dll = Path.Combine(dir, "ComputeWarden.Daemon.dll");
+            if (File.Exists(dll)) return ("dotnet", new[] { dll });
+        }
 
         return (null, Array.Empty<string>());
+    }
+
+    private static IEnumerable<string> SearchDirectories()
+    {
+        if (Path.GetDirectoryName(Environment.ProcessPath) is { Length: > 0 } exeDir) yield return exeDir;
+        yield return AppContext.BaseDirectory;
     }
 
     private static (string?, string[]) FromPath(string path)

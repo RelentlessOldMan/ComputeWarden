@@ -1,0 +1,347 @@
+using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using ComputeWarden.Cli;
+using ComputeWarden.Client;
+using ComputeWarden.Core;
+using ComputeWarden.Core.Config;
+using ComputeWarden.Core.Diagnostics;
+using ComputeWarden.Core.Ipc;
+using ComputeWarden.Core.Model;
+using ComputeWarden.Core.Providers;
+using ComputeWarden.Daemon;
+using ComputeWarden.Mcp;
+
+namespace ComputeWarden.Tests;
+
+/// <summary>The sharing system over the wire: dispatcher JSON, long-poll renew, client, MCP tools, and cw.</summary>
+[Collection("mcp-gateway")] // the MCP tool tests mutate the static WardenGateway
+public class SharingIpcTests
+{
+    private sealed class NoProcesses : IProcessLister
+    {
+        public IReadOnlyList<RunningProcess> List() => Array.Empty<RunningProcess>();
+    }
+
+    private static (RequestDispatcher d, Warden w) New()
+    {
+        var warden = TestFactory.NewWarden(new FakeClock());
+        return (new RequestDispatcher(warden, pollInterval: TimeSpan.FromMilliseconds(20)), warden);
+    }
+
+    private static JsonNode Handle(RequestDispatcher d, object request)
+        => JsonNode.Parse(d.Handle(JsonSerializer.Serialize(request)))!;
+
+    private static WardenHost StartHost(out string pipeName)
+    {
+        pipeName = "ComputeWarden-test-" + Guid.NewGuid().ToString("N");
+        var host = new WardenHost(WardenConfig.CreateDefault(), NullLog.Instance, new NoProcesses(), pipeName: pipeName);
+        host.Start();
+        return host;
+    }
+
+    // ---- Dispatcher ------------------------------------------------------
+
+    [Fact]
+    public void Acquire_with_kind_returns_advice()
+    {
+        var (d, _) = New();
+        Handle(d, new { v = 1, op = "SET_MODE", mode = "steady", reason = "gaming" });
+
+        var res = Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "build", kind = "shared", estimateSeconds = 60 });
+
+        Assert.True((bool)res["acquired"]!);
+        Assert.Equal("shared", (string)res["kind"]!);
+        var advice = res["advice"]!;
+        Assert.Equal("throttled", (string)advice["grant"]!);
+        Assert.Equal(1, (int)advice["throttle"]!["maxCores"]!);
+        Assert.Contains("steady mode: gaming", (string)advice["reason"]!);
+        Assert.Equal(new[] { "cpu", "ram", "disk" }, advice["contended"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram", "disk" }, res["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+    }
+
+    [Fact]
+    public void Legacy_acquire_response_has_no_advice()
+    {
+        var (d, _) = New();
+
+        var res = Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "x" });
+
+        Assert.True((bool)res["acquired"]!);
+        Assert.Null(res["advice"]);
+        Assert.Null(res["kind"]);
+        Assert.Equal(5, res["resources"]!.AsArray().Count);
+    }
+
+    [Fact]
+    public void Queued_claim_reports_its_place_in_line()
+    {
+        var (d, _) = New();
+        Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "x", kind = "exclusive" });
+
+        var res = Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "y", kind = "exclusive", whenBusy = "wait" });
+
+        var queue = res["advice"]!["queue"]!;
+        Assert.Equal("queued", (string)res["advice"]!["grant"]!);
+        Assert.Equal(1, (int)queue["position"]!);
+    }
+
+    [Fact]
+    public void Status_lists_mode_and_claims()
+    {
+        var (d, _) = New();
+        Handle(d, new { v = 1, op = "SET_MODE", mode = "hold", durationSeconds = 600, resources = new[] { "gpu" } });
+        Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "x", kind = "shared" });
+
+        var res = Handle(d, new { v = 1, op = "STATUS" });
+
+        Assert.Equal("hold", (string)res["mode"]!["mode"]!);
+        Assert.Equal("gpu", (string)res["mode"]!["resources"]![0]!);
+        Assert.NotNull((string?)res["mode"]!["expiresAt"]);
+        var claim = Assert.Single(res["claims"]!.AsArray())!;
+        Assert.Equal("A", (string)claim["owner"]!);
+        Assert.Equal("full", (string)claim["grant"]!);
+    }
+
+    [Theory]
+    [InlineData("{\"v\":1,\"op\":\"SET_MODE\",\"mode\":\"turbo\"}", "Unknown mode")]
+    [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"greedy\"}", "Unknown kind")]
+    [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"exclusive\",\"whenBusy\":\"cry\"}", "Unknown whenBusy")]
+    [InlineData("{\"v\":1,\"op\":\"SET_MODE\",\"mode\":\"hold\",\"durationSeconds\":0}", "durationSeconds")]
+    public void Bad_values_are_reported_as_errors(string line, string expected)
+    {
+        var (d, _) = New();
+
+        var res = JsonNode.Parse(d.Handle(line))!;
+
+        Assert.False((bool)res["ok"]!);
+        Assert.Contains(expected, (string)res["error"]!);
+    }
+
+    [Fact]
+    public async Task Renew_with_wait_returns_as_soon_as_the_grant_changes()
+    {
+        var (d, w) = New();
+        w.SetMode(UserMode.Steady);
+        var id = w.Acquire(new ClaimRequest("A", "build", ClaimKind.Shared)).ReservationId!;
+
+        var watch = Stopwatch.StartNew();
+        var pending = d.HandleAsync(JsonSerializer.Serialize(new { v = 1, op = "RENEW", reservationId = id, waitSeconds = 30 }));
+        await Task.Delay(100);
+        Assert.False(pending.IsCompleted);
+        w.SetMode(UserMode.Auto);
+        var res = JsonNode.Parse(await pending)!;
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10));
+        Assert.True((bool)res["renewed"]!);
+        Assert.Equal("full", (string)res["advice"]!["grant"]!);
+        Assert.Equal(Grant.Full, w.LastGrant(id));
+    }
+
+    [Fact]
+    public async Task Renew_with_wait_gives_up_at_the_deadline()
+    {
+        var (d, w) = New();
+        w.SetMode(UserMode.Steady);
+        var id = w.Acquire(new ClaimRequest("A", "build", ClaimKind.Shared)).ReservationId!;
+
+        var res = JsonNode.Parse(await d.HandleAsync(JsonSerializer.Serialize(new { v = 1, op = "RENEW", reservationId = id, waitSeconds = 1 })))!;
+
+        Assert.True((bool)res["renewed"]!);
+        Assert.Equal("throttled", (string)res["advice"]!["grant"]!);
+    }
+
+    [Fact]
+    public async Task Renew_with_wait_on_an_unknown_id_answers_at_once()
+    {
+        var (d, _) = New();
+
+        var watch = Stopwatch.StartNew();
+        var res = JsonNode.Parse(await d.HandleAsync("{\"v\":1,\"op\":\"RENEW\",\"reservationId\":\"nope\",\"waitSeconds\":30}"))!;
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5));
+        Assert.False((bool)res["renewed"]!);
+    }
+
+    // ---- Client over the pipe -------------------------------------------
+
+    [Fact]
+    public async Task Client_claims_modes_and_long_poll_round_trip()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+
+        var mode = await client.SetModeAsync(UserMode.Steady, durationSeconds: 3600, reason: "gaming");
+        Assert.Equal(UserMode.Steady, mode.Mode);
+        Assert.NotNull(mode.ExpiresAt);
+
+        var claim = await client.AcquireAsync(new ClaimRequest("A", "build", ClaimKind.Shared, EstimateSeconds: 120, Cores: 8, RamGb: 4.5));
+        Assert.Equal(ClaimKind.Shared, claim.Kind);
+        Assert.Equal(Grant.Throttled, claim.Advice!.Grant);
+        Assert.Equal(2, claim.Advice.Throttle!.MaxRamGb);
+        Assert.NotNull(claim.Advice.How);
+
+        var status = await client.StatusAsync();
+        Assert.Equal("gaming", status.Mode!.Reason);
+        var info = Assert.Single(status.Claims!);
+        Assert.Equal(8, info.Cores);
+        Assert.Equal(4.5, info.RamGb);
+        Assert.Equal(Grant.Throttled, info.Grant);
+
+        var renewing = client.RenewAsync(claim.ReservationId!, waitSeconds: 30);
+        await Task.Delay(200);
+        await client.SetModeAsync(UserMode.Auto);
+        var renew = await renewing;
+        Assert.True(renew.Renewed);
+        Assert.True(renew.Advice is null || renew.Advice.Grant == Grant.Full);
+
+        var queued = await client.AcquireAsync(new ClaimRequest("B", "x", ClaimKind.Exclusive, ResourceSet.Gpu));
+        var waiting = await client.AcquireAsync(new ClaimRequest("C", "y", ClaimKind.Exclusive, ResourceSet.Gpu, WhenBusy.Wait, UserPriority: "user said so"));
+        Assert.Equal(Grant.Full, queued.Advice!.Grant);
+        Assert.Equal(Grant.Queued, waiting.Advice!.Grant);
+        Assert.Equal(1, waiting.Advice.Queue!.Position);
+        Assert.Equal("B", waiting.Advice.Queue.Ahead.Count == 0 ? "B" : waiting.Advice.Queue.Ahead[0].Owner);
+    }
+
+    // ---- MCP tools ------------------------------------------------------
+
+    [Fact]
+    public async Task Mcp_tools_report_advice_mode_and_claims()
+    {
+        await using var host = StartHost(out var pipe);
+        WardenGateway.Configure(new WardenClient(pipe), autoSpawn: false);
+
+        var set = JsonNode.Parse(await ComputeWardenTools.SetMode("steady", 7200, "gaming"))!;
+        Assert.Equal("steady", (string)set["mode"]!["mode"]!);
+        Assert.True((int)set["mode"]!["remaining_seconds"]! > 7000);
+
+        var acq = JsonNode.Parse(await ComputeWardenTools.Acquire("Claude", "dotnet test", kind: "shared", estimateSeconds: 90))!;
+        Assert.True((bool)acq["acquired"]!);
+        Assert.Equal("throttled", (string)acq["advice"]!["grant"]!);
+        Assert.Equal(1, (int)acq["advice"]!["throttle"]!["max_cores"]!);
+        Assert.Contains("small", (string)acq["advice"]!["next"]!);
+
+        var status = JsonNode.Parse(await ComputeWardenTools.Status())!;
+        Assert.Equal("steady", (string)status["mode"]!["mode"]!);
+        Assert.Equal("Claude", (string)status["claims"]![0]!["owner"]!);
+
+        await ComputeWardenTools.SetMode("auto");
+        var renew = JsonNode.Parse(await ComputeWardenTools.Renew((string)acq["reservation_id"]!, waitSeconds: 5))!;
+        Assert.True((bool)renew["renewed"]!);
+        Assert.Equal("full", (string)renew["advice"]!["grant"]!); // the game-over / mode-over signal
+
+        var bad = JsonNode.Parse(await ComputeWardenTools.Acquire("Claude", "x", kind: "greedy"))!;
+        Assert.Contains("Unknown kind", (string)bad["error"]!);
+    }
+
+    [Fact]
+    public async Task Mcp_acquire_without_kind_is_the_legacy_shape()
+    {
+        await using var host = StartHost(out var pipe);
+        WardenGateway.Configure(new WardenClient(pipe), autoSpawn: false);
+
+        var acq = JsonNode.Parse(await ComputeWardenTools.Acquire("Claude", "index"))!;
+
+        Assert.True((bool)acq["acquired"]!);
+        Assert.Null(acq["advice"]);
+        Assert.Null(acq["kind"]);
+    }
+
+    // ---- cw -------------------------------------------------------------
+
+    [Fact]
+    public async Task Cw_sets_and_shows_the_mode_and_status()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        var output = new StringWriter();
+        var errors = new StringWriter();
+
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "mode", "steady", "2h", "gaming", "tonight" }, client, output, errors));
+        Assert.Contains("Mode set: steady, 2h left: gaming tonight", output.ToString());
+
+        await client.AcquireAsync(new ClaimRequest("Codex", "full test suite", ClaimKind.Exclusive, ResourceSet.Cpu, WhenBusy.Wait));
+        output.GetStringBuilder().Clear();
+        Assert.Equal(0, await Cli.Cli.RunAsync(Array.Empty<string>(), client, output, errors));
+        var text = output.ToString();
+        Assert.Contains("Mode:    steady", text);
+        Assert.Contains("queued #1", text);
+        Assert.Contains("Codex: full test suite [cpu]", text);
+
+        output.GetStringBuilder().Clear();
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "mode", "auto" }, client, output, errors));
+        Assert.Contains("auto (normal rules)", output.ToString());
+        Assert.Equal(UserMode.Auto, (await client.StatusAsync()).Mode!.Mode);
+    }
+
+    [Fact]
+    public async Task Cw_reports_bad_input_and_a_missing_daemon()
+    {
+        var output = new StringWriter();
+        var errors = new StringWriter();
+        var nobody = new WardenClient("ComputeWarden-test-none-" + Guid.NewGuid().ToString("N"), connectTimeoutMs: 100);
+
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "mode", "turbo" }, nobody, output, errors));
+        Assert.Contains("Unknown mode 'turbo'", errors.ToString());
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "frobnicate" }, nobody, output, errors));
+        Assert.Equal(1, await Cli.Cli.RunAsync(new[] { "status" }, nobody, output, errors));
+        Assert.Contains("Could not reach", errors.ToString());
+    }
+
+    [Fact]
+    public async Task Cw_starts_the_daemon_only_when_it_needs_one()
+    {
+        var launches = 0;
+        bool Launch() { launches++; return false; }
+        var nobody = new WardenClient("ComputeWarden-test-none-" + Guid.NewGuid().ToString("N"), connectTimeoutMs: 100);
+
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "help" }, nobody, new StringWriter(), new StringWriter(), Launch));
+        Assert.Equal(0, launches);
+        Assert.Equal(1, await Cli.Cli.RunAsync(new[] { "mode", "steady" }, nobody, new StringWriter(), new StringWriter(), Launch));
+        Assert.Equal(1, launches);
+
+        await using var host = StartHost(out var pipe);
+        Assert.Equal(0, await Cli.Cli.RunAsync(Array.Empty<string>(), new WardenClient(pipe), new StringWriter(), new StringWriter(), Launch));
+        Assert.Equal(1, launches);
+    }
+
+    [Theory]
+    [InlineData("90m", 5400)]
+    [InlineData("2h", 7200)]
+    [InlineData("1h30m", 5400)]
+    [InlineData("1d", 86400)]
+    [InlineData("45s", 45)]
+    [InlineData("30", 1800)]
+    public void Cw_parses_durations(string text, int seconds)
+    {
+        Assert.True(Cli.Cli.TryParseDuration(text, out var parsed));
+        Assert.Equal(seconds, parsed);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("0")]
+    [InlineData("8d")]
+    [InlineData("gaming")]
+    [InlineData("2x")]
+    public void Cw_rejects_bad_durations(string text)
+        => Assert.False(Cli.Cli.TryParseDuration(text, out _));
+
+    [Fact]
+    public void Cw_mode_arguments_parse()
+    {
+        Assert.True(Cli.Cli.TryParseMode(new[] { "hold", "for", "30m", "recording", "--resources", "cpu,gpu" }, out var r, out _));
+        Assert.Equal(UserMode.Hold, r.Mode);
+        Assert.Equal(1800, r.DurationSeconds);
+        Assert.Equal("recording", r.Reason);
+        Assert.Equal(new[] { "cpu", "gpu" }, r.Resources);
+
+        Assert.True(Cli.Cli.TryParseMode(new[] { "open" }, out var open, out _));
+        Assert.Null(open.DurationSeconds);
+        Assert.Null(open.Reason);
+
+        Assert.False(Cli.Cli.TryParseMode(new[] { "auto", "2h" }, out _, out var error));
+        Assert.Contains("auto takes no duration", error);
+        Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "--resources", "cpu,bogus" }, out _, out _));
+    }
+}

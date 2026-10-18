@@ -2,14 +2,24 @@ using ComputeWarden.Core.Model;
 
 namespace ComputeWarden.Core;
 
-/// <summary>Complete current state, for the status operation.</summary>
+/// <summary>
+/// Complete current state, for the status operation. <see cref="Blockers"/> are what holds
+/// resources (processes, manual holds, a blocking user mode, exclusive holds);
+/// <see cref="Claims"/> lists every agent claim, including shared work and the line.
+/// </summary>
 public sealed record StatusResult(
     MachineState State,
     bool CanRunIntensive,
     IReadOnlyList<Blocker> Blockers,
-    ResourceSet BusyResources = ResourceSet.None);
+    ResourceSet BusyResources = ResourceSet.None,
+    ModeState? Mode = null,
+    IReadOnlyList<ClaimInfo>? Claims = null);
 
-/// <summary>Outcome of an atomic acquire attempt.</summary>
+/// <summary>
+/// Outcome of an acquire. A legacy acquire (no kind) either holds its resources or is refused.
+/// A claim with a kind is always created (unless invalid) and carries <see cref="Advice"/>:
+/// full, throttled, or queued.
+/// </summary>
 public sealed record AcquireResult(
     bool Acquired,
     string? ReservationId,
@@ -17,7 +27,9 @@ public sealed record AcquireResult(
     MachineState MachineState,
     string? Reason,
     IReadOnlyList<Blocker> Blockers,
-    ResourceSet Resources = ResourceSet.None)
+    ResourceSet Resources = ResourceSet.None,
+    Advice? Advice = null,
+    ClaimKind? Kind = null)
 {
     public static AcquireResult Success(Reservation r) => new(
         Acquired: true,
@@ -28,17 +40,31 @@ public sealed record AcquireResult(
         Blockers: Array.Empty<Blocker>(),
         Resources: r.Resources);
 
+    public static AcquireResult Claimed(Reservation r, Advice advice, MachineState state, IReadOnlyList<Blocker> blockers) => new(
+        Acquired: true,
+        ReservationId: r.Id,
+        ExpiresAt: r.ExpiresAt,
+        MachineState: state,
+        Reason: advice.Reason,
+        Blockers: blockers,
+        Resources: r.Resources,
+        Advice: advice,
+        Kind: r.Kind);
+
     public static AcquireResult Failure(string reason, MachineState state, IReadOnlyList<Blocker> blockers) =>
         new(false, null, null, state, reason, blockers);
 }
 
-/// <summary>Outcome of a lease renewal.</summary>
+/// <summary>Outcome of a lease renewal, which is also how a claim checks back for current advice.</summary>
 public sealed record RenewResult(
     bool Renewed,
     DateTimeOffset? ExpiresAt,
-    string? Reason)
+    string? Reason,
+    Advice? Advice = null)
 {
-    public static RenewResult Success(DateTimeOffset expiresAt) => new(true, expiresAt, null);
+    public static RenewResult Success(DateTimeOffset expiresAt, Advice? advice = null)
+        => new(true, expiresAt, advice?.Reason, advice);
+
     public static RenewResult Failure(string reason) => new(false, null, reason);
 }
 

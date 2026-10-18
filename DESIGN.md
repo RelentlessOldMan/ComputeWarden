@@ -213,3 +213,167 @@ Two agents, one machine: A acquires, B is refused and told A is the blocker, A r
 releases, B then acquires. If A crashes, its lease expires and the machine frees up. A
 configured external process blocks both until it exits. When that scenario passes
 reliably, v1 is done.
+
+## 16. Shared work, advice, and the line
+
+> Status: built (`Warden.Evaluate`, `SharingTests`, `SharingIpcTests`). Everything below is **advisory**. The warden tells agents
+> how big to run; it never caps, kills, or reprioritizes a process.
+
+### Motivation
+
+Today the warden only answers yes or no, and only for jobs heavy enough to bother asking.
+Everyday builds, test runs, and app launches never ask, so they pile onto the machine while
+a game is running, or crawl along at one core after it has quit. The target behavior is
+what a human would tell several sessions by hand: *"I'm gaming, keep it small"*, and later
+*"I'm done with my game, go full ham as long as you have the lease."* The aim is for
+sessions to get that answer from the warden, live, without being told.
+
+### Claim kinds
+
+| Kind | Created by | Meaning |
+|---|---|---|
+| **Priority** | Config process rules (games, etc.) | **The user's own lease.** Gaming means the user holds those resources. Non-negotiable: never queued, asked, or throttled, and every agent on those resources is limited for as long as it runs. |
+| **Exclusive** | Agent heavy job (today's `acquire`) | Will saturate these resources. One holder per resource; the rest wait in line or run throttled. |
+| **Shared** | Agent everyday build/test/run | Normal work. Never refused; told how big it may run right now. With no `resources`, it means cpu+ram+disk (not all), so a GPU-using game throttles a build instead of queuing it. |
+
+Agent claims (exclusive, shared, and queue tickets) are all **leases**: renew, release,
+and crash-safe expiry are unchanged. A lease just gains a `kind` and the warden's current
+**advice**.
+
+### Request and answer
+
+```
+acquire(owner, description, resources, kind: "shared" | "exclusive",
+        estimateSeconds, cores?, ramGb?, whenBusy: "throttle" | "wait",
+        userPriority?: "<why the user said so>")
+```
+
+| Mode | Meaning |
+|---|---|
+| `full` | Nothing in the way; run normally. For an exclusive claim: go full ham while the lease is held. |
+| `throttled` | Run, but small: `{max_cores, priority, max_ram_gb, reason, how}`, where `how` is a concrete hint (`dotnet build -m:1`, `dotnet test -- RunConfiguration.MaxCpuCount=1`). |
+| `queued` | In line: `{position, ahead[], est_wait_seconds}`. Check back via renew. The estimate is null when a game, hold, or steady mode is in the way, since nobody knows when that ends. |
+
+### Rules
+
+1. A **priority** claim on a resource throttles everything else on that resource, always.
+   No mode, lease, or `userPriority` overrides it. If the
+   resource can't be shared (config; by default every resource except `gpu` can be), the
+   request is queued instead.
+2. An **exclusive** claim gets `full` when its resources are free *and* nobody ahead of it
+   in line wants them. Otherwise it gets `throttled` or `queued`, per `whenBusy`
+   (default `throttle`).
+3. A **shared** claim gets `full` unless a priority or exclusive claim overlaps it, in
+   which case it gets `throttled`. Shared claims block neither each other nor exclusive
+   claims; they're short and polite, and they're told to shrink on their next check.
+4. **Throttle cap:** at most `max_throttled_per_resource` (default 3) throttled claims per
+   contended resource. Beyond that, a request is queued. The cap applies only to *new*
+   starts: **work that has started is never told `queued`**, only `throttled`. It can't
+   un-start, and telling it to stop would just be ignored.
+5. **The line is first come, first served.** A newcomer can't get `full` ahead of an
+   earlier waiter for an overlapping resource. A queued ticket is promoted to `full` when it
+   checks in at the head of the line and its resources are free.
+6. **Skipping the line:** `userPriority` puts the request at the front of the line. It
+   never takes resources from current holders (advisory), and it is logged and shown in
+   status. Agents set it only when the user has told them they have priority.
+7. **UNKNOWN:** exclusive claims are queued or refused as today; shared claims are
+   throttled.
+8. **Legacy acquires** (no `kind`) are also refused when anyone is in line for an
+   overlapping resource. They can't jump the queue.
+
+### Checking back
+
+`renew` returns the current advice, so advice tracks the machine while work is running:
+
+- If a game starts during an exclusive job, the next renew says `throttled: Overwatch
+  started`. The running process won't shrink, but the agent's next step will be smaller.
+- If the game exits, a throttled claim's next renew says `full`, and new claims get `full`
+  straight away. This is the automatic "go full ham".
+- A queued ticket's renew returns its position, or its promotion to `full`. Tickets must
+  check in every `queue_checkin_seconds` (default 120), or they drop out of line, so a
+  crashed agent can't stall the queue. The ticket's lease is the check-in window until it
+  starts; then it gets its real lease.
+- **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
+  grant differs from the last one it was told, or the wait runs out. The dispatcher polls
+  `Warden.PeekGrant` once a second, which renews nothing, and then does the real renew. So
+  waiting agents don't burn tokens polling, and a game exit reaches them within about a
+  second. An unknown id answers at once.
+
+### User override: the mode
+
+One machine-wide setting that only the user sets. It adjusts how agents treat *each other*.
+It never loosens a priority claim: while a game is running, everyone on its resources is
+limited, in every mode.
+
+| Mode | Says | Effect |
+|---|---|---|
+| `hold` | "Nobody start anything." | Every new claim is queued; work already running is throttled (rule 4). |
+| `steady` | "Y'all go slow and steady." | Everything gets `throttled`; nobody gets `full`. Exclusive claims are throttled or queued, per `whenBusy`. |
+| `auto` | (default) | The rules above. |
+| `open` | "Full bore allowed with a lease." | No throttling between agents: shared work runs `full` beside exclusive leases, with no throttle cap between agents. A game still throttles, and its cap still applies. Exclusive leases still keep two heavy jobs off the same resource. |
+
+- A mode can take `resources` (e.g. `steady` for cpu only), an optional duration (`steady`
+  for 2h, then back to `auto`), and a reason. The reason is shown to agents in their advice:
+  `throttled: user set steady mode ("gaming tonight")`.
+- Running agents pick up a mode change on their next renew, the same way they notice a game
+  starting or stopping.
+- **Ways to set it:** a small CLI (`cw mode steady 2h "gaming"`, also runnable as
+  `! cw mode open` inside a Claude Code session), or by telling any agent, which calls
+  `computewarden_set_mode`. The tool is documented as user-only: an agent calls it only on
+  the user's explicit word, never on its own judgment (the same trust model as
+  `userPriority`).
+- Non-auto modes other than `open` also show as a synthetic `mode` blocker in status, so
+  legacy clients and `can_run` see the machine as busy.
+- `set_manual_busy` and `clear_manual_busy` stay as their own separate provider, not as aliases
+  for the mode. A manual hold acts like `hold` on its resources, and clearing it doesn't
+  touch the mode.
+
+### Estimates
+
+Agents supply `estimateSeconds`, `cores`, and `ramGb`. These aren't used for core
+arithmetic. They feed queue wait estimates (time left on the jobs ahead), status ("3 shared
+jobs, ~12 cores claimed, throttled by Overwatch"), and the default lease length: once
+started, a claim with an estimate and no `leaseSeconds` gets `ceil(estimate × 1.25) + 30`
+seconds, clamped to the lease bounds.
+
+### Config (defaults)
+
+```yaml
+sharing:                     # hot-reloads with the rest of the config
+  throttle_max_cores: 1
+  throttle_priority: below_normal   # or idle
+  throttle_max_ram_gb: 2
+  max_throttled_per_resource: 3
+  unshareable: [gpu]
+  queue_checkin_seconds: 120
+```
+
+### Compatibility
+
+An acquire without `kind` behaves exactly as today: an exclusive claim that is refused
+rather than queued. Old adapters and old CLAUDE.md wording keep working, with no IPC version
+bump.
+
+### Agent policy change
+
+For this to work, every session reports its builds, tests, and runs as shared claims
+(about two small tool calls per command) in every project, not just opted-in ones. The
+global CLAUDE.md rule becomes:
+
+- Report builds, tests, and runs as shared claims, and follow the advice.
+- Use exclusive claims for genuinely heavy jobs.
+- Set `userPriority` only on the user's word.
+
+### Example
+
+```
+10:00  A: shared build (cpu)            → full
+10:01  B: exclusive test fan-out (cpu)  → full     (A's next check: throttled)
+10:02  C: exclusive indexing (cpu,disk), whenBusy: wait
+                                        → queued #1, ~5 min
+10:03  User starts Overwatch            → B's renew: throttled; new shared work: throttled
+10:04  D, E, F: shared builds           → throttled ×3 (cap reached)
+10:05  G: shared build                  → queued #2
+10:07  B releases; C checks in          → still queued (Overwatch is priority)
+10:40  Overwatch exits                  → C promoted to full on next check; G gets full
+```

@@ -25,6 +25,7 @@
     <ProjectReference Include="..\..\src\ComputeWarden.Daemon\ComputeWarden.Daemon.csproj" />
     <ProjectReference Include="..\..\src\ComputeWarden.Client\ComputeWarden.Client.csproj" />
     <ProjectReference Include="..\..\src\ComputeWarden.Mcp\ComputeWarden.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\ComputeWarden.Cli\ComputeWarden.Cli.csproj" />
   </ItemGroup>
 
 </Project>

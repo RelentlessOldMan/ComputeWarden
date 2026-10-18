@@ -74,11 +74,72 @@ public sealed class WardenClient
         return ResponseParser.Acquire(await SendAsync(request, ct));
     }
 
-    public async Task<RenewResult> RenewAsync(string reservationId, int? leaseSeconds = null, CancellationToken ct = default)
+    /// <summary>
+    /// Reports work and gets the warden's advice (full, throttled, or queued). Shared claims
+    /// and exclusive claims that throttle or wait are always created; the advice says how big
+    /// to run.
+    /// </summary>
+    public async Task<AcquireResult> AcquireAsync(ClaimRequest claim, CancellationToken ct = default)
     {
-        var request = new IpcRequest { Op = IpcOps.Renew, ReservationId = reservationId, LeaseSeconds = leaseSeconds };
-        return ResponseParser.Renew(await SendAsync(request, ct));
+        var request = new IpcRequest
+        {
+            Op = IpcOps.Acquire,
+            Owner = claim.Owner,
+            Description = claim.Description,
+            Kind = Warden.KindName(claim.Kind),
+            WhenBusy = claim.Kind == ClaimKind.Exclusive ? WhenBusyName(claim.WhenBusy) : null,
+            LeaseSeconds = claim.LeaseSeconds,
+            EstimateSeconds = claim.EstimateSeconds,
+            Cores = claim.Cores,
+            RamGb = claim.RamGb,
+            UserPriority = claim.UserPriority,
+            Metadata = claim.Metadata is null ? null : new Dictionary<string, string>(claim.Metadata),
+            Resources = claim.Resources == ResourceSet.None ? null : Resources.ToNames(claim.Resources).ToList(),
+        };
+        return ResponseParser.Acquire(await SendAsync(request, ct));
     }
+
+    /// <param name="waitSeconds">
+    /// Wait (up to 60s) for the claim's grant to change before answering, e.g. for a game to
+    /// exit. Lets a throttled or queued agent react at once without busy polling.
+    /// </param>
+    public async Task<RenewResult> RenewAsync(string reservationId, int? leaseSeconds = null, int? waitSeconds = null, CancellationToken ct = default)
+    {
+        var request = new IpcRequest
+        {
+            Op = IpcOps.Renew,
+            ReservationId = reservationId,
+            LeaseSeconds = leaseSeconds,
+            WaitSeconds = waitSeconds is > 0 ? Math.Min(waitSeconds.Value, RequestDispatcher.MaxWaitSeconds) : null,
+        };
+        var wait = request.WaitSeconds is int w ? TimeSpan.FromSeconds(w) : TimeSpan.Zero;
+        return ResponseParser.Renew(await SendAsync(request, ct, _responseTimeout + wait));
+    }
+
+    /// <summary>Sets the machine-wide user mode. The user's call only.</summary>
+    public async Task<ModeState> SetModeAsync(
+        UserMode mode, IEnumerable<string>? resources = null, int? durationSeconds = null, string? reason = null,
+        CancellationToken ct = default)
+    {
+        var root = await SendAsync(new IpcRequest
+        {
+            Op = IpcOps.SetMode,
+            Mode = Warden.ModeName(mode),
+            Resources = resources?.ToList(),
+            DurationSeconds = durationSeconds,
+            Reason = reason,
+        }, ct);
+        if (!root.TryGetProperty("mode", out var m) || m.ValueKind != JsonValueKind.Object)
+            throw new WardenClientException("Response missing 'mode'");
+        return ResponseParser.Mode(m);
+    }
+
+    private static string WhenBusyName(WhenBusy w) => w switch
+    {
+        WhenBusy.Wait => "wait",
+        WhenBusy.Refuse => "refuse",
+        _ => "throttle",
+    };
 
     public async Task<ReleaseResult> ReleaseAsync(string reservationId, CancellationToken ct = default)
     {
@@ -124,8 +185,9 @@ public sealed class WardenClient
         catch (UnauthorizedAccessException) { return DaemonProbe.AccessDenied; }
     }
 
-    private async Task<JsonElement> SendAsync(IpcRequest request, CancellationToken ct)
+    private async Task<JsonElement> SendAsync(IpcRequest request, CancellationToken ct, TimeSpan? responseTimeout = null)
     {
+        var limit = responseTimeout ?? _responseTimeout;
         // The pipe stream owns its own lifetime via `using`; reader/writer leave it open so
         // disposal happens exactly once, in a well-defined order, regardless of which throws.
         using var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
@@ -135,7 +197,7 @@ public sealed class WardenClient
         using var writer = new StreamWriter(client, Utf8NoBom, bufferSize: 1024, leaveOpen: true) { AutoFlush = true };
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(_responseTimeout);
+        timeout.CancelAfter(limit);
 
         string? line;
         try
@@ -146,7 +208,7 @@ public sealed class WardenClient
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new TimeoutException(
-                $"ComputeWarden daemon did not respond within {_responseTimeout.TotalSeconds:0}s");
+                $"ComputeWarden daemon did not respond within {limit.TotalSeconds:0}s");
         }
 
         if (line is null)

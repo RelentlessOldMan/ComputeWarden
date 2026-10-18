@@ -5,8 +5,8 @@
 # or wherever the COMPUTEWARDEN_CONFIG environment variable points.
 # If no file is found, built-in defaults are used.
 #
-# Hot-reload: editing process_rules (incl. resources) or the debounce (busy_after_ms / available_after_ms)
-# takes effect within ~1s while the daemon is running - no restart needed. Changing
+# Hot-reload: editing process_rules (incl. resources), the debounce (busy_after_ms / available_after_ms),
+# or sharing takes effect within ~1s while the daemon is running - no restart needed. Changing
 # poll_interval_ms, leases, allow_manual_blocker, or logging still requires a restart.
 
 server:
@@ -24,6 +24,8 @@ process_detection:
   available_after_ms: 3000 # keep BUSY this long after a matched process exits (debounce)
 
 # Cooperating agents will see the machine as BUSY whenever any enabled rule matches.
+# A matched process is a *priority* claim (the user's own lease, e.g. a game): every agent
+# on its resources is throttled or queued while it runs, in every mode.
 # Optional per rule: `resources` = which of cpu, gpu, ram, network, disk the process occupies.
 # Agents asking only for other resources can still proceed. Omit it to block everything.
 process_rules:
@@ -37,6 +39,22 @@ process_rules:
     executable: CodeCarver.exe
     enabled: true
     resources: [ram, disk]   # memory-heavy analyzer: CPU/GPU work can still run
+
+# Shared work and the line (agent claims with a kind). All advisory: agents apply it themselves.
+sharing:
+  # What "throttled" tells an agent: run on at most this many cores, at this priority
+  # (below_normal or idle), using at most this much memory.
+  throttle_max_cores: 1
+  throttle_priority: below_normal
+  throttle_max_ram_gb: 2
+  # At most this many new claims run throttled per contended resource; later ones queue.
+  # Work already running is never queued, only throttled.
+  max_throttled_per_resource: 3
+  # Resources that can't run small beside a holder: contended claims are queued instead.
+  # [] makes everything shareable.
+  unshareable: [gpu]
+  # A queued ticket must check in (renew) at least this often or it drops out of line.
+  queue_checkin_seconds: 120
 
 # Set false to forbid clients from setting/clearing the manual blocker over MCP.
 allow_manual_blocker: true

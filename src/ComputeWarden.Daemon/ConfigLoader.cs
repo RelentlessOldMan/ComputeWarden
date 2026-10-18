@@ -96,6 +96,7 @@ public static class ConfigLoader
                 AvailableAfterMs = root.ProcessDetection?.AvailableAfterMs ?? detectDefaults.AvailableAfterMs,
             },
             ProcessRules = rules,
+            Sharing = ParseSharing(root.Sharing),
             AllowManualBlocker = root.AllowManualBlocker ?? true,
             LogLevel = root.Logging?.Level ?? "info",
         };
@@ -115,6 +116,48 @@ public static class ConfigLoader
         }
     }
 
+    private static SharingOptions ParseSharing(YamlSharing? s)
+    {
+        var d = new SharingOptions();
+        if (s is null) return d;
+
+        ResourceSet unshareable;
+        try
+        {
+            // An explicit empty list means every resource can be shared.
+            unshareable = s.Unshareable is null ? d.Unshareable
+                : s.Unshareable.Count == 0 ? ResourceSet.None
+                : Resources.Parse(s.Unshareable);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new YamlException($"sharing.unshareable: {ex.Message}");
+        }
+
+        var cores = s.ThrottleMaxCores ?? d.ThrottleMaxCores;
+        var ram = s.ThrottleMaxRamGb ?? d.ThrottleMaxRamGb;
+        var slots = s.MaxThrottledPerResource ?? d.MaxThrottledPerResource;
+        var checkin = s.QueueCheckinSeconds ?? d.QueueCheckinSeconds;
+        if (cores < 1) throw new YamlException("sharing.throttle_max_cores must be at least 1");
+        if (!(ram > 0)) throw new YamlException("sharing.throttle_max_ram_gb must be positive");
+        if (slots < 0) throw new YamlException("sharing.max_throttled_per_resource must not be negative");
+        if (checkin < 10) throw new YamlException("sharing.queue_checkin_seconds must be at least 10");
+
+        var priority = string.IsNullOrWhiteSpace(s.ThrottlePriority) ? d.ThrottlePriority : s.ThrottlePriority.Trim().ToLowerInvariant();
+        if (priority is not ("below_normal" or "idle"))
+            throw new YamlException($"sharing.throttle_priority must be below_normal or idle, not '{priority}'");
+
+        return new SharingOptions
+        {
+            ThrottleMaxCores = cores,
+            ThrottlePriority = priority,
+            ThrottleMaxRamGb = ram,
+            MaxThrottledPerResource = slots,
+            Unshareable = unshareable,
+            QueueCheckinSeconds = checkin,
+        };
+    }
+
     // ---- YAML shape (snake_case via UnderscoredNamingConvention) --------
 
     private sealed class YamlRoot
@@ -125,6 +168,17 @@ public static class ConfigLoader
         public List<YamlProcessRule>? ProcessRules { get; set; }
         public YamlLogging? Logging { get; set; }
         public bool? AllowManualBlocker { get; set; }
+        public YamlSharing? Sharing { get; set; }
+    }
+
+    private sealed class YamlSharing
+    {
+        public int? ThrottleMaxCores { get; set; }
+        public string? ThrottlePriority { get; set; }
+        public double? ThrottleMaxRamGb { get; set; }
+        public int? MaxThrottledPerResource { get; set; }
+        public List<string>? Unshareable { get; set; }
+        public int? QueueCheckinSeconds { get; set; }
     }
 
     private sealed class YamlServer { public int? PollIntervalMs { get; set; } }

@@ -1,0 +1,269 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
+using ComputeWarden.Client;
+using ComputeWarden.Core;
+using ComputeWarden.Core.Model;
+
+namespace ComputeWarden.Cli;
+
+/// <summary>
+/// <c>cw</c>: the user's own controls. Shows what's running and sets the user mode
+/// ("y'all go slow and steady", "full bore allowed"), which agents only do on the user's word.
+/// </summary>
+internal static class Cli
+{
+    public const string Usage = """
+        Usage:
+          cw                         Show status (same as 'cw status').
+          cw status                  Mode, what holds each resource, and every agent claim.
+          cw mode                    Show the current mode.
+          cw mode <mode> [for] [<duration>] [<reason>...] [--resources cpu,ram,...]
+                                     Set the mode. Duration like 90m, 2h, 1h30m, 1d; omit to keep
+                                     it until changed. Examples:
+                                       cw mode steady 2h gaming
+                                       cw mode open
+                                       cw mode hold 30m "recording a video"
+                                       cw mode auto
+        Modes:
+          auto     Normal rules: games limit everyone; agents share by the line.
+          steady   Everyone runs throttled (slow and steady). Nobody goes full.
+          open     No throttling between agents; exclusive holds still keep heavy jobs apart.
+          hold     Nobody starts new work; work already running is throttled.
+        No mode ever overrides a running game (configured priority process).
+        """;
+
+    private static readonly TimeSpan StartupWait = TimeSpan.FromSeconds(8);
+
+    /// <param name="launch">Starts the daemon when none is running (null: never launch).</param>
+    public static async Task<int> RunAsync(string[] args, WardenClient client, TextWriter stdout, TextWriter stderr,
+        Func<bool>? launch = null)
+    {
+        try
+        {
+            var command = args.Length == 0 ? "status" : args[0].ToLowerInvariant();
+            if (launch is not null && command is "status" or "mode")
+                await EnsureDaemonAsync(client, launch);
+            switch (command)
+            {
+                case "status":
+                    Print(await client.StatusAsync(), stdout, DateTimeOffset.UtcNow);
+                    return 0;
+
+                case "mode" when args.Length == 1:
+                    var status = await client.StatusAsync();
+                    stdout.WriteLine(status.Mode is { } current
+                        ? $"Mode: {Describe(current, DateTimeOffset.UtcNow)}"
+                        : "Mode: (daemon is too old to report a mode)");
+                    return 0;
+
+                case "mode":
+                    if (!TryParseMode(args.Skip(1).ToArray(), out var req, out var error))
+                    {
+                        stderr.WriteLine(error);
+                        stderr.WriteLine("Run 'cw help' for usage.");
+                        return 2;
+                    }
+                    var set = await client.SetModeAsync(req.Mode, req.Resources, req.DurationSeconds, req.Reason);
+                    stdout.WriteLine($"Mode set: {Describe(set, DateTimeOffset.UtcNow)}");
+                    return 0;
+
+                case "help" or "-h" or "--help" or "/?":
+                    stdout.WriteLine(Usage);
+                    return 0;
+
+                default:
+                    stderr.WriteLine($"Unknown command '{args[0]}'.");
+                    stderr.WriteLine(Usage);
+                    return 2;
+            }
+        }
+        catch (Exception ex) when (ex is TimeoutException or IOException)
+        {
+            stderr.WriteLine("Could not reach the ComputeWarden daemon. It starts with the first Claude/Codex session that uses it.");
+            return 1;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            stderr.WriteLine("Access denied to the ComputeWarden pipe: the daemon belongs to another user or an elevated session.");
+            return 1;
+        }
+        catch (WardenClientException ex)
+        {
+            stderr.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    /// <summary>
+    /// Starts the daemon if it isn't running, so <c>cw mode steady</c> works before any agent
+    /// session has started one. A failed start falls through to the normal "could not reach".
+    /// </summary>
+    private static async Task EnsureDaemonAsync(WardenClient client, Func<bool> launch)
+    {
+        if (await client.ProbeAsync() != DaemonProbe.NotRunning || !launch()) return;
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (waited.Elapsed < StartupWait && await client.ProbeAsync() == DaemonProbe.NotRunning)
+            await Task.Delay(150);
+    }
+
+    public sealed record ModeRequest(UserMode Mode, int? DurationSeconds, string? Reason, string[]? Resources);
+
+    public static bool TryParseMode(string[] args, out ModeRequest request, out string? error)
+    {
+        request = new ModeRequest(UserMode.Auto, null, null, null);
+        error = null;
+
+        UserMode? mode = null;
+        int? duration = null;
+        string[]? resources = null;
+        var reason = new List<string>();
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a is "--resources" or "-r")
+            {
+                if (i + 1 >= args.Length) { error = "--resources needs a list, e.g. cpu,ram"; return false; }
+                resources = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                try { Resources.Parse(resources); }
+                catch (ArgumentException ex) { error = ex.Message; return false; }
+                continue;
+            }
+
+            if (mode is null)
+            {
+                mode = a.ToLowerInvariant() switch
+                {
+                    "auto" or "normal" => UserMode.Auto,
+                    "steady" or "slow" => UserMode.Steady,
+                    "open" or "full" => UserMode.Open,
+                    "hold" or "stop" => UserMode.Hold,
+                    _ => null,
+                };
+                if (mode is null) { error = $"Unknown mode '{a}' (expected auto, steady, open, or hold)."; return false; }
+                continue;
+            }
+
+            if (duration is null && reason.Count == 0)
+            {
+                if (a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && TryParseDuration(args[i + 1], out _))
+                    continue;
+                if (TryParseDuration(a, out var seconds)) { duration = seconds; continue; }
+            }
+            reason.Add(a);
+        }
+
+        if (mode is null) { error = "Missing mode (auto, steady, open, or hold)."; return false; }
+        if (mode == UserMode.Auto && (duration is not null || resources is not null))
+        {
+            error = "auto takes no duration or resources: it just ends the current mode.";
+            return false;
+        }
+
+        request = new ModeRequest(mode.Value, duration, reason.Count == 0 ? null : string.Join(' ', reason), resources);
+        return true;
+    }
+
+    private static readonly Regex DurationPattern = new(
+        @"^(?:(?<d>\d+)d)?(?:(?<h>\d+)h)?(?:(?<m>\d+)m)?(?:(?<s>\d+)s)?$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>Parses 90m, 2h, 1h30m, 1d, 45s. A bare number is minutes.</summary>
+    public static bool TryParseDuration(string text, out int seconds)
+    {
+        seconds = 0;
+        if (string.IsNullOrEmpty(text)) return false;
+        if (int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var minutes))
+        {
+            seconds = minutes * 60;
+            return minutes > 0 && minutes <= 7 * 24 * 60;
+        }
+        var m = DurationPattern.Match(text);
+        if (!m.Success) return false;
+        long total = 0;
+        total += Part(m, "d") * 86400;
+        total += Part(m, "h") * 3600;
+        total += Part(m, "m") * 60;
+        total += Part(m, "s");
+        if (total <= 0 || total > 7 * 24 * 3600) return false;
+        seconds = (int)total;
+        return true;
+    }
+
+    private static long Part(Match m, string group)
+        => m.Groups[group].Success ? long.Parse(m.Groups[group].Value, CultureInfo.InvariantCulture) : 0;
+
+    // ---- Output ---------------------------------------------------------
+
+    public static void Print(StatusResult s, TextWriter w, DateTimeOffset now)
+    {
+        if (s.Mode is { } mode) w.WriteLine($"Mode:    {Describe(mode, now)}");
+        var busy = s.BusyResources == ResourceSet.None ? "" : $" {Names(s.BusyResources)}";
+        w.WriteLine($"Machine: {s.State.ToString().ToUpperInvariant()}{busy}");
+
+        var games = s.Blockers.Where(b => b.Type == BlockerType.Process).ToList();
+        var manual = s.Blockers.Where(b => b.Type == BlockerType.Manual && b.Id != "mode").ToList();
+        if (games.Count > 0)
+        {
+            w.WriteLine();
+            w.WriteLine("Priority (limits everyone):");
+            foreach (var b in games) w.WriteLine($"  {b.Description} {Names(b.Resources)}");
+        }
+        if (manual.Count > 0)
+        {
+            w.WriteLine();
+            w.WriteLine("Manual holds:");
+            foreach (var b in manual) w.WriteLine($"  {b.Description} {Names(b.Resources)}");
+        }
+
+        var claims = s.Claims ?? Array.Empty<ClaimInfo>();
+        w.WriteLine();
+        if (claims.Count == 0)
+        {
+            // Legacy daemon: reservations are only visible as blockers.
+            var holds = s.Blockers.Where(b => b.Type == BlockerType.Reservation).ToList();
+            if (holds.Count == 0) { w.WriteLine("No agent work reported."); return; }
+            w.WriteLine("Holds:");
+            foreach (var b in holds) w.WriteLine($"  {b.Description} {Names(b.Resources)} {Left(b.ExpiresAt, now)}");
+            return;
+        }
+
+        w.WriteLine("Agent work:");
+        foreach (var c in claims)
+        {
+            var state = c.Kind == ClaimKind.Exclusive && c.Holding ? "holding"
+                : c.Position is int p && c.Grant == Grant.Queued ? $"queued #{p}"
+                : c.Position is int q ? $"{Warden.GrantName(c.Grant)}, #{q} in line"
+                : Warden.GrantName(c.Grant);
+            var extras = new List<string>();
+            if (c.EstimateSeconds is int e) extras.Add($"est {Span(e)}");
+            if (c.UserPriority is { } up) extras.Add($"user priority: {up}");
+            var tail = extras.Count == 0 ? "" : $" ({string.Join("; ", extras)})";
+            w.WriteLine($"  {state,-22} {Warden.KindName(c.Kind),-9} {c.Owner}: {c.Description} {Names(c.Resources)} {Left(c.ExpiresAt, now)}{tail}");
+        }
+    }
+
+    public static string Describe(ModeState m, DateTimeOffset now)
+    {
+        if (m.Mode == UserMode.Auto) return "auto (normal rules)";
+        var text = Warden.ModeName(m.Mode);
+        if (m.Resources != ResourceSet.All) text += $" {Names(m.Resources)}";
+        if (m.ExpiresAt is { } e) text += $", {Span(Math.Max(0, (int)Math.Ceiling((e - now).TotalSeconds)))} left";
+        if (m.Reason is { } r) text += $": {r}";
+        return text;
+    }
+
+    private static string Left(DateTimeOffset? expiresAt, DateTimeOffset now)
+        => expiresAt is { } e ? $"[lease {Span(Math.Max(0, (int)Math.Ceiling((e - now).TotalSeconds)))}]" : "";
+
+    private static string Names(ResourceSet set) => "[" + string.Join(",", Resources.ToNames(set)) + "]";
+
+    public static string Span(int seconds)
+    {
+        if (seconds < 60) return $"{seconds}s";
+        if (seconds < 3600) return $"{seconds / 60}m";
+        var h = seconds / 3600;
+        var m = seconds % 3600 / 60;
+        return m == 0 ? $"{h}h" : $"{h}h{m}m";
+    }
+}

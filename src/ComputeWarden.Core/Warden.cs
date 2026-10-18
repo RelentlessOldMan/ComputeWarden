@@ -1,3 +1,4 @@
+using System.Globalization;
 using ComputeWarden.Core.Config;
 using ComputeWarden.Core.Diagnostics;
 using ComputeWarden.Core.Model;
@@ -7,16 +8,25 @@ using ComputeWarden.Core.Time;
 namespace ComputeWarden.Core;
 
 /// <summary>
-/// The authoritative, thread-safe coordinator. Holds reservations and composes blocker
-/// providers to answer "is it safe to begin intensive work?" and to atomically acquire
-/// permission. All state-mutating operations execute under a single lock so that no race
-/// can grant two conflicting reservations simultaneously (spec §27).
-/// <para>Exclusivity is per resource: every blocker occupies a <see cref="ResourceSet"/>, and
-/// an acquire succeeds when no blocker overlaps the requested set. Requests that omit
-/// resources ask for <see cref="ResourceSet.All"/>, i.e. the whole machine.</para>
+/// The authoritative, thread-safe coordinator. Holds agent claims and composes blocker
+/// providers to answer "how big may this work run right now?". All state-mutating operations
+/// execute under a single lock so that no race can grant two conflicting holds (spec §27).
+/// <para>Three kinds of claim share the machine (DESIGN.md §16):
+/// <b>priority</b> claims are configured processes (the user's games), which limit everyone on
+/// their resources and are never negotiated; <b>exclusive</b> claims own their resources, one
+/// holder per resource, with a first-come-first-served line; <b>shared</b> claims (everyday
+/// builds and tests) are never refused, only told to run full or throttled. Everything is
+/// advice: the warden never caps or kills a process.</para>
+/// <para>A legacy acquire (no kind) is an exclusive claim that is refused rather than queued,
+/// which is exactly the pre-sharing behavior.</para>
 /// </summary>
 public sealed class Warden
 {
+    private const int MaxModeSeconds = 7 * 24 * 3600;
+
+    /// <summary>What everyday work uses when it doesn't say: builds and tests are cpu, ram, and disk.</summary>
+    public const ResourceSet SharedDefault = ResourceSet.Cpu | ResourceSet.Ram | ResourceSet.Disk;
+
     private readonly object _gate = new();
     private readonly Dictionary<string, Reservation> _reservations = new(StringComparer.Ordinal);
     private readonly IClock _clock;
@@ -27,26 +37,31 @@ public sealed class Warden
     private readonly ILog _log;
     private readonly DateTimeOffset _startedAt;
 
-    // Counters (mutated only under _gate).
+    // Mutated only under _gate.
+    private SharingOptions _sharing;
+    private ModeState _mode;
+    private long _seq;
     private long _totalAcquisitions;
     private long _failedAcquisitions;
     private long _expiredReservations;
 
     /// <param name="manual">The manual blocker provider (also exposed via set/clear helpers).</param>
-    /// <param name="extraProviders">Other providers, e.g. the process monitor.</param>
+    /// <param name="extraProviders">Other providers, e.g. the process monitor. Process blockers are priority claims.</param>
     public Warden(
         IClock clock,
         LeaseOptions lease,
         WardenLimits limits,
         ManualBlockerProvider manual,
         IEnumerable<IBlockerProvider>? extraProviders = null,
-        ILog? log = null)
+        ILog? log = null,
+        SharingOptions? sharing = null)
     {
         _clock = clock;
         _lease = lease;
         _limits = limits;
         _manual = manual;
         _log = log ?? NullLog.Instance;
+        _sharing = sharing ?? new SharingOptions();
 
         var providers = new List<IBlockerProvider>();
         if (extraProviders is not null) providers.AddRange(extraProviders);
@@ -54,6 +69,7 @@ public sealed class Warden
         _providers = providers;
 
         _startedAt = clock.UtcNow;
+        _mode = ModeState.Auto(_startedAt);
     }
 
     // ---- Read operations ------------------------------------------------
@@ -66,9 +82,14 @@ public sealed class Warden
     {
         lock (_gate)
         {
-            var blockers = CollectBlockersLocked(out var confident);
-            var state = DetermineState(confident, blockers);
-            return new StatusResult(state, state == MachineState.Available, blockers, Occupied(blockers));
+            var x = BuildLocked();
+            var state = DetermineState(x.Confident, x.Blockers);
+            var claims = _reservations.Values
+                .OrderBy(r => r.Seq)
+                .Select(r => Info(r, x))
+                .ToList();
+            return new StatusResult(
+                state, state == MachineState.Available, x.Blockers, Occupied(x.Blockers), _mode, claims);
         }
     }
 
@@ -80,8 +101,8 @@ public sealed class Warden
     {
         lock (_gate)
         {
-            var blockers = CollectBlockersLocked(out var confident);
-            return DetermineState(confident, Conflicting(blockers, resources)) == MachineState.Available;
+            var x = BuildLocked();
+            return DetermineState(x.Confident, Conflicting(x.Blockers, resources)) == MachineState.Available;
         }
     }
 
@@ -89,8 +110,8 @@ public sealed class Warden
     {
         lock (_gate)
         {
-            var blockers = CollectBlockersLocked(out _);
-            var processBlockers = blockers.Count(b => b.Type == BlockerType.Process);
+            var x = BuildLocked();
+            var processBlockers = x.Blockers.Count(b => b.Type == BlockerType.Process);
             return new WardenStats(
                 _totalAcquisitions,
                 _failedAcquisitions,
@@ -101,12 +122,12 @@ public sealed class Warden
         }
     }
 
-    // ---- Reservation lifecycle -----------------------------------------
+    // ---- Claim lifecycle ------------------------------------------------
 
     /// <summary>
-    /// Atomically checks blockers overlapping <paramref name="resources"/> and, if none, creates
-    /// a reservation holding those resources. This is the critical correctness operation:
-    /// check + acquire under one lock.
+    /// Legacy acquire: atomically checks blockers overlapping <paramref name="resources"/> and,
+    /// if none (and nobody is waiting in line for them), creates an exclusive hold. Otherwise
+    /// refuses and creates nothing.
     /// </summary>
     public AcquireResult Acquire(
         string owner,
@@ -114,65 +135,145 @@ public sealed class Warden
         int? leaseSeconds = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         ResourceSet resources = ResourceSet.All)
+        => Acquire(new ClaimRequest(owner, description, ClaimKind.Exclusive, resources,
+            WhenBusy.Refuse, leaseSeconds, Metadata: metadata));
+
+    /// <summary>
+    /// Creates a claim and returns the warden's advice for it. Shared claims and exclusive
+    /// claims that throttle or wait are always created (unless invalid); a
+    /// <see cref="WhenBusy.Refuse"/> exclusive claim is the legacy acquire.
+    /// Resources <see cref="ResourceSet.None"/> means the kind's default: everyday work is
+    /// cpu+ram+disk (so a build isn't held up by a game's GPU), heavy work the whole machine.
+    /// </summary>
+    public AcquireResult Acquire(ClaimRequest request)
     {
-        if (resources == ResourceSet.None) resources = ResourceSet.All;
+        var kind = request.Kind;
+        var resources = request.Resources != ResourceSet.None ? request.Resources
+            : kind == ClaimKind.Shared ? SharedDefault
+            : ResourceSet.All;
+        var whenBusy = kind == ClaimKind.Shared ? WhenBusy.Throttle : request.WhenBusy;
 
         lock (_gate)
         {
-            if (!TryValidate(owner, description, metadata, out var validationError))
+            if (!TryValidate(request, out var validationError))
             {
                 _failedAcquisitions++;
-                var b = CollectBlockersLocked(out var c);
-                return AcquireResult.Failure(validationError!, DetermineState(c, b), b);
-            }
-
-            // Only blockers sharing a resource with this request matter. Unknown is still
-            // machine-wide: if we can't see, we can't tell which resources are free.
-            var blockers = Conflicting(CollectBlockersLocked(out var confident), resources);
-            var state = DetermineState(confident, blockers);
-
-            if (state == MachineState.Unknown)
-            {
-                _failedAcquisitions++;
-                return AcquireResult.Failure(
-                    "Machine state is UNKNOWN; refusing to acquire.", state, blockers);
-            }
-
-            if (blockers.Count > 0)
-            {
-                _failedAcquisitions++;
-                var reason = resources == ResourceSet.All
-                    ? "Machine currently unavailable"
-                    : $"Requested resources in use: {string.Join(", ", Resources.ToNames(Occupied(blockers) & resources))}";
-                return AcquireResult.Failure(reason, state, blockers);
+                var bx = BuildLocked();
+                return AcquireResult.Failure(validationError!, DetermineState(bx.Confident, bx.Blockers), bx.Blockers);
             }
 
             var now = _clock.UtcNow;
-            var seconds = _lease.Resolve(leaseSeconds);
-            var reservation = new Reservation(
-                id: NewId(),
-                owner: owner,
-                description: description ?? string.Empty,
-                createdAt: now,
-                expiresAt: now.AddSeconds(seconds),
-                metadata: CloneMetadata(metadata),
-                resources: resources);
 
-            _reservations[reservation.Id] = reservation;
+            if (whenBusy == WhenBusy.Refuse)
+                return AcquireLegacyLocked(request, resources, now);
+
+            var leaseSeconds = _lease.Resolve(request.LeaseSeconds ?? LeaseFromEstimate(request.EstimateSeconds));
+            var r = new Reservation(
+                id: NewId(),
+                owner: request.Owner,
+                description: request.Description ?? string.Empty,
+                createdAt: now,
+                expiresAt: now.AddSeconds(leaseSeconds),
+                metadata: CloneMetadata(request.Metadata),
+                resources: resources)
+            {
+                Kind = kind,
+                WhenBusy = whenBusy,
+                EstimateSeconds = request.EstimateSeconds,
+                Cores = request.Cores,
+                RamGb = request.RamGb,
+                UserPriority = string.IsNullOrWhiteSpace(request.UserPriority) ? null : request.UserPriority,
+                Seq = ++_seq,
+                LeaseSeconds = leaseSeconds,
+            };
+            _reservations[r.Id] = r;
             _totalAcquisitions++;
-            // Lifecycle events are rare, so logging under the lock is cheap here and keeps the
-            // audit trail ordered.
-            _log.Info($"Reservation acquired: {owner} \"{Trunc(reservation.Description)}\" [{Short(reservation.Id)}] {Names(resources)} lease {seconds}s");
-            return AcquireResult.Success(reservation);
+
+            // Building after the insert puts the new claim in line, so the same promotion pass
+            // that serves earlier waiters decides whether it can hold right away.
+            var x = BuildLocked();
+            var advice = Evaluate(r, x, now);
+            Apply(r, advice, now, renewSeconds: null);
+
+            var priorityNote = r.UserPriority is null ? "" : $" (user priority: {Trunc(r.UserPriority)})";
+            _log.Info($"Claim {KindName(kind)}: {r.Owner} \"{Trunc(r.Description)}\" [{Short(r.Id)}] {Names(resources)} -> {GrantName(advice.Grant)}{Because(advice)}{priorityNote}");
+
+            var after = BuildLocked();
+            var blockers = Conflicting(after.Blockers, resources).Where(b => b.Id != r.Id).ToList();
+            return AcquireResult.Claimed(r, advice, DetermineState(after.Confident, after.Blockers), blockers);
         }
     }
 
-    /// <summary>Renews an existing reservation. The id acts as a bearer capability.</summary>
+    private AcquireResult AcquireLegacyLocked(ClaimRequest request, ResourceSet resources, DateTimeOffset now)
+    {
+        var x = BuildLocked();
+
+        // Only blockers sharing a resource with this request matter. Unknown is still
+        // machine-wide: if we can't see, we can't tell which resources are free.
+        var blockers = Conflicting(x.Blockers, resources);
+        var state = DetermineState(x.Confident, blockers);
+
+        if (state == MachineState.Unknown)
+        {
+            _failedAcquisitions++;
+            return AcquireResult.Failure("Machine state is UNKNOWN; refusing to acquire.", state, blockers);
+        }
+
+        if (blockers.Count > 0)
+        {
+            _failedAcquisitions++;
+            var reason = resources == ResourceSet.All
+                ? "Machine currently unavailable"
+                : $"Requested resources in use: {string.Join(", ", Resources.ToNames(Occupied(blockers) & resources))}";
+            return AcquireResult.Failure(reason, state, blockers);
+        }
+
+        // First come, first served: a legacy caller can't take resources someone is waiting for.
+        var waiting = x.Line.Where(w => Resources.Overlaps(w.Resources, resources)).ToList();
+        if (waiting.Count > 0)
+        {
+            _failedAcquisitions++;
+            return AcquireResult.Failure(
+                $"Requested resources are promised to {waiting.Count} claim(s) waiting in line", MachineState.Busy, blockers);
+        }
+
+        var seconds = _lease.Resolve(request.LeaseSeconds);
+        var reservation = new Reservation(
+            id: NewId(),
+            owner: request.Owner,
+            description: request.Description ?? string.Empty,
+            createdAt: now,
+            expiresAt: now.AddSeconds(seconds),
+            metadata: CloneMetadata(request.Metadata),
+            resources: resources)
+        {
+            Kind = ClaimKind.Exclusive,
+            WhenBusy = WhenBusy.Refuse,
+            Seq = ++_seq,
+            LeaseSeconds = seconds,
+            Holding = true,
+            Started = true,
+            StartedAt = now,
+        };
+
+        _reservations[reservation.Id] = reservation;
+        _totalAcquisitions++;
+        // Lifecycle events are rare, so logging under the lock is cheap here and keeps the
+        // audit trail ordered.
+        _log.Info($"Reservation acquired: {request.Owner} \"{Trunc(reservation.Description)}\" [{Short(reservation.Id)}] {Names(resources)} lease {seconds}s");
+        return AcquireResult.Success(reservation);
+    }
+
+    /// <summary>
+    /// Renews a claim's lease and returns its current advice: this is how running work notices
+    /// a game starting or stopping, and how a queued ticket checks in. The id acts as a bearer
+    /// capability.
+    /// </summary>
     public RenewResult Renew(string reservationId, int? leaseSeconds = null)
     {
         lock (_gate)
         {
-            PruneExpiredLocked();
+            var x = BuildLocked();
             if (string.IsNullOrEmpty(reservationId) ||
                 !_reservations.TryGetValue(reservationId, out var r))
             {
@@ -180,14 +281,45 @@ public sealed class Warden
             }
 
             var now = _clock.UtcNow;
-            r.LastRenewedAt = now;
-            r.ExpiresAt = now.AddSeconds(_lease.Resolve(leaseSeconds));
-            _log.Debug($"Reservation renewed: [{Short(r.Id)}] expires {r.ExpiresAt:o}");
-            return RenewResult.Success(r.ExpiresAt);
+            var advice = Evaluate(r, x, now);
+            var previous = r.LastGrant;
+            var wasStarted = r.Started;
+            Apply(r, advice, now, leaseSeconds);
+
+            if (advice.Grant != previous || r.Started != wasStarted)
+                _log.Info($"Claim now {GrantName(advice.Grant)}: {r.Owner} [{Short(r.Id)}]{Because(advice)}");
+            else
+                _log.Debug($"Reservation renewed: [{Short(r.Id)}] expires {r.ExpiresAt:o}");
+
+            return RenewResult.Success(r.ExpiresAt, r.WhenBusy == WhenBusy.Refuse && advice.Grant == Grant.Full ? null : advice);
         }
     }
 
-    /// <summary>Releases a reservation. Idempotent — releasing an unknown id is not an error.</summary>
+    /// <summary>
+    /// The grant a claim would get right now, without renewing it; null if it no longer exists.
+    /// Lets a long-polling renew wait for a change (a game exiting, a holder releasing).
+    /// </summary>
+    public Grant? PeekGrant(string reservationId)
+    {
+        lock (_gate)
+        {
+            var x = BuildLocked();
+            if (string.IsNullOrEmpty(reservationId) || !_reservations.TryGetValue(reservationId, out var r))
+                return null;
+            return Evaluate(r, x, _clock.UtcNow).Grant;
+        }
+    }
+
+    /// <summary>The grant last given to a claim; null if it no longer exists.</summary>
+    public Grant? LastGrant(string reservationId)
+    {
+        lock (_gate)
+            return !string.IsNullOrEmpty(reservationId) && _reservations.TryGetValue(reservationId, out var r)
+                ? r.LastGrant
+                : null;
+    }
+
+    /// <summary>Releases a claim. Idempotent — releasing an unknown id is not an error.</summary>
     public ReleaseResult Release(string reservationId)
     {
         lock (_gate)
@@ -204,7 +336,46 @@ public sealed class Warden
         }
     }
 
-    // ---- Manual blocker -------------------------------------------------
+    // ---- User control ---------------------------------------------------
+
+    /// <summary>
+    /// Sets the machine-wide user mode. Only the user should do this (agents only on the
+    /// user's explicit word). <paramref name="durationSeconds"/> reverts to auto afterwards.
+    /// </summary>
+    public ModeState SetMode(UserMode mode, ResourceSet resources = ResourceSet.All, int? durationSeconds = null, string? reason = null)
+    {
+        if (reason is { Length: > 0 } && reason.Length > _limits.MaxReasonLength)
+            throw new ArgumentException($"reason exceeds {_limits.MaxReasonLength} characters", nameof(reason));
+        if (durationSeconds is < 1 or > MaxModeSeconds)
+            throw new ArgumentException($"durationSeconds must be between 1 and {MaxModeSeconds}", nameof(durationSeconds));
+
+        lock (_gate)
+        {
+            var now = _clock.UtcNow;
+            _mode = mode == UserMode.Auto
+                ? ModeState.Auto(now)
+                : new ModeState(
+                    mode,
+                    resources == ResourceSet.None ? ResourceSet.All : resources,
+                    string.IsNullOrWhiteSpace(reason) ? null : reason,
+                    now,
+                    durationSeconds is int d ? now.AddSeconds(d) : null);
+
+            var until = _mode.ExpiresAt is { } e ? $" until {e:o}" : "";
+            var why = _mode.Reason is null ? "" : $": {Trunc(_mode.Reason)}";
+            _log.Info($"User mode set to {ModeName(_mode.Mode)} {Names(_mode.Resources)}{until}{why}");
+            return _mode;
+        }
+    }
+
+    public ModeState GetMode()
+    {
+        lock (_gate)
+        {
+            ExpireModeLocked(_clock.UtcNow);
+            return _mode;
+        }
+    }
 
     public Blocker SetManualBusy(string reason, ResourceSet resources = ResourceSet.All)
     {
@@ -218,33 +389,306 @@ public sealed class Warden
 
     // ---- Maintenance ----------------------------------------------------
 
-    /// <summary>Forces expiry of stale reservations. Called by the daemon's low-frequency sweep.</summary>
-    public void Sweep()
+    /// <summary>Applies hot-reloaded sharing settings.</summary>
+    public void UpdateSharing(SharingOptions sharing)
     {
-        lock (_gate) PruneExpiredLocked();
+        lock (_gate) _sharing = sharing;
     }
 
-    // ---- Internals ------------------------------------------------------
-
-    private List<Blocker> CollectBlockersLocked(out bool confident)
+    /// <summary>
+    /// Expires stale claims, ends a timed user mode, and promotes waiters whose resources have
+    /// freed up. Called by the daemon's low-frequency sweep.
+    /// </summary>
+    public void Sweep()
     {
+        lock (_gate) BuildLocked();
+    }
+
+    // ---- The rules ------------------------------------------------------
+
+    /// <summary>Everything one decision needs, computed once per operation under the lock.</summary>
+    private sealed class Context
+    {
+        public bool Confident = true;
+        public List<Blocker> Blockers = new();
+        public List<Blocker> ProcessBlockers = new();
+        public List<Blocker> ManualBlockers = new();
+        public ResourceSet Priority;
+        public ResourceSet Hold;
+        public ResourceSet Steady;
+        public ResourceSet Open;
+        public List<Reservation> Holders = new();
+        public List<Reservation> Line = new();
+    }
+
+    /// <summary>
+    /// Prunes, collects blockers, and runs the promotion pass: walking the line in order, a
+    /// waiter takes its resources if nothing holds them and nobody earlier is waiting for them.
+    /// </summary>
+    private Context BuildLocked()
+    {
+        var now = _clock.UtcNow;
         PruneExpiredLocked();
+        ExpireModeLocked(now);
 
-        var blockers = new List<Blocker>();
-        confident = true;
-
-        foreach (var r in _reservations.Values)
-            blockers.Add(r.ToBlocker());
-
+        var x = new Context();
         foreach (var provider in _providers)
         {
             var result = provider.GetBlockers();
-            if (!result.Confident) confident = false;
-            blockers.AddRange(result.Blockers);
+            if (!result.Confident) x.Confident = false;
+            foreach (var b in result.Blockers)
+            {
+                if (b.Type == BlockerType.Process) { x.ProcessBlockers.Add(b); x.Priority |= b.Resources; }
+                else { x.ManualBlockers.Add(b); x.Hold |= b.Resources; }
+            }
         }
 
-        return blockers;
+        switch (_mode.Mode)
+        {
+            case UserMode.Hold: x.Hold |= _mode.Resources; break;
+            case UserMode.Steady: x.Steady = _mode.Resources; break;
+            case UserMode.Open: x.Open = _mode.Resources; break;
+        }
+
+        x.Holders = _reservations.Values.Where(r => r.Holding).ToList();
+        x.Line = _reservations.Values
+            .Where(r => r.InLine)
+            .OrderBy(r => r.UserPriority is null ? 1 : 0)
+            .ThenBy(r => r.Seq)
+            .ToList();
+
+        if (x.Confident)
+        {
+            var held = Occupied(x.Holders);
+            var waitedFor = ResourceSet.None;
+            var unavailable = x.Hold | x.Priority | x.Steady;
+            foreach (var w in x.Line.ToList())
+            {
+                if (Resources.Overlaps(w.Resources, unavailable | held | waitedFor))
+                {
+                    waitedFor |= w.Resources;
+                    continue;
+                }
+                w.Holding = true;
+                held |= w.Resources;
+                x.Holders.Add(w);
+                x.Line.Remove(w);
+                // A brand-new claim taking free resources is logged by Acquire itself.
+                if (w.Started || w.LastGrant == Grant.Queued)
+                    _log.Info($"Claim promoted to hold: {w.Owner} \"{Trunc(w.Description)}\" [{Short(w.Id)}] {Names(w.Resources)}");
+            }
+        }
+
+        foreach (var h in x.Holders) x.Blockers.Add(h.ToBlocker());
+        x.Blockers.AddRange(x.ProcessBlockers);
+        x.Blockers.AddRange(x.ManualBlockers);
+        if (_mode.Mode is UserMode.Hold or UserMode.Steady)
+        {
+            var why = _mode.Reason is null ? "" : $": {_mode.Reason}";
+            x.Blockers.Add(new Blocker(
+                Id: "mode",
+                Type: BlockerType.Manual,
+                Source: "UserMode",
+                Description: $"User set {ModeName(_mode.Mode)} mode{why}",
+                Owner: "user",
+                CreatedAt: _mode.SetAt,
+                ExpiresAt: _mode.ExpiresAt,
+                Resources: _mode.Resources));
+        }
+        return x;
     }
+
+    /// <summary>The advice for one claim given the current state. Pure: changes nothing.</summary>
+    private Advice Evaluate(Reservation c, Context x, DateTimeOffset now)
+    {
+        var res = c.Resources;
+        var ahead = c.InLine ? x.Line.TakeWhile(w => w != c).Where(w => Resources.Overlaps(w.Resources, res)).ToList() : new();
+
+        // Work that hasn't started is told to wait. Work already running can't un-start, so
+        // the most it's asked is to run small.
+        Advice Defer(ResourceSet contended, string? reason)
+            => c.Started ? Throttled(contended, reason) : Queued(c, x, ahead, contended, now, reason);
+
+        if (!x.Confident)
+        {
+            const string unknown = "machine state is UNKNOWN (the process list can't be read)";
+            return c.Kind == ClaimKind.Shared ? Throttled(res, unknown) : Defer(res, unknown);
+        }
+
+        var hold = x.Hold & res;
+        if (hold != ResourceSet.None)
+            return Defer(hold, HoldReason(x, hold));
+
+        var priority = x.Priority & res;
+        var steady = x.Steady & res;
+        var others = ResourceSet.None;
+        foreach (var h in x.Holders)
+            if (h != c) others |= h.Resources;
+        others &= res;
+
+        ResourceSet contended;
+        var reasons = new List<string>();
+        if (c.Kind == ClaimKind.Exclusive && !c.Holding)
+        {
+            var waitedFor = Occupied(ahead) & res;
+            contended = priority | steady | others | waitedFor;
+            if (contended == ResourceSet.None) contended = res; // not promoted, so something is in the way
+            Explain(reasons, x, c, priority, steady, others);
+            if (ahead.Count > 0) reasons.Add($"{ahead.Count} ahead in line");
+            if (c.WhenBusy == WhenBusy.Wait)
+                return Defer(contended, Join(reasons));
+        }
+        else if (c.Kind == ClaimKind.Exclusive)
+        {
+            contended = priority | steady;
+            Explain(reasons, x, c, priority, steady, ResourceSet.None);
+        }
+        else
+        {
+            var blocking = others & ~x.Open;
+            contended = priority | steady | blocking;
+            Explain(reasons, x, c, priority, steady, blocking);
+        }
+
+        if (contended == ResourceSet.None) return Advice.Full;
+
+        var sharing = _sharing;
+        var unshareable = contended & sharing.Unshareable;
+        if (unshareable != ResourceSet.None)
+        {
+            reasons.Add($"{string.Join("/", Resources.ToNames(unshareable))} can't be shared right now");
+            return Defer(contended, Join(reasons));
+        }
+
+        // The cap only limits new starts: running work keeps going (throttled at worst).
+        if (!c.Started && (contended & ~x.Open) != ResourceSet.None &&
+            ThrottledCount(c, contended) >= sharing.MaxThrottledPerResource)
+        {
+            reasons.Add($"throttle slots full ({sharing.MaxThrottledPerResource} per resource)");
+            return Queued(c, x, ahead, contended, now, Join(reasons));
+        }
+
+        return Throttled(contended, Join(reasons));
+    }
+
+    /// <summary>Records the advice given and sets the lease: tickets get the check-in window, running work its lease.</summary>
+    private void Apply(Reservation r, Advice advice, DateTimeOffset now, int? renewSeconds)
+    {
+        r.LastGrant = advice.Grant;
+        r.LastRenewedAt = now;
+        if (!r.Started && advice.Grant != Grant.Queued)
+        {
+            r.Started = true;
+            r.StartedAt = now;
+        }
+
+        int seconds;
+        if (!r.Started) seconds = Math.Max(1, _sharing.QueueCheckinSeconds);
+        else if (r.WhenBusy == WhenBusy.Refuse) seconds = _lease.Resolve(renewSeconds); // legacy: renew defaults as before
+        else seconds = renewSeconds is null ? r.LeaseSeconds : _lease.Resolve(renewSeconds);
+        r.ExpiresAt = now.AddSeconds(seconds);
+    }
+
+    private void Explain(List<string> reasons, Context x, Reservation c, ResourceSet priority, ResourceSet steady, ResourceSet others)
+    {
+        foreach (var p in x.ProcessBlockers)
+            if (Resources.Overlaps(p.Resources, priority))
+                reasons.Add(p.Description);
+        if (steady != ResourceSet.None)
+            reasons.Add(_mode.Reason is null ? "user set steady mode" : $"user set steady mode: {_mode.Reason}");
+        if (others != ResourceSet.None)
+            foreach (var h in x.Holders)
+                if (h != c && Resources.Overlaps(h.Resources, others))
+                    reasons.Add($"{h.Owner} holds {string.Join("/", Resources.ToNames(h.Resources & others))} ({Trunc(h.Description)})");
+    }
+
+    private string HoldReason(Context x, ResourceSet hold)
+    {
+        var reasons = new List<string>();
+        foreach (var m in x.ManualBlockers)
+            if (Resources.Overlaps(m.Resources, hold))
+                reasons.Add($"manual hold: {m.Description}");
+        if (_mode.Mode == UserMode.Hold && Resources.Overlaps(_mode.Resources, hold))
+            reasons.Add(_mode.Reason is null ? "user set hold mode" : $"user set hold mode: {_mode.Reason}");
+        return Join(reasons) + "; don't start new work on these resources";
+    }
+
+    private int ThrottledCount(Reservation c, ResourceSet contended)
+        => _reservations.Values.Count(r =>
+            r != c && r.Started && r.LastGrant == Grant.Throttled && Resources.Overlaps(r.Resources, contended));
+
+    private Advice Throttled(ResourceSet contended, string? reason)
+    {
+        var s = _sharing;
+        var cpu = Resources.Overlaps(contended, ResourceSet.Cpu);
+        var ram = Resources.Overlaps(contended, ResourceSet.Ram);
+        var throttle = new ThrottleAdvice(
+            MaxCores: cpu ? s.ThrottleMaxCores : null,
+            Priority: cpu ? s.ThrottlePriority : null,
+            MaxRamGb: ram ? s.ThrottleMaxRamGb : null);
+        return new Advice(Grant.Throttled, reason, throttle, HowText(contended, s), null, contended);
+    }
+
+    private Advice Queued(Reservation c, Context x, List<Reservation> ahead, ResourceSet contended, DateTimeOffset now, string? reason)
+    {
+        int? position = c.InLine ? x.Line.IndexOf(c) + 1 : null;
+        if (position == 0) position = null;
+
+        // Waits behind a game, a hold, or steady mode have no end we can predict.
+        int? estimate = null;
+        if (!Resources.Overlaps(c.Resources, x.Priority | x.Hold | x.Steady) && x.Confident)
+        {
+            var remaining = 0;
+            foreach (var h in x.Holders)
+                if (h != c && Resources.Overlaps(h.Resources, c.Resources))
+                    remaining = Math.Max(remaining, Remaining(h, now));
+            foreach (var a in ahead)
+                remaining += a.EstimateSeconds ?? a.LeaseSeconds;
+            estimate = remaining;
+        }
+
+        var queue = new QueueInfo(position, ahead.Select(a => Info(a, x)).ToList(), estimate);
+        return new Advice(Grant.Queued, reason, null, "Don't start yet. Check back by renewing this reservation.", queue, contended);
+    }
+
+    private static int Remaining(Reservation h, DateTimeOffset now)
+    {
+        var leaseLeft = Math.Max(0, (int)(h.ExpiresAt - now).TotalSeconds);
+        if (h.EstimateSeconds is int e && h.StartedAt is { } started)
+            return Math.Clamp((int)(started.AddSeconds(e) - now).TotalSeconds, 0, leaseLeft);
+        return leaseLeft;
+    }
+
+    private static string HowText(ResourceSet contended, SharingOptions s)
+    {
+        var parts = new List<string>();
+        if (Resources.Overlaps(contended, ResourceSet.Cpu))
+        {
+            var n = s.ThrottleMaxCores;
+            parts.Add($"use at most {n} core{(n == 1 ? "" : "s")} at {s.ThrottlePriority.Replace('_', '-')} priority " +
+                      $"(e.g. dotnet build -m:{n}, dotnet test -- RunConfiguration.MaxCpuCount={n}, make -j{n})");
+        }
+        if (Resources.Overlaps(contended, ResourceSet.Ram))
+            parts.Add($"keep memory under {s.ThrottleMaxRamGb.ToString(CultureInfo.InvariantCulture)} GB (no large parallel test hosts or in-memory datasets)");
+        if (Resources.Overlaps(contended, ResourceSet.Disk))
+            parts.Add("avoid heavy disk I/O (no clean rebuilds, full scans, or large copies)");
+        if (Resources.Overlaps(contended, ResourceSet.Network))
+            parts.Add("avoid large downloads or uploads");
+        if (Resources.Overlaps(contended, ResourceSet.Gpu))
+            parts.Add("keep off the GPU");
+        var text = string.Join("; ", parts);
+        return text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text[1..] + ".";
+    }
+
+    private ClaimInfo Info(Reservation r, Context x)
+    {
+        int? position = r.InLine ? x.Line.IndexOf(r) + 1 : null;
+        if (position == 0) position = null;
+        return new ClaimInfo(r.Id, r.Owner, r.Description, r.Kind, r.Resources, r.LastGrant, r.Holding,
+            r.ExpiresAt, r.EstimateSeconds, r.Cores, r.RamGb, r.UserPriority, position);
+    }
+
+    // ---- Internals ------------------------------------------------------
 
     private static List<Blocker> Conflicting(List<Blocker> blockers, ResourceSet resources)
         => resources == ResourceSet.All
@@ -258,12 +702,52 @@ public sealed class Warden
         return set;
     }
 
+    private static ResourceSet Occupied(IEnumerable<Reservation> claims)
+    {
+        var set = ResourceSet.None;
+        foreach (var c in claims) set |= c.Resources;
+        return set;
+    }
+
     private static string Names(ResourceSet set) => "[" + string.Join(",", Resources.ToNames(set)) + "]";
+
+    private static string? Join(List<string> reasons) => reasons.Count == 0 ? null : string.Join("; ", reasons);
+
+    private static string Because(Advice a) => a.Reason is null ? "" : $" ({Trunc(a.Reason)})";
+
+    private static int? LeaseFromEstimate(int? estimateSeconds)
+        => estimateSeconds is int e and > 0 ? (int)Math.Min(int.MaxValue, Math.Ceiling(e * 1.25) + 30) : null;
+
+    public static string KindName(ClaimKind kind) => kind == ClaimKind.Shared ? "shared" : "exclusive";
+
+    public static string GrantName(Grant grant) => grant switch
+    {
+        Grant.Full => "full",
+        Grant.Throttled => "throttled",
+        _ => "queued",
+    };
+
+    public static string ModeName(UserMode mode) => mode switch
+    {
+        UserMode.Steady => "steady",
+        UserMode.Open => "open",
+        UserMode.Hold => "hold",
+        _ => "auto",
+    };
 
     private static MachineState DetermineState(bool confident, IReadOnlyList<Blocker> blockers)
         => !confident ? MachineState.Unknown
          : blockers.Count > 0 ? MachineState.Busy
          : MachineState.Available;
+
+    private void ExpireModeLocked(DateTimeOffset now)
+    {
+        if (_mode.ExpiresAt is { } e && e <= now)
+        {
+            _log.Info($"User mode {ModeName(_mode.Mode)} ended (time up); back to auto");
+            _mode = ModeState.Auto(now);
+        }
+    }
 
     private void PruneExpiredLocked()
     {
@@ -277,6 +761,13 @@ public sealed class Warden
         foreach (var r in expired)
         {
             _reservations.Remove(r.Id);
+            if (!r.Started)
+            {
+                // A ticket that stopped checking in: its agent gave up or crashed. Not a misuse
+                // of a lease, since it never ran.
+                _log.Info($"Queue ticket dropped (no check-in): {r.Owner} \"{Trunc(r.Description)}\" [{Short(r.Id)}]");
+                continue;
+            }
             _expiredReservations++;
             // The prime "misuse" signal: a lease that lapsed because the owner never released
             // (crashed, forgot, or under-estimated its lease). Distinct from a clean release.
@@ -291,13 +782,12 @@ public sealed class Warden
     private static string Held(Reservation r, DateTimeOffset now)
         => $"{Math.Max(0, (int)(now - r.CreatedAt).TotalSeconds)}s";
 
-    private bool TryValidate(
-        string owner,
-        string? description,
-        IReadOnlyDictionary<string, string>? metadata,
-        out string? error)
+    private bool TryValidate(ClaimRequest request, out string? error)
     {
         error = null;
+        var owner = request.Owner;
+        var description = request.Description;
+        var metadata = request.Metadata;
 
         if (string.IsNullOrWhiteSpace(owner))
         {
@@ -312,6 +802,16 @@ public sealed class Warden
         if (description is { Length: > 0 } && description.Length > _limits.MaxDescriptionLength)
         {
             error = $"description exceeds {_limits.MaxDescriptionLength} characters";
+            return false;
+        }
+        if (request.UserPriority is { Length: > 0 } up && up.Length > _limits.MaxReasonLength)
+        {
+            error = $"userPriority exceeds {_limits.MaxReasonLength} characters";
+            return false;
+        }
+        if (request.EstimateSeconds is < 0 || request.Cores is < 0 || request.RamGb is < 0 || request.RamGb is double.NaN)
+        {
+            error = "estimateSeconds, cores, and ramGb must not be negative";
             return false;
         }
         if (metadata is not null)

@@ -7,6 +7,7 @@ public sealed class WardenConfig
     public ProcessDetectionOptions ProcessDetection { get; init; } = new();
     public List<ProcessRule> ProcessRules { get; init; } = new();
     public WardenLimits Limits { get; init; } = new();
+    public SharingOptions Sharing { get; init; } = new();
 
     /// <summary>Whether clients may set/clear the manual blocker over IPC.</summary>
     public bool AllowManualBlocker { get; init; } = true;
