@@ -65,3 +65,22 @@ public static class TestFactory
             new ManualBlockerProvider(clock),
             extraProviders);
 }
+
+/// <summary>Keeps tests off the real daemon pipe, and keeps pipe awaits from hanging the run.</summary>
+public static class TestIsolation
+{
+    public static readonly TimeSpan Deadline = TimeSpan.FromSeconds(30);
+
+    public static string NewPipeName() => "ComputeWarden-test-" + Guid.NewGuid().ToString("N");
+
+    // The gateway's static default points at the live pipe with auto-spawn; never leave it there.
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void Init() => ConfigureDeadGateway();
+
+    public static void ConfigureDeadGateway()
+        => ComputeWarden.Mcp.WardenGateway.Configure(
+            new ComputeWarden.Client.WardenClient(NewPipeName(), connectTimeoutMs: 100), autoSpawn: false);
+
+    public static Task<T> Within<T>(this Task<T> task) => task.WaitAsync(Deadline);
+    public static Task Within(this Task task) => task.WaitAsync(Deadline);
+}

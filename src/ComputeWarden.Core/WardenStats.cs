@@ -1,6 +1,6 @@
 namespace ComputeWarden.Core;
 
-/// <summary>Inexpensive counters for observability (spec §31).</summary>
+/// <summary>Inexpensive counters for observability.</summary>
 public sealed record WardenStats(
     long TotalAcquisitions,
     long FailedAcquisitions,

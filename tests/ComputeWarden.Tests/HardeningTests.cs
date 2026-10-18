@@ -114,9 +114,9 @@ public class PipeServerHardeningTests
         using var writer = new StreamWriter(client, Utf8NoBom, 1024, leaveOpen: true) { AutoFlush = true };
 
         await writer.WriteLineAsync(new string('x', 300_000));
-        var rejected = JsonNode.Parse((await reader.ReadLineAsync())!)!;
+        var rejected = JsonNode.Parse((await reader.ReadLineAsync().Within())!)!;
         await writer.WriteLineAsync("{\"v\":1,\"op\":\"STATUS\"}");
-        var status = JsonNode.Parse((await reader.ReadLineAsync())!)!;
+        var status = JsonNode.Parse((await reader.ReadLineAsync().Within())!)!;
 
         Assert.Contains("too large", (string)rejected["error"]!);
         Assert.True((bool)status["ok"]!);
@@ -184,7 +184,7 @@ public class GatewayHardeningTests
         }
         finally
         {
-            WardenGateway.Configure(new WardenClient(connectTimeoutMs: 2000), autoSpawn: true);
+            TestIsolation.ConfigureDeadGateway();
         }
     }
 }

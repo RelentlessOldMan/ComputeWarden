@@ -2,7 +2,7 @@ namespace ComputeWarden.Core.Config;
 
 /// <summary>
 /// Input validation limits. The service must validate all client inputs and place caps on
-/// string and metadata sizes (spec §26).
+/// string and metadata sizes.
 /// </summary>
 public sealed class WardenLimits
 {

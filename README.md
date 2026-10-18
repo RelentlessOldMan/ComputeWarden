@@ -1,6 +1,6 @@
 # ComputeWarden 🚦
 
-A small Windows background service that AI coding agents and build tools ask before starting
+A small Windows background process that AI coding agents and build tools ask before starting
 heavy work, so they take turns instead of all saturating one machine at once.
 
 Two agents, one machine: agent A asks for the CPU and gets it. Agent B asks for the CPU and is
@@ -87,12 +87,13 @@ cw mode auto                     # back to normal rules
 | Mode | Effect |
 |---|---|
 | `auto` | The rules above. |
-| `steady` | Everyone runs throttled; nobody goes full. The 3-per-resource cap applies, and `whenBusy: wait` claims wait for the mode to end. |
+| `steady` | Everyone runs throttled; nobody goes full. The 3-per-resource cap applies, GPU work queues if another agent is on the GPU, and `whenBusy: wait` claims wait for the mode to end. |
 | `open` | No throttling between agents. Exclusive holds still keep two heavy jobs apart. A game's throttling and cap still apply. |
 | `hold` | New work is queued; work already running is throttled. |
 
-A mode can take a duration (90m, 2h, 1h30m, 1d; a unit is required, at most 7d), a reason (shown to agents in their advice),
-and `--resources cpu,ram` to cover only some resources. **No mode overrides a running
+A mode can take a duration (90m, 2h, 1h30m, 1d; a unit is required, at most 7d), a reason
+(shown to agents in their advice), and `--resources cpu,ram` (or `-r`) to cover only some
+resources. `normal`, `slow`, `full`, and `stop` also work for auto, steady, open, and hold. **No mode overrides a running
 game.** Inside a Claude Code session you can run it as `! cw mode open`.
 
 ## Install
@@ -102,8 +103,9 @@ Windows x64. Self-contained, so you don't need the .NET runtime.
 1. Download the latest `ComputeWarden-vX.Y.Z-win-x64.zip` from
    [Releases](https://github.com/RelentlessOldMan/ComputeWarden/releases).
 2. Extract `ComputeWarden.Mcp.exe`, `ComputeWarden.Daemon.exe` and `cw.exe` into one
-   folder, e.g. `%LOCALAPPDATA%\ComputeWarden\bin`. The adapter and daemon must stay side by
-   side. Add the folder to your PATH to run `cw` from any terminal:
+   folder, e.g. `%LOCALAPPDATA%\ComputeWarden\bin`. Keep all three side by side: the adapter
+   and `cw` start the daemon from their own folder. Add the folder to your PATH to run `cw`
+   from any terminal (open a new terminal afterwards so it sees the change):
    ```powershell
    [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$env:LOCALAPPDATA\ComputeWarden\bin", "User")
    ```
@@ -127,8 +129,8 @@ Windows x64. Self-contained, so you don't need the .NET runtime.
 4. Optional: copy [`config.example.yaml`](config.example.yaml) to
    `%ProgramData%\ComputeWarden\config.yaml` and list the programs that should count as busy.
 
-You don't need to start anything yourself. The first time an agent calls a tool, the adapter
-starts the daemon in the background, and it then runs until reboot.
+You don't need to start anything yourself. The first time an agent calls a tool (or you run
+`cw`), the daemon starts in the background, and it then runs until reboot.
 
 **Check it works:** start a new agent session and ask it to call `computewarden_status`.
 You should get something like:
@@ -184,7 +186,8 @@ and legacy acquires are refused until that clears. Manual holds and hold mode st
 
 The daemon reads `%ProgramData%\ComputeWarden\config.yaml` (or wherever the
 `COMPUTEWARDEN_CONFIG` environment variable points). Without one it uses defaults: lease
-30s–1h (default 5 min), and no process rules.
+30s–1h (default 5 min), and no process rules. If the file can't be read or parsed at startup,
+the daemon logs the error and starts with defaults.
 
 The part you'll edit most is the process list:
 
@@ -197,9 +200,12 @@ process_rules:
     resources: [cpu, gpu, ram]         # disk and network work can still run
 ```
 
+A rule can also set `enabled: false` to switch it off, and a `description` as a note to
+yourself.
+
 **Edits apply live.** The daemon watches the file, so changes to `process_rules`, the
-debounce settings, and `sharing` take effect within about a second. A broken edit is logged and ignored,
-and the previous rules stay active. Changing the poll interval, lease bounds,
+debounce settings, and `sharing` take effect within a few seconds. A broken edit is logged
+and ignored, and the previous settings stay active. Changing the poll interval, lease bounds,
 `allow_manual_blocker`, or logging needs a daemon restart.
 
 How small "throttled" is, and how many throttled claims fit, are in `sharing`:
@@ -233,12 +239,14 @@ or from an elevated (admin) session, and normal sessions can't connect to it. St
 that session, or an elevated prompt) and let a normal session start its own.
 
 **"daemon is not running and could not be launched":** `ComputeWarden.Daemon.exe` isn't next
-to `ComputeWarden.Mcp.exe`. Put it there, or set `COMPUTEWARDEN_DAEMON` to its full path.
+to `ComputeWarden.Mcp.exe` (or `cw.exe`). Put it there, or set `COMPUTEWARDEN_DAEMON` to its full path.
 
 **Updating:** each open agent session keeps `ComputeWarden.Mcp.exe` locked, so it can't be
 overwritten, but Windows does allow renaming it. Stop the daemon, rename the old adapter
-aside (e.g. to `ComputeWarden.Mcp.exe.old`), copy both new exes in, and delete the old one
-later. `./publish.ps1 -Install` does all of this when building from source. Open sessions
+aside (e.g. to `ComputeWarden.Mcp.exe.old`), copy the new exes in, and delete the old one
+later. `./publish.ps1 -Install` does all of this when building from source (it leaves
+`*.old-<timestamp>` files, cleaned up on the next install). It refuses while a mode other
+than auto is set, since the restart drops it; pass `-Force` to install anyway. Open sessions
 keep using the old adapter until they restart.
 
 ## Limitations

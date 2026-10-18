@@ -7,7 +7,7 @@ namespace ComputeWarden.Daemon;
 /// <summary>
 /// Drives <see cref="ProcessBlockerProvider.Refresh"/> on the configured interval and logs
 /// only state transitions (blocker appeared/cleared, confidence lost/regained) — never a line
-/// per poll (spec §30).
+/// per poll.
 /// </summary>
 public sealed class ProcessMonitor : IAsyncDisposable
 {

@@ -67,7 +67,7 @@ public sealed class WardenHost : IAsyncDisposable
     }
 
     /// <summary>
-    /// Re-reads the config file and applies the hot-reloadable parts (process rules + debounce).
+    /// Re-reads the config file and applies the hot-reloadable parts (process rules, debounce, sharing).
     /// A missing/corrupt config is logged and ignored so a bad edit never wipes the live rules.
     /// Public so it can be driven directly (tests) as well as by the file watcher.
     /// </summary>
@@ -75,7 +75,8 @@ public sealed class WardenHost : IAsyncDisposable
     {
         // Editors often save by renaming, so the file can be briefly absent. Treat that as "no
         // change" — falling through would swap the live rules for the built-in defaults.
-        if (!File.Exists(ConfigLoader.ResolvePath()))
+        var path = _configPath ?? ConfigLoader.ResolvePath();
+        if (!File.Exists(path))
         {
             _log.Warn("Config reload skipped (keeping current rules): config file not found");
             return;
@@ -84,7 +85,7 @@ public sealed class WardenHost : IAsyncDisposable
         ConfigLoadResult loaded;
         try
         {
-            loaded = ConfigLoader.Load();
+            loaded = ConfigLoader.Load(path);
         }
         catch (Exception ex)
         {
@@ -124,7 +125,7 @@ public sealed class WardenHost : IAsyncDisposable
         _configWatcher.Changed += OnConfigChanged;
         _configWatcher.Created += OnConfigChanged;
         _configWatcher.Renamed += OnConfigChanged;
-        _log.Info($"Watching {_configPath} - process rules hot-reload on change");
+        _log.Info($"Watching {_configPath} - process rules and sharing hot-reload on change");
     }
 
     private void OnConfigChanged(object sender, FileSystemEventArgs e)

@@ -5,5 +5,7 @@
     <Product>ComputeWarden</Product>
     <Company>RelentlessOldMan</Company>
     <Authors>RelentlessOldMan</Authors>
+    <!-- Keep local build paths out of the shipped binaries and PDBs. -->
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
   </PropertyGroup>
 </Project>

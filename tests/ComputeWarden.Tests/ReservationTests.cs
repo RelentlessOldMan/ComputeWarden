@@ -158,4 +158,17 @@ public class ReservationTests
         // Clamped to maximum: expiry is start + 3600s.
         Assert.Equal(clock.UtcNow.AddSeconds(3600), acquired.ExpiresAt);
     }
+
+    [Fact]
+    public void Reservation_expires_exactly_at_the_end_of_its_lease()
+    {
+        var clock = new FakeClock();
+        var warden = TestFactory.NewWarden(clock, new LeaseOptions { DefaultSeconds = 100, MinimumSeconds = 1 });
+        var acquired = warden.Acquire("Agent A", "work", 100);
+
+        clock.AdvanceSeconds(100);
+
+        Assert.False(warden.Renew(acquired.ReservationId!).Renewed);
+        Assert.True(warden.CanRun());
+    }
 }

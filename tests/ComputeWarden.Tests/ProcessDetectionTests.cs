@@ -183,4 +183,20 @@ public class ProcessDetectionTests
         Assert.False(result.Confident);
         Assert.Empty(result.Blockers);
     }
+
+    [Fact]
+    public void Blocker_clears_exactly_when_the_linger_window_ends()
+    {
+        var lister = new FakeLister();
+        var clock = new FakeClock();
+        var provider = Provider(lister, clock, new ProcessDetectionOptions { AvailableAfterMs = 3000 });
+        lister.Set(("MSBuild", 1));
+        provider.Refresh();
+
+        lister.Set();
+        clock.AdvanceSeconds(3);
+        provider.Refresh();
+
+        Assert.Empty(provider.GetBlockers().Blockers);
+    }
 }

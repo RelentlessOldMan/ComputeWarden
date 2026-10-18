@@ -258,14 +258,16 @@ public class SharingTests
     public void Legacy_acquire_cannot_jump_the_line()
     {
         var rig = new Rig();
-        var a = rig.Exclusive("A");
-        rig.Exclusive("B", whenBusy: WhenBusy.Wait);
+        rig.StartGame(resources: ResourceSet.Gpu);
+        var a = rig.Exclusive("A", ResourceSet.Cpu);
+        rig.Exclusive("B", ResourceSet.Cpu | ResourceSet.Gpu, WhenBusy.Wait);
         rig.Warden.Release(a.ReservationId!);
-        // B is promoted on the next look, so the legacy caller finds the resources taken.
+        // The cpu is free, but B (still waiting on the gpu) is in line for it.
 
         var legacy = rig.Warden.Acquire("legacy", "index", resources: ResourceSet.Cpu);
 
         Assert.False(legacy.Acquired);
+        Assert.Contains("waiting in line", legacy.Reason);
     }
 
     [Fact]
@@ -783,5 +785,94 @@ public class SharingTests
         rig.Warden.SetMode(UserMode.Steady);
 
         Assert.Equal(Grant.Queued, rig.Shared("A", ResourceSet.Gpu).Advice!.Grant);
+    }
+
+    // ---- Boundaries and gaps --------------------------------------------
+
+    [Fact]
+    public void Waiter_is_not_marked_holding_while_the_state_is_unknown()
+    {
+        var rig = new Rig();
+        var a = rig.Exclusive("A", ResourceSet.Cpu);
+        rig.Exclusive("B", ResourceSet.Cpu, WhenBusy.Wait);
+        rig.Processes.Result = ProviderResult.Unhealthy;
+        rig.Warden.Release(a.ReservationId!);
+
+        var b = Assert.Single(rig.Warden.GetStatus().Claims!);
+        Assert.False(b.Holding);
+        Assert.False(rig.Log.Contains("Claim promoted to hold: B"));
+    }
+
+    [Fact]
+    public void Sweep_promotes_a_waiter_once_its_resources_free()
+    {
+        var rig = new Rig();
+        rig.StartGame(resources: ResourceSet.Cpu);
+        Assert.Equal(Grant.Queued, rig.Exclusive("B", ResourceSet.Cpu, WhenBusy.Wait).Advice!.Grant);
+        rig.StopGame();
+        Assert.False(rig.Log.Contains("Claim promoted to hold: B"));
+
+        rig.Warden.Sweep(); // no client traffic in between
+
+        Assert.True(rig.Log.Contains("Claim promoted to hold: B"));
+    }
+
+    [Fact]
+    public void Mode_ends_exactly_at_its_expiry()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Steady, durationSeconds: 60);
+
+        rig.Clock.AdvanceSeconds(60);
+
+        Assert.Equal(UserMode.Auto, rig.Warden.GetMode().Mode);
+    }
+
+    [Fact]
+    public void Open_mode_scoped_to_gpu_still_throttles_cpu_beside_a_holder()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Open, resources: ResourceSet.Gpu);
+        rig.Exclusive("A", ResourceSet.Cpu);
+
+        Assert.Equal(Grant.Throttled, rig.Shared("B", ResourceSet.Cpu).Advice!.Grant);
+    }
+
+    // DESIGN §16: open mode has no throttle cap between agents (a game's cap still applies).
+    [Fact]
+    public void Open_mode_lifts_the_throttle_cap_between_agents()
+    {
+        var rig = new Rig();
+        rig.Warden.SetMode(UserMode.Open);
+        rig.Exclusive("A", ResourceSet.Cpu);
+
+        for (var i = 0; i < 5; i++)
+            Assert.Equal(Grant.Throttled, rig.Exclusive("E" + i, ResourceSet.Cpu).Advice!.Grant);
+    }
+
+    [Fact]
+    public void Throttle_advice_has_no_ram_limit_when_ram_is_not_contended()
+    {
+        var rig = new Rig();
+        rig.StartGame(resources: ResourceSet.Cpu);
+
+        var a = rig.Shared("A", ResourceSet.Cpu | ResourceSet.Ram).Advice!;
+
+        Assert.Equal(Grant.Throttled, a.Grant);
+        Assert.Equal(ResourceSet.Cpu, a.Contended);
+        Assert.Null(a.Throttle!.MaxRamGb);
+    }
+
+    [Fact]
+    public void Legacy_refusal_for_the_line_counts_as_a_failed_acquisition()
+    {
+        var rig = new Rig();
+        rig.Exclusive("A", ResourceSet.Cpu);
+        rig.Exclusive("B", ResourceSet.Cpu | ResourceSet.Disk, WhenBusy.Wait);
+        var before = rig.Warden.GetStats().FailedAcquisitions;
+
+        Assert.False(rig.Warden.Acquire("legacy", "copy", resources: ResourceSet.Disk).Acquired);
+
+        Assert.Equal(before + 1, rig.Warden.GetStats().FailedAcquisitions);
     }
 }

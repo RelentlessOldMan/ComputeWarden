@@ -155,8 +155,8 @@ public class ClientCompatibilityTests
             await writer.WriteLineAsync(response);
         });
 
-        var result = await call(new WardenClient(pipeName));
-        await serve;
+        var result = await call(new WardenClient(pipeName)).Within();
+        await serve.Within();
         return result;
     }
 

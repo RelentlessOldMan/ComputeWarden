@@ -10,7 +10,7 @@ namespace ComputeWarden.Core;
 /// <summary>
 /// The authoritative, thread-safe coordinator. Holds agent claims and composes blocker
 /// providers to answer "how big may this work run right now?". All state-mutating operations
-/// execute under a single lock so that no race can grant two conflicting holds (spec §27).
+/// execute under a single lock so that no race can grant two conflicting holds.
 /// <para>Three kinds of claim share the machine (DESIGN.md §16):
 /// <b>priority</b> claims are configured processes (the user's games), which limit everyone on
 /// their resources and are never negotiated; <b>exclusive</b> claims own their resources, one

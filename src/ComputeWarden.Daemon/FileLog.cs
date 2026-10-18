@@ -4,7 +4,7 @@ namespace ComputeWarden.Daemon;
 
 /// <summary>
 /// Appends log lines to a file, with a simple size cap + single-backup rollover so the log
-/// can never grow without bound (spec §37). Logging never throws into callers — a failing log
+/// can never grow without bound. Logging never throws into callers — a failing log
 /// sink must not take down the daemon.
 /// </summary>
 public sealed class FileLog : ILog, IDisposable

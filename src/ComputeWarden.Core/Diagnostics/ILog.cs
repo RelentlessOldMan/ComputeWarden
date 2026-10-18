@@ -3,7 +3,7 @@ namespace ComputeWarden.Core.Diagnostics;
 /// <summary>
 /// Minimal logging seam. Kept tiny so Core stays dependency-free; the daemon supplies a
 /// console/file implementation. Routine polling must not log — only lifecycle events and
-/// state transitions (spec §30).
+/// state transitions.
 /// </summary>
 public interface ILog
 {

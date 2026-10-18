@@ -17,5 +17,10 @@ publish/
 Thumbs.db
 .DS_Store
 
+## Test and scratch output
+TestResults/
+*.log
+*.tmp
+
 ## Release artifacts
 *.zip

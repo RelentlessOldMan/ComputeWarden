@@ -1,5 +1,7 @@
 using ComputeWarden.Core;
 using ComputeWarden.Core.Model;
+using ComputeWarden.Core.Config;
+using ComputeWarden.Core.Providers;
 
 namespace ComputeWarden.Tests;
 
@@ -57,5 +59,47 @@ public class ConcurrencyTests
         }
 
         Assert.True(warden.CanRun());
+    }
+
+    private sealed class StallOnce : IBlockerProvider
+    {
+        public readonly ManualResetEventSlim Entered = new();
+        public readonly ManualResetEventSlim Release = new();
+        private int _calls;
+        public string Name => "stall";
+        public ProviderResult GetBlockers()
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                Entered.Set();
+                Release.Wait(TimeSpan.FromSeconds(30));
+            }
+            return ProviderResult.Empty;
+        }
+    }
+
+    [Fact]
+    public void Acquire_waits_while_another_acquire_holds_the_lock()
+    {
+        // The first acquire stalls inside a provider, which runs under the warden's lock. A
+        // second acquire must wait for it: if it gets through, the lock isn't shared.
+        var clock = new FakeClock();
+        var stall = new StallOnce();
+        var warden = new Warden(clock, new LeaseOptions(), new WardenLimits(), new ManualBlockerProvider(clock), new[] { stall });
+
+        var first = new Thread(() => warden.Acquire(new ClaimRequest("A", "x", ClaimKind.Exclusive, ResourceSet.Cpu)));
+        first.Start();
+        Assert.True(stall.Entered.Wait(TimeSpan.FromSeconds(30)));
+        var secondDone = new ManualResetEventSlim();
+        var second = new Thread(() => { warden.Acquire(new ClaimRequest("B", "y", ClaimKind.Exclusive, ResourceSet.Gpu)); secondDone.Set(); });
+        second.Start();
+
+        var gotThrough = secondDone.Wait(TimeSpan.FromSeconds(2));
+        stall.Release.Set();
+        first.Join();
+        second.Join();
+
+        Assert.False(gotThrough);
+        Assert.True(secondDone.IsSet);
     }
 }

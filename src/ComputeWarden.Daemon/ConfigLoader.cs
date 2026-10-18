@@ -28,9 +28,9 @@ public static class ConfigLoader
         return string.IsNullOrWhiteSpace(overridePath) ? DefaultPath : overridePath;
     }
 
-    public static ConfigLoadResult Load()
+    public static ConfigLoadResult Load(string? path = null)
     {
-        var path = ResolvePath();
+        path ??= ResolvePath();
 
         if (!File.Exists(path))
             return new ConfigLoadResult(WardenConfig.CreateDefault(), $"No config file at {path}; using defaults", IsError: false);

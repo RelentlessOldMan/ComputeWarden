@@ -15,9 +15,9 @@ coordinates well-behaved tools by convention.
 
 | Decision | Choice |
 |---|---|
-| Language / runtime | C# / **.NET 10** (MCP SDK requires it; single target everywhere — mixing 8/10 caused problems in a sibling project). Ship self-contained single-file exes so target machines don't need the runtime installed. |
+| Language / runtime | C# / **.NET 10** (the MCP SDK requires it; one target everywhere). Ship self-contained single-file exes so target machines don't need the runtime installed. |
 | Deployment | Plain background **daemon**, no Windows Service, no installer |
-| Daemon lifecycle | First MCP adapter auto-spawns it if missing (race-safe via named mutex); **runs until reboot** (idle-timeout deferred) |
+| Daemon lifecycle | The first MCP adapter or `cw` call starts it if missing (race-safe via named mutex); **runs until reboot** (idle-timeout deferred) |
 | Topology | Daemon = single source of truth; thin per-client MCP adapter forwards over a **named pipe** |
 | IPC transport | Named pipe `\\.\pipe\ComputeWarden`, newline-delimited JSON, versioned |
 | Reservations | **Exclusive per resource** (cpu/gpu/ram/network/disk; holds conflict only where they overlap, default all); `reservation_id` is a **bearer capability** |
@@ -44,8 +44,8 @@ resources (an old client, a process rule without `resources`, a bare manual hold
 and old daemons therefore interoperate conservatively, with no protocol version bump.
 
 - **UNKNOWN** is not a blocker; it means "couldn't compute the blocker set."
-  `acquire` under UNKNOWN **refuses** (fail-conservative). Agents treat
-  UNKNOWN as "do not begin work."
+  It is fail-conservative: a legacy acquire under UNKNOWN is refused, an exclusive one
+  queued, and a shared claim is throttled as if a game held its resources (§16 rule 7).
 - Debounce (`available_after_ms`) lives **inside** the ProcessProvider, so acquire
   automatically respects the "recently-seen" grace window without special-casing.
 
@@ -89,8 +89,8 @@ Notes:
   cooperative contract only promises "known-safe at acquisition time," not guaranteed
   exclusivity.
 - Lease seconds are clamped server-side to `[minimum_seconds, maximum_seconds]`, never below 1s.
-- UNKNOWN refuses every request, even one for resources nothing appears to hold: if the
-  process list can't be read, nothing is known to be free.
+- UNKNOWN refuses every legacy acquire, even one for resources nothing appears to hold: if
+  the process list can't be read, nothing is known to be free.
 - There is no "add resources to my reservation" operation. A second acquire is an unrelated
   reservation, and growing holds piecemeal is the hold-and-wait pattern that lets two agents
   stall on each other. Agents request everything in one call; if needs change, they release
@@ -129,7 +129,7 @@ Notes:
 
 - Pipe: `\\.\pipe\ComputeWarden`. Restrict ACL to the current user/session.
 - Wire: one JSON object per line (request), one per line (response). `v` field for version.
-- Requests: `STATUS | CAN_RUN | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY | STATS`.
+- Requests: `STATUS | CAN_RUN | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY | SET_MODE | STATS`.
 - Server validates every input: string/metadata size caps, lease bounds, resource names;
   unknown ops get a structured error (never crash the pipe loop). Request lines are capped
   at 256K characters *while reading*, and idle connections are dropped after 30s.
@@ -166,9 +166,9 @@ Notes:
 - Format (server poll interval, lease bounds, `process_detection`,
   `process_rules`, logging). Missing config → defaults; corrupt or unreadable → defaults,
   logged as an error, daemon still starts.
-- **Hot-reload** of `process_rules` + debounce via a file watcher (500ms debounce). A corrupt
-  or momentarily-missing file keeps the current rules. The other settings are read at
-  startup only.
+- **Hot-reload** of `process_rules`, their debounce, and `sharing` via a file watcher
+  (500ms debounce). A corrupt or momentarily-missing file keeps the current settings. The
+  other settings are read at startup only.
 
 ## 12. Project layout
 
@@ -177,8 +177,9 @@ ComputeWarden.slnx
 ├── src/
 │   ├── ComputeWarden.Core/        # Blocker, Reservation, providers, state calc, config models
 │   ├── ComputeWarden.Daemon/      # ProcessMonitor, LeaseSweeper, named-pipe server, host, logs
-│   ├── ComputeWarden.Client/      # IPC client library (used by adapter + future CLI)
-│   └── ComputeWarden.Mcp/         # stdio MCP adapter + auto-spawn logic
+│   ├── ComputeWarden.Client/      # IPC client library (used by the adapter and cw)
+│   ├── ComputeWarden.Mcp/         # stdio MCP adapter + auto-spawn logic
+│   └── ComputeWarden.Cli/         # cw: status and modes from a terminal
 └── tests/
     └── ComputeWarden.Tests/       # xUnit
 ```
@@ -221,9 +222,9 @@ reliably, v1 is done.
 
 ### Motivation
 
-Today the warden only answers yes or no, and only for jobs heavy enough to bother asking.
-Everyday builds, test runs, and app launches never ask, so they pile onto the machine while
-a game is running, or crawl along at one core after it has quit. The target behavior is
+Before this, the warden only answered yes or no, and only for jobs heavy enough to bother asking.
+Everyday builds, test runs, and app launches never asked, so they piled onto the machine while
+a game was running, or crawled along at one core after it had quit. The target behavior is
 what a human would tell several sessions by hand: *"I'm gaming, keep it small"*, and later
 *"I'm done with my game, go full ham as long as you have the lease."* The aim is for
 sessions to get that answer from the warden, live, without being told.
@@ -233,7 +234,7 @@ sessions to get that answer from the warden, live, without being told.
 | Kind | Created by | Meaning |
 |---|---|---|
 | **Priority** | Config process rules (games, etc.) | **The user's own lease.** Gaming means the user holds those resources. Non-negotiable: never queued, asked, or throttled, and every agent on those resources is limited for as long as it runs. |
-| **Exclusive** | Agent heavy job (today's `acquire`) | Will saturate these resources. One holder per resource; the rest wait in line or run throttled. |
+| **Exclusive** | Agent heavy job (`acquire` with `kind: exclusive`) | Will saturate these resources. One holder per resource; the rest wait in line or run throttled. |
 | **Shared** | Agent everyday build/test/run | Normal work. Never refused; told how big it may run right now. With no `resources`, it means cpu+ram+disk (not all), so a GPU-using game throttles a build instead of queuing it. |
 
 Agent claims (exclusive, shared, and queue tickets) are all **leases**: renew, release,
@@ -285,7 +286,8 @@ acquire(owner, description, resources, kind: "shared" | "exclusive",
 6. **Skipping the line:** `userPriority` puts the request at the front of the line. It
    never takes resources from current holders (advisory), and it is logged and shown in
    status. Agents set it only when the user has told them they have priority.
-7. **UNKNOWN:** exclusive claims are queued or refused as today, and nobody is promoted.
+7. **UNKNOWN:** exclusive claims are queued (refused with `whenBusy: refuse`; throttled if already running),
+   and nobody is promoted.
    Shared claims are treated as if a game held all their resources: throttled, with the
    cap, and queued if they need the gpu. Holds and hold mode still apply, since they're
    known even when the process list isn't.
@@ -363,8 +365,8 @@ sharing:                     # hot-reloads with the rest of the config
 
 ### Compatibility
 
-An acquire without `kind` behaves exactly as today: an exclusive claim that is refused
-rather than queued. Old adapters and old CLAUDE.md wording keep working, with no IPC version
+An acquire without `kind` behaves as it did before claim kinds: an exclusive claim that is
+refused rather than queued. Old adapters and old CLAUDE.md wording keep working, with no IPC version
 bump.
 
 ### Agent policy change

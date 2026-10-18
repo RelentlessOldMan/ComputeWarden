@@ -47,6 +47,28 @@ public class ConfigLoaderTests
     }
 
     [Fact]
+    public void Sharing_values_other_than_the_defaults_come_through()
+    {
+        const string yaml = """
+            sharing:
+              throttle_max_cores: 4
+              throttle_priority: below_normal
+              throttle_max_ram_gb: 6.5
+              max_throttled_per_resource: 0
+              unshareable: [gpu, disk]
+              queue_checkin_seconds: 45
+            """;
+
+        var s = ConfigLoader.Parse(yaml).Sharing;
+
+        Assert.Equal(4, s.ThrottleMaxCores);
+        Assert.Equal(6.5, s.ThrottleMaxRamGb);
+        Assert.Equal(0, s.MaxThrottledPerResource); // zero is allowed: every contended start queues
+        Assert.Equal(ComputeWarden.Core.Model.ResourceSet.Gpu | ComputeWarden.Core.Model.ResourceSet.Disk, s.Unshareable);
+        Assert.Equal(45, s.QueueCheckinSeconds);
+    }
+
+    [Fact]
     public void Process_detection_poll_interval_overrides_server()
     {
         const string yaml = """

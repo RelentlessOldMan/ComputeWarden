@@ -27,8 +27,8 @@ public class PipeIntegrationTests
         using var reader = new StreamReader(client, Utf8NoBom, false, 1024, leaveOpen: true);
         using var writer = new StreamWriter(client, Utf8NoBom) { AutoFlush = true };
 
-        await writer.WriteLineAsync(JsonSerializer.Serialize(request));
-        var line = await reader.ReadLineAsync();
+        await writer.WriteLineAsync(JsonSerializer.Serialize(request)).Within();
+        var line = await reader.ReadLineAsync().Within();
         return JsonNode.Parse(line!)!;
     }
 

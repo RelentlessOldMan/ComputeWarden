@@ -156,9 +156,9 @@ public class SharingIpcTests
         await Task.Delay(100);
         Assert.False(pending.IsCompleted);
         w.SetMode(UserMode.Auto);
-        var res = JsonNode.Parse(await pending)!;
+        var res = JsonNode.Parse(await pending.Within())!;
 
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10));
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"answered after {watch.Elapsed}");
         Assert.True((bool)res["renewed"]!);
         Assert.Equal("full", (string)res["advice"]!["grant"]!);
         Assert.Equal(Grant.Full, w.LastGrant(id));
@@ -171,8 +171,10 @@ public class SharingIpcTests
         w.SetMode(UserMode.Steady);
         var id = w.Acquire(new ClaimRequest("A", "build", ClaimKind.Shared)).ReservationId!;
 
-        var res = JsonNode.Parse(await d.HandleAsync(JsonSerializer.Serialize(new { v = 1, op = "RENEW", reservationId = id, waitSeconds = 1 })))!;
+        var watch = Stopwatch.StartNew();
+        var res = JsonNode.Parse(await d.HandleAsync(JsonSerializer.Serialize(new { v = 1, op = "RENEW", reservationId = id, waitSeconds = 1 })).Within())!;
 
+        Assert.True(watch.Elapsed >= TimeSpan.FromSeconds(0.8), $"answered after {watch.Elapsed}");
         Assert.True((bool)res["renewed"]!);
         Assert.Equal("throttled", (string)res["advice"]!["grant"]!);
     }
@@ -183,7 +185,7 @@ public class SharingIpcTests
         var (d, _) = New();
 
         var watch = Stopwatch.StartNew();
-        var res = JsonNode.Parse(await d.HandleAsync("{\"v\":1,\"op\":\"RENEW\",\"reservationId\":\"nope\",\"waitSeconds\":30}"))!;
+        var res = JsonNode.Parse(await d.HandleAsync("{\"v\":1,\"op\":\"RENEW\",\"reservationId\":\"nope\",\"waitSeconds\":30}").Within())!;
 
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5));
         Assert.False((bool)res["renewed"]!);
@@ -201,23 +203,33 @@ public class SharingIpcTests
         Assert.Equal(UserMode.Steady, mode.Mode);
         Assert.NotNull(mode.ExpiresAt);
 
-        var claim = await client.AcquireAsync(new ClaimRequest("A", "build", ClaimKind.Shared, EstimateSeconds: 120, Cores: 8, RamGb: 4.5));
+        var claim = await client.AcquireAsync(new ClaimRequest("A", "build", ClaimKind.Shared, LeaseSeconds: 30, EstimateSeconds: 120, Cores: 8, RamGb: 4.5)).Within();
         Assert.Equal(ClaimKind.Shared, claim.Kind);
         Assert.Equal(Grant.Throttled, claim.Advice!.Grant);
         Assert.Equal(2, claim.Advice.Throttle!.MaxRamGb);
         Assert.NotNull(claim.Advice.How);
 
-        var status = await client.StatusAsync();
+        var status = await client.StatusAsync().Within();
         Assert.Equal("gaming", status.Mode!.Reason);
         var info = Assert.Single(status.Claims!);
         Assert.Equal(8, info.Cores);
         Assert.Equal(4.5, info.RamGb);
         Assert.Equal(Grant.Throttled, info.Grant);
 
+        var leaseEnd = info.ExpiresAt;
+        var watch = Stopwatch.StartNew();
         var renewing = client.RenewAsync(claim.ReservationId!, waitSeconds: 30);
-        await Task.Delay(200);
-        await client.SetModeAsync(UserMode.Auto);
-        var renew = await renewing;
+        // The waiting renew pushes the lease out; once it has, the daemon is holding the renew.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (Assert.Single((await client.StatusAsync().Within()).Claims!).ExpiresAt <= leaseEnd.AddSeconds(5))
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the renew never reached the daemon");
+            await Task.Delay(25);
+        }
+        Assert.False(renewing.IsCompleted);
+        await client.SetModeAsync(UserMode.Auto).Within();
+        var renew = await renewing.Within();
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(20), $"answered after {watch.Elapsed}");
         Assert.True(renew.Renewed);
         Assert.Equal(Grant.Full, renew.Advice!.Grant); // answered on the change, not after 30s
 
@@ -364,6 +376,7 @@ public class SharingIpcTests
     [InlineData("1h30m", 5400)]
     [InlineData("1d", 86400)]
     [InlineData("45s", 45)]
+    [InlineData("7d", 604800)]
     public void Cw_parses_durations(string text, int seconds)
     {
         Assert.True(Cli.Cli.TryParseDuration(text, out var parsed));
@@ -374,6 +387,7 @@ public class SharingIpcTests
     [InlineData("")]
     [InlineData("0")]
     [InlineData("8d")]
+    [InlineData("7d1s")]
     [InlineData("gaming")]
     [InlineData("2x")]
     [InlineData("30")]
@@ -429,5 +443,48 @@ public class SharingIpcTests
         Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "2h", "gaming", "3h" }, out _, out var error));
         Assert.Contains("Two durations", error);
         Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "gaming", "10d" }, out _, out _));
+    }
+
+    [Theory]
+    [InlineData("normal", UserMode.Auto)]
+    [InlineData("slow", UserMode.Steady)]
+    [InlineData("full", UserMode.Open)]
+    [InlineData("stop", UserMode.Hold)]
+    [InlineData("STEADY", UserMode.Steady)]
+    public void Cw_mode_aliases(string word, UserMode expected)
+    {
+        Assert.True(Cli.Cli.TryParseMode(new[] { word }, out var r, out var error), error);
+        Assert.Equal(expected, r.Mode);
+    }
+
+    [Fact]
+    public void Cw_mode_resources_short_flag_and_empty_list()
+    {
+        Assert.True(Cli.Cli.TryParseMode(new[] { "hold", "-r", "gpu, disk" }, out var r, out _));
+        Assert.Equal(new[] { "gpu", "disk" }, r.Resources);
+
+        Assert.True(Cli.Cli.TryParseMode(new[] { "hold", "--resources", "" }, out var empty, out _));
+        Assert.Empty(empty.Resources!); // nothing named: the daemon applies the mode to everything
+
+        Assert.False(Cli.Cli.TryParseMode(new[] { "hold", "-r" }, out _, out var missing));
+        Assert.Contains("--resources needs a list", missing);
+        Assert.False(Cli.Cli.TryParseMode(new[] { "auto", "--resources", "cpu" }, out _, out var auto));
+        Assert.Contains("auto takes no duration or resources", auto);
+    }
+
+    [Fact]
+    public async Task Cw_shows_mode_resources_and_user_priority()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        var output = new StringWriter();
+
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "mode", "hold", "-r", "gpu" }, client, output, new StringWriter()).Within());
+        Assert.Contains("Mode set: hold [gpu]", output.ToString());
+
+        await client.AcquireAsync(new ClaimRequest("A", "train", ClaimKind.Exclusive, ResourceSet.Cpu, WhenBusy.Wait, UserPriority: "user: now")).Within();
+        output.GetStringBuilder().Clear();
+        Assert.Equal(0, await Cli.Cli.RunAsync(Array.Empty<string>(), client, output, new StringWriter()).Within());
+        Assert.Contains("user priority: user: now", output.ToString());
     }
 }

@@ -10,7 +10,7 @@ namespace ComputeWarden.Mcp;
 
 /// <summary>
 /// The MCP tool surface for ComputeWarden. Each tool forwards to the daemon over IPC and
-/// returns compact structured JSON (spec §38) so agents can make their own decisions and
+/// returns compact structured JSON so agents can make their own decisions and
 /// produce useful explanations. Errors are returned as JSON, never thrown, so a transient
 /// daemon hiccup surfaces as data the agent can act on.
 /// </summary>
