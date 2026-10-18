@@ -55,6 +55,7 @@ public static class ComputeWardenTools
                 mode = s.Mode is { } m ? ModeDto(m, now) : null,
                 blockers = Blockers(s.Blockers),
                 claims = s.Claims?.Select(c => ClaimDto(c, now)).ToArray(),
+                daemonVersion = s.DaemonVersion,
             };
         });
 
@@ -107,7 +108,7 @@ public static class ComputeWardenTools
             {
                 r = await client.AcquireAsync(new ClaimRequest(
                     owner, description, ParseKind(kind),
-                    resources is null or { Length: 0 } ? ResourceSet.None : Resources.Parse(resources),
+                    Resources.ParseClaim(resources),
                     ParseWhenBusy(whenBusy), leaseSeconds, estimateSeconds, cores, ramGb, userPriority, metadata));
             }
 
@@ -136,10 +137,11 @@ public static class ComputeWardenTools
     public static Task<string> Renew(
         [Description("The reservation_id returned by computewarden_acquire.")] string reservationId,
         [Description("New lease seconds; clamped to server bounds. Omit to keep the claim's lease (legacy holds: the server default).")] int? leaseSeconds = null,
-        [Description("Wait up to this many seconds (max 60) for the grant to change before answering.")] int? waitSeconds = null)
+        [Description("Wait up to this many seconds (max 60) for the grant to change before answering.")] int? waitSeconds = null,
+        CancellationToken cancellationToken = default) // the host cancelling closes the pipe, which ends the daemon's wait
         => Run(async client =>
         {
-            var r = await client.RenewAsync(reservationId, leaseSeconds, waitSeconds);
+            var r = await client.RenewAsync(reservationId, leaseSeconds, waitSeconds, cancellationToken);
             var now = DateTimeOffset.UtcNow;
             return new
             {
@@ -181,7 +183,8 @@ public static class ComputeWardenTools
 
     [McpServerTool(Name = "computewarden_set_manual_busy")]
     [Description("Creates a manual blocker marking the machine BUSY for work ComputeWarden cannot " +
-                 "auto-detect (e.g. disk maintenance). May be disabled by server configuration.")]
+                 "auto-detect (e.g. disk maintenance). The USER's control: call this only when the user " +
+                 "explicitly asks for it, never on your own. May be disabled by server configuration.")]
     public static Task<string> SetManualBusy(
         [Description("Human-readable reason the machine is manually held busy.")] string reason,
         [Description("Resources to hold (cpu, gpu, ram, network, disk). Omit for all.")] string[]? resources = null)
@@ -192,7 +195,8 @@ public static class ComputeWardenTools
         });
 
     [McpServerTool(Name = "computewarden_clear_manual_busy")]
-    [Description("Removes the manual blocker previously set by computewarden_set_manual_busy.")]
+    [Description("Removes the manual blocker previously set by computewarden_set_manual_busy. The USER's " +
+                 "control, like setting it: only when the user explicitly asks.")]
     public static Task<string> ClearManualBusy()
         => Run(async client =>
         {
@@ -254,6 +258,11 @@ public static class ComputeWardenTools
                 error = "Access denied to the ComputeWarden pipe",
                 hint = "The daemon belongs to another user or an elevated session; stop it so a normal session can start its own.",
             }, Json);
+        }
+        catch (ArgumentException ex)
+        {
+            // A bad argument checked here before sending (an unknown resource, kind, or mode).
+            return JsonSerializer.Serialize(new { error = ex.Message }, Json);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

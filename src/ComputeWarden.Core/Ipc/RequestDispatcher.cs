@@ -79,9 +79,12 @@ public sealed class RequestDispatcher
         {
             request = JsonSerializer.Deserialize<IpcRequest>(requestLine, ParseOptions);
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            return Error("Malformed request (invalid JSON)");
+            // Valid JSON with a field of the wrong type has a path; say which field.
+            return Error(ex.Path is { Length: > 1 } path
+                ? $"Malformed request: '{path.TrimStart('$', '.')}' has the wrong type"
+                : "Malformed request (invalid JSON)");
         }
 
         if (request is null || string.IsNullOrWhiteSpace(request.Op))
@@ -135,6 +138,7 @@ public sealed class RequestDispatcher
             o["blockers"] = Blockers(status.Blockers);
             if (status.Mode is { } mode) o["mode"] = ModeJson(mode);
             o["claims"] = ClaimsJson(status.Claims ?? Array.Empty<ClaimInfo>());
+            o["daemonVersion"] = IpcProtocol.ProductVersion;
         });
     }
 
@@ -151,7 +155,7 @@ public sealed class RequestDispatcher
                 r.Owner ?? string.Empty,
                 r.Description ?? string.Empty,
                 ParseKind(r.Kind),
-                r.Resources is null or { Count: 0 } ? ResourceSet.None : resources, // None: the kind's default
+                Resources.ParseClaim(r.Resources), // None: the kind's default
                 ParseWhenBusy(r.WhenBusy),
                 r.LeaseSeconds,
                 r.EstimateSeconds,

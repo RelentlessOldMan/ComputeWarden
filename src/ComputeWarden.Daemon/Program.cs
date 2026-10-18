@@ -28,7 +28,18 @@ else log.Info(loaded.Message);
 
 // Single-instance guard: only one daemon should be the machine-wide authority. If another
 // daemon already holds the mutex, exit quietly — that one is serving the pipe.
-using var singleInstance = new Mutex(initiallyOwned: false, "Global\\ComputeWardenDaemon", out _);
+Mutex singleInstance;
+try
+{
+    singleInstance = new Mutex(initiallyOwned: false, "Global\\ComputeWardenDaemon", out _);
+}
+catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException)
+{
+    // E.g. another user's or an elevated daemon created it: that one is the authority here.
+    log.Error("Could not open the single-instance mutex; is a daemon running as another user or elevated?", ex);
+    return 1;
+}
+using var _singleInstance = singleInstance;
 bool owns;
 try
 {

@@ -13,7 +13,8 @@ public sealed record StatusResult(
     IReadOnlyList<Blocker> Blockers,
     ResourceSet BusyResources = ResourceSet.None,
     ModeState? Mode = null,
-    IReadOnlyList<ClaimInfo>? Claims = null);
+    IReadOnlyList<ClaimInfo>? Claims = null,
+    string? DaemonVersion = null);
 
 /// <summary>
 /// Outcome of an acquire. A legacy acquire (no kind) either holds its resources or is refused.

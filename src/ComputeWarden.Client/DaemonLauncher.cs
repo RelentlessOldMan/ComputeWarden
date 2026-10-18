@@ -21,13 +21,14 @@ public static class DaemonLauncher
                 ? d
                 : AppContext.BaseDirectory;
 
+            // Shell execute, not CreateProcess: CreateProcess would hand the daemon our inheritable
+            // handles, including the MCP host's stdio pipes, and the daemon lives until reboot, so
+            // the host would never see this adapter's stdout close.
             var psi = new ProcessStartInfo
             {
                 FileName = fileName,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false,
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
                 WorkingDirectory = workingDirectory,
             };
             foreach (var arg in arguments) psi.ArgumentList.Add(arg);

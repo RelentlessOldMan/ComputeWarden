@@ -77,6 +77,9 @@ public sealed record Advice(
     ResourceSet Contended)
 {
     public static readonly Advice Full = new(Grant.Full, null, null, null, null, ResourceSet.None);
+
+    /// <summary>Queued only for a throttle slot: the resources it's waiting for one on.</summary>
+    internal ResourceSet SlotWait { get; init; }
 }
 
 /// <summary>A snapshot of one agent claim, for status and queue listings.</summary>

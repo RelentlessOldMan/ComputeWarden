@@ -16,7 +16,8 @@ namespace ComputeWarden.Daemon;
 /// server down.
 ///
 /// On Windows the pipe DACL is restricted to the current user (plus LocalSystem) so other
-/// local users cannot connect (spec §26). On other platforms the default pipe is used.
+/// local users cannot connect, and remote clients are denied. On other platforms the default
+/// pipe is used.
 /// </summary>
 public sealed class NamedPipeServer : IAsyncDisposable
 {
@@ -117,26 +118,40 @@ public sealed class NamedPipeServer : IAsyncDisposable
             using (var writer = new StreamWriter(server, Utf8NoBom, bufferSize: 1024, leaveOpen: true) { AutoFlush = true })
             {
                 var lines = new BoundedLineReader(reader, MaxRequestChars);
+                Task<(string? Line, bool TooLong)>? next = null;
                 while (!_cts.IsCancellationRequested)
                 {
-                    using var idle = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-                    idle.CancelAfter(_idleTimeout);
+                    // Defense-in-depth: a legitimate request is tiny even with maxed-out metadata,
+                    // so cap line length while reading. (The pipe is also ACL-restricted to the
+                    // current user; this bounds a buggy client, not just a hostile one.)
+                    var read = next ?? lines.ReadLineAsync(_cts.Token);
+                    next = null;
+                    (string? Line, bool TooLong) got;
+                    try { got = await read.WaitAsync(_idleTimeout, _cts.Token); }
+                    catch (TimeoutException) { break; } // idle past the timeout; disposing the pipe ends the read
 
-                    // Defense-in-depth (spec §26): a legitimate request is tiny even with maxed-out
-                    // metadata, so cap line length while reading. (The pipe is also ACL-restricted
-                    // to the current user; this bounds a buggy client, not just a hostile one.)
-                    var (line, tooLong) = await lines.ReadLineAsync(idle.Token);
+                    var (line, tooLong) = got;
                     if (tooLong)
                     {
                         _log.Warn($"Rejected pipe request exceeding {MaxRequestChars} characters");
-                        await writer.WriteLineAsync(TooLargeResponse.AsMemory(), _cts.Token);
+                        await WriteAsync(writer, TooLargeResponse);
                         continue;
                     }
                     if (line is null) break;
                     if (line.Length == 0) continue;
 
-                    var response = await _dispatcher.HandleAsync(line, _cts.Token);
-                    await writer.WriteLineAsync(response.AsMemory(), _cts.Token);
+                    // Read the next request while this one is handled: a renew can wait up to a
+                    // minute for new advice, and if the client hangs up meanwhile the read ends,
+                    // so the wait stops instead of renewing a lease for nobody.
+                    using var gone = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                    var handling = _dispatcher.HandleAsync(line, gone.Token);
+                    next = lines.ReadLineAsync(_cts.Token);
+                    if (await Task.WhenAny(handling, next) == next &&
+                        (next.IsFaulted || next.IsCanceled || next.Result.Line is null))
+                        gone.Cancel();
+
+                    var response = await handling;
+                    await WriteAsync(writer, response);
                 }
             }
         }
@@ -156,6 +171,17 @@ public sealed class NamedPipeServer : IAsyncDisposable
         {
             _clients.TryRemove(id, out _);
         }
+    }
+
+    /// <summary>
+    /// Writes one response, giving up after the idle timeout: a client that stops reading would
+    /// otherwise hold this handler, and one of the finite pipe instances, forever.
+    /// </summary>
+    private async Task WriteAsync(StreamWriter writer, string response)
+    {
+        using var stuck = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        stuck.CancelAfter(_idleTimeout);
+        await writer.WriteLineAsync(response.AsMemory(), stuck.Token);
     }
 
     private NamedPipeServerStream CreatePipeInstance()
@@ -179,6 +205,11 @@ public sealed class NamedPipeServer : IAsyncDisposable
 
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         security.AddAccessRule(new PipeAccessRule(system, PipeAccessRights.FullControl, AccessControlType.Allow));
+
+        // The same user signed in on another machine would match the rule above over SMB. The
+        // warden coordinates this machine only, so refuse every remote client.
+        var network = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
+        security.AddAccessRule(new PipeAccessRule(network, PipeAccessRights.FullControl, AccessControlType.Deny));
 
         return NamedPipeServerStreamAcl.Create(
             _pipeName,

@@ -117,7 +117,9 @@ Windows x64. Self-contained, so you don't need the .NET runtime.
    **Codex** (`~/.codex/config.toml`):
    ```toml
    [mcp_servers.computewarden]
-   command = 'C:\Users\you\AppData\Local\ComputeWarden\bin\ComputeWarden.Mcp.exe'
+   command = 'C:\Users\<you>\AppData\Local\ComputeWarden\bin\ComputeWarden.Mcp.exe'
+   # a renew can wait up to 60 s for new advice, longer than Codex's default tool timeout
+   tool_timeout_sec = 120
    ```
 
    Other MCP clients: point them at `ComputeWarden.Mcp.exe` as a stdio server (see
@@ -144,15 +146,15 @@ Each command costs two small tool calls (acquire and release):
 
 ```markdown
 ## ComputeWarden (shared machine)
-`computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools or daemon are unavailable, work normally.
-- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, plus owner, description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes.
-- **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`.
+`computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
+- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes, even if it failed.
+- **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"` with `estimateSeconds`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`. Release it even if it fails.
 - **Follow `advice.grant`:**
   - `full`: run normally.
-  - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, low priority).
-  - `queued`: don't start. Call `computewarden_renew` with `waitSeconds: 60` until the grant changes.
-- **Long work:** renew within the lease. When the grant changes, size the next step to match. A switch to `full` means go full speed.
-- **User only:** set `userPriority` (skip the line) or call `computewarden_set_mode` only when the user explicitly says so.
+  - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
+  - `queued`: don't start. Call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
+- **Long work:** `estimateSeconds` sets the lease, so err high. Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
+- **User only:** set `userPriority` (skip the line), call `computewarden_set_mode`, or set a manual hold only when the user explicitly says so.
 ```
 
 Older wording that only gates heavy work with a plain acquire (no `kind`) still works.
@@ -168,8 +170,8 @@ Those acquires are all-or-nothing and are refused while anyone is in line for th
 | `computewarden_status` | `AVAILABLE` / `BUSY` / `UNKNOWN`, `busy_resources`, every blocker, the current `mode`, and every agent claim. |
 | `computewarden_can_run` | Quick check for the given `resources`. Informational only: it reserves nothing. |
 | `computewarden_set_mode` | Sets the user mode (`auto` / `steady` / `open` / `hold`), with optional duration, reason, and resources. **User only:** agents call it only on your word. |
-| `computewarden_set_manual_busy` | Holds the machine (or given `resources`) busy for work ComputeWarden can't detect. |
-| `computewarden_clear_manual_busy` | Clears that manual hold. |
+| `computewarden_set_manual_busy` | Holds the machine (or given `resources`) busy for work ComputeWarden can't detect. **User only.** |
+| `computewarden_clear_manual_busy` | Clears that manual hold. **User only.** |
 | `computewarden_stats` | Counters since the daemon started. A high `expired_reservations` means agents acquire but don't release. |
 
 All tools return compact JSON, and errors come back as JSON with an `error` field too.

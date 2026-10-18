@@ -87,6 +87,29 @@ public class SharingIpcTests
     }
 
     [Fact]
+    public void Status_reports_the_daemon_version()
+    {
+        var (d, _) = New();
+
+        var res = Handle(d, new { v = 1, op = "STATUS" });
+
+        Assert.Equal(IpcProtocol.ProductVersion, (string)res["daemonVersion"]!);
+        Assert.Matches(@"^\d+\.\d+\.\d+", IpcProtocol.ProductVersion);
+    }
+
+    [Fact]
+    public void Blank_resource_names_give_the_kinds_default()
+    {
+        var (d, _) = New();
+
+        var blank = Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "x", kind = "shared", resources = new[] { " " } });
+        var nulls = Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "y", kind = "shared", resources = new string?[] { null } });
+
+        Assert.Equal(new[] { "cpu", "ram", "disk" }, blank["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram", "disk" }, nulls["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+    }
+
+    [Fact]
     public void Status_lists_mode_and_claims()
     {
         var (d, _) = New();
@@ -108,6 +131,9 @@ public class SharingIpcTests
     [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"greedy\"}", "Unknown kind")]
     [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"exclusive\",\"whenBusy\":\"cry\"}", "Unknown whenBusy")]
     [InlineData("{\"v\":1,\"op\":\"SET_MODE\",\"mode\":\"hold\",\"durationSeconds\":0}", "durationSeconds")]
+    [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"shared\",\"estimateSeconds\":\"ten\"}", "'estimateSeconds' has the wrong type")]
+    [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"shared\",\"resources\":\"cpu\"}", "'resources' has the wrong type")]
+    [InlineData("{\"v\":1,\"op\":\"ACQUIRE\",\"owner\":\"A\",\"kind\":\"shared\",\"resources\":[\"cpuu\"]}", "Unknown resource 'cpuu'")]
     public void Bad_values_are_reported_as_errors(string line, string expected)
     {
         var (d, _) = New();
@@ -204,6 +230,29 @@ public class SharingIpcTests
         Assert.Contains("B holds gpu", waiting.Advice.Reason);
     }
 
+    [Fact]
+    public async Task Waiting_renew_stops_when_the_client_hangs_up()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        await client.SetModeAsync(UserMode.Steady);
+        var claim = await client.AcquireAsync(new ClaimRequest("A", "build", ClaimKind.Shared, LeaseSeconds: 60));
+
+        using var cts = new CancellationTokenSource();
+        var renewing = client.RenewAsync(claim.ReservationId!, leaseSeconds: 3600, waitSeconds: 30, ct: cts.Token);
+        await Task.Delay(500);
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => renewing);
+        await Task.Delay(1000);
+
+        // Ending the wait now would renew for an hour, if the daemon were still waiting.
+        await client.SetModeAsync(UserMode.Auto);
+        await Task.Delay(2000);
+
+        var info = Assert.Single((await client.StatusAsync()).Claims!);
+        Assert.True(info.ExpiresAt < DateTimeOffset.UtcNow.AddMinutes(10), $"renewed for nobody: expires {info.ExpiresAt:O}");
+    }
+
     // ---- MCP tools ------------------------------------------------------
 
     [Fact]
@@ -221,6 +270,9 @@ public class SharingIpcTests
         Assert.Equal("throttled", (string)acq["advice"]!["grant"]!);
         Assert.Equal(1, (int)acq["advice"]!["throttle"]!["max_cores"]!);
         Assert.Contains("small", (string)acq["advice"]!["next"]!);
+
+        var typo = JsonNode.Parse(await ComputeWardenTools.Acquire("Claude", "x", resources: new[] { "cpuu" }, kind: "shared"))!;
+        Assert.StartsWith("Unknown resource 'cpuu'", (string)typo["error"]!);
 
         var status = JsonNode.Parse(await ComputeWardenTools.Status())!;
         Assert.Equal("steady", (string)status["mode"]!["mode"]!);
@@ -354,5 +406,28 @@ public class SharingIpcTests
         Assert.False(Cli.Cli.TryParseMode(new[] { "auto", "2h" }, out _, out var error));
         Assert.Contains("auto takes no duration", error);
         Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "--resources", "cpu,bogus" }, out _, out _));
+    }
+
+    [Theory]
+    [InlineData("steady gaming 2h")]
+    [InlineData("steady gaming for 2h")]
+    [InlineData("steady 2h gaming")]
+    [InlineData("steady for 2h gaming")]
+    public void Cw_mode_takes_the_duration_anywhere(string line)
+    {
+        Assert.True(Cli.Cli.TryParseMode(line.Split(' '), out var r, out var error), error);
+        Assert.Equal(7200, r.DurationSeconds);
+        Assert.Equal("gaming", r.Reason);
+    }
+
+    [Fact]
+    public void Cw_mode_keeps_for_in_a_reason_and_refuses_two_durations()
+    {
+        Assert.True(Cli.Cli.TryParseMode(new[] { "hold", "waiting", "for", "friends" }, out var r, out _));
+        Assert.Equal("waiting for friends", r.Reason);
+        Assert.Null(r.DurationSeconds);
+        Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "2h", "gaming", "3h" }, out _, out var error));
+        Assert.Contains("Two durations", error);
+        Assert.False(Cli.Cli.TryParseMode(new[] { "steady", "gaming", "10d" }, out _, out _));
     }
 }

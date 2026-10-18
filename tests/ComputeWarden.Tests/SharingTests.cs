@@ -84,6 +84,7 @@ public class SharingTests
         Assert.Equal(2, a.Throttle.MaxRamGb);
         Assert.Contains("Overwatch.exe", a.Reason);
         Assert.Contains("-m:1", a.How);
+        Assert.Contains("start \"\" /b /wait /belownormal <command>", a.How);
     }
 
     [Fact]

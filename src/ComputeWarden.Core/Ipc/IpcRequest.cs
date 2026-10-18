@@ -69,4 +69,12 @@ public static class IpcProtocol
 
     /// <summary>Default machine-wide pipe name (Windows: \\.\pipe\ComputeWarden).</summary>
     public const string PipeName = "ComputeWarden";
+
+    /// <summary>The release this build is, e.g. "1.1.2": STATUS reports it so an install can be checked.</summary>
+    public static string ProductVersion { get; } =
+        (typeof(IpcProtocol).Assembly
+             .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+             .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+             .FirstOrDefault()?.InformationalVersion ?? "unknown")
+        .Split('+')[0];
 }

@@ -37,7 +37,8 @@ internal static class ResponseParser
         BusyResources: ResourcesOpt(root, "busyResources") ?? ResourceSet.None,
         // A daemon predating sharing sends neither.
         Mode: root.TryGetProperty("mode", out var m) && m.ValueKind == JsonValueKind.Object ? Mode(m) : null,
-        Claims: root.TryGetProperty("claims", out var c) ? Claims(c) : null);
+        Claims: root.TryGetProperty("claims", out var c) ? Claims(c) : null,
+        DaemonVersion: String(root, "daemonVersion"));
 
     public static AcquireResult Acquire(JsonElement root) => new(
         Acquired: Bool(root, "acquired"),

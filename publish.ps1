@@ -6,7 +6,9 @@ param(
     [string]$Config  = "Release",
     # Also copy the published exes to the stable per-user install dir the user-scope MCP
     # server points at (%LOCALAPPDATA%\ComputeWarden\bin), so updating is a one-liner.
-    [switch]$Install
+    [switch]$Install,
+    # Install even though a user mode (steady, open, hold) is set: restarting the daemon drops it.
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,9 +40,15 @@ if ($Install) {
     $bin = Join-Path $env:LOCALAPPDATA "ComputeWarden\bin"
     Write-Host "Installing to $bin"
     New-Item -ItemType Directory -Force $bin | Out-Null
-    # A running daemon locks its exe; stop it so the copy can replace it.
-    Get-CimInstance Win32_Process -Filter "Name='ComputeWarden.Daemon.exe'" |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+    # The daemon is restarted at the end, which drops a mode the user set. Don't do that silently.
+    $daemons = @(Get-CimInstance Win32_Process -Filter "Name='ComputeWarden.Daemon.exe'")
+    if ($daemons.Count -gt 0 -and -not $Force) {
+        $mode = (& (Join-Path $out "cw.exe") mode 2>$null) -join " "
+        if ($LASTEXITCODE -eq 0 -and $mode -notmatch '^Mode: auto') {
+            throw "$mode. Installing restarts the daemon, which drops that mode. Re-run with -Force to install anyway, then set it again with cw mode."
+        }
+    }
 
     # Clean up exes moved aside by earlier installs, once no session is still running them.
     Get-ChildItem $bin -Filter "*.old-*" -File -ErrorAction SilentlyContinue |
@@ -74,6 +82,14 @@ if ($Install) {
             }
         }
     }
+    # Stop every daemon only now, after the copy: an adapter that respawns one while we wait gets
+    # the new exe, not the old one. Running exes rename fine, so the daemon never blocked the copy.
+    Get-CimInstance Win32_Process -Filter "Name='ComputeWarden.Daemon.exe'" | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    Write-Host "Stopped the old daemon; the next agent call or cw command starts the new one."
+
     Write-Host ""
     if ($movedAside.Count -gt 0) {
         Write-Host "Updated while in use (old copy moved aside): $($movedAside -join ', ')"

@@ -34,6 +34,14 @@ public static class Resources
     public static string ValidNames => string.Join(", ", Names.Select(n => n.Name)) + ", all";
 
     /// <summary>
+    /// Parses a claim's resource names. No names (null, empty, or only blanks) gives
+    /// <see cref="ResourceSet.None"/>, which a claim reads as its kind's default, so a stray
+    /// blank can't turn everyday work into a whole-machine claim.
+    /// </summary>
+    public static ResourceSet ParseClaim(IEnumerable<string>? names)
+        => names is null || names.All(string.IsNullOrWhiteSpace) ? ResourceSet.None : Parse(names);
+
+    /// <summary>
     /// Parses resource names (case-insensitive; "all" and "memory" accepted). Null or empty
     /// means <see cref="ResourceSet.All"/>. Throws <see cref="ArgumentException"/> on an
     /// unknown name so typos fail loudly instead of silently under-reserving.

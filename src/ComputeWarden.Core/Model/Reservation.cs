@@ -41,6 +41,12 @@ public sealed class Reservation
     /// <summary>The grant last given to the owner, which keeps a throttled slot stable across check-ins.</summary>
     public Grant LastGrant { get; internal set; } = Grant.Full;
 
+    /// <summary>What the last throttled advice was throttled on: only those resources' slots are taken.</summary>
+    internal ResourceSet LastContended { get; set; }
+
+    /// <summary>A ticket queued only for a throttle slot: the resources it's waiting for one on.</summary>
+    internal ResourceSet SlotWait { get; set; }
+
     public Reservation(
         string id,
         string owner,

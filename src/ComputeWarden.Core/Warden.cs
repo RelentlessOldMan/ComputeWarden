@@ -102,7 +102,9 @@ public sealed class Warden
         lock (_gate)
         {
             var x = BuildLocked();
-            return DetermineState(x.Confident, Conflicting(x.Blockers, resources)) == MachineState.Available;
+            // Resources promised to a claim waiting in line aren't free either: a legacy acquire is refused them.
+            return DetermineState(x.Confident, Conflicting(x.Blockers, resources)) == MachineState.Available &&
+                   !x.Line.Any(w => Resources.Overlaps(w.Resources, resources));
         }
     }
 
@@ -607,12 +609,12 @@ public sealed class Warden
         if (!c.Started && capped != ResourceSet.None)
         {
             var waiting = EarlierWaiting(c, capped);
-            var full = FullSlots(c, capped, waiting, sharing.MaxThrottledPerResource);
+            var full = FullSlots(c, x, capped, waiting, sharing.MaxThrottledPerResource);
             if (full != ResourceSet.None)
             {
                 reasons.Add($"throttle slots full on {string.Join("/", Resources.ToNames(full))} ({sharing.MaxThrottledPerResource} per resource)");
-                if (c.Kind == ClaimKind.Shared) ahead = waiting;
-                return Queued(c, x, ahead, contended, now, Join(reasons));
+                ahead = ahead.Union(waiting).OrderBy(r => r.UserPriority is null ? 1 : 0).ThenBy(r => r.Seq).ToList();
+                return Queued(c, x, ahead, contended, now, Join(reasons), slotWait: capped);
             }
         }
 
@@ -623,6 +625,8 @@ public sealed class Warden
     private void Apply(Reservation r, Advice advice, DateTimeOffset now, int? renewSeconds)
     {
         r.LastGrant = advice.Grant;
+        r.LastContended = advice.Grant == Grant.Throttled ? advice.Contended : ResourceSet.None;
+        r.SlotWait = advice.Grant == Grant.Queued ? advice.SlotWait : ResourceSet.None;
         r.LastRenewedAt = now;
         if (!r.Started && advice.Grant != Grant.Queued)
         {
@@ -662,24 +666,42 @@ public sealed class Warden
     }
 
     /// <summary>
-    /// Shared tickets that arrived before <paramref name="c"/> and are still waiting for a slot on
-    /// <paramref name="capped"/>: a newcomer doesn't take a freed slot ahead of them.
+    /// Tickets of either kind still waiting for a throttle slot on <paramref name="capped"/> that
+    /// are ahead of <paramref name="c"/>: earlier arrivals, and user-priority claims before everyone
+    /// else. A newcomer doesn't take a freed slot ahead of them. Tickets queued for some other
+    /// reason (an unshareable gpu, a hold) aren't waiting for a slot, so they don't count.
     /// </summary>
     private List<Reservation> EarlierWaiting(Reservation c, ResourceSet capped)
         => _reservations.Values
-            .Where(r => r != c && r.Kind == ClaimKind.Shared && !r.Started && r.LastGrant == Grant.Queued &&
-                        r.Seq < c.Seq && Resources.Overlaps(r.Resources, capped))
-            .OrderBy(r => r.Seq)
+            .Where(r => r != c && !r.Started && r.LastGrant == Grant.Queued &&
+                        Resources.Overlaps(r.SlotWait, capped) && Ahead(r, c))
+            .OrderBy(r => r.UserPriority is null ? 1 : 0)
+            .ThenBy(r => r.Seq)
             .ToList();
 
-    /// <summary>The resources in <paramref name="capped"/> whose throttle slots are all taken, counted per resource.</summary>
-    private ResourceSet FullSlots(Reservation c, ResourceSet capped, List<Reservation> waiting, int max)
+    /// <summary>Line order: user-priority claims first, then first come, first served.</summary>
+    private static bool Ahead(Reservation r, Reservation c)
     {
+        var rFirst = r.UserPriority is not null;
+        var cFirst = c.UserPriority is not null;
+        return rFirst != cFirst ? rFirst : r.Seq < c.Seq;
+    }
+
+    /// <summary>
+    /// The resources in <paramref name="capped"/> whose throttle slots are all taken, counted per
+    /// resource: tickets ahead waiting for one, running work throttled on it, and running work a
+    /// game (or steady mode, or UNKNOWN) now contends there, which turns throttled at its next check-in.
+    /// </summary>
+    private ResourceSet FullSlots(Reservation c, Context x, ResourceSet capped, List<Reservation> waiting, int max)
+    {
+        var slowing = x.Priority | x.Steady | (x.Confident ? ResourceSet.None : ResourceSet.All);
         var full = ResourceSet.None;
         foreach (var bit in Bits(capped))
         {
-            var used = waiting.Count(r => Resources.Overlaps(r.Resources, bit)) + _reservations.Values.Count(r =>
-                r != c && r.Started && r.LastGrant == Grant.Throttled && Resources.Overlaps(r.Resources, bit));
+            var used = waiting.Count(r => Resources.Overlaps(r.SlotWait, bit)) + _reservations.Values.Count(r =>
+                r != c && r.Started && (r.LastGrant == Grant.Throttled
+                    ? Resources.Overlaps(r.LastContended, bit)
+                    : Resources.Overlaps(r.Resources & slowing, bit)));
             if (used >= max) full |= bit;
         }
         return full;
@@ -703,33 +725,37 @@ public sealed class Warden
         return new Advice(Grant.Throttled, reason, throttle, HowText(contended, s), null, contended);
     }
 
-    private Advice Queued(Reservation c, Context x, List<Reservation> ahead, ResourceSet contended, DateTimeOffset now, string? reason)
+    private Advice Queued(Reservation c, Context x, List<Reservation> ahead, ResourceSet contended, DateTimeOffset now, string? reason,
+        ResourceSet slotWait = ResourceSet.None)
     {
-        int? position = c.InLine || ahead.Count > 0 ? ahead.Count + 1 : null;
+        int? position = c.InLine || ahead.Count > 0 || slotWait != ResourceSet.None ? ahead.Count + 1 : null;
 
         // Waits behind a game, a hold, or steady mode (directly or through a claim ahead) have no end we can predict.
         int? estimate = null;
         if (!Resources.Overlaps(c.Resources | Occupied(ahead), x.Priority | x.Hold | x.Steady) && x.Confident)
         {
-            var remaining = 0;
+            long remaining = 0; // long: estimates are only checked for >= 0, so their sum can pass int.MaxValue
             foreach (var h in x.Holders)
                 if (h != c && Resources.Overlaps(h.Resources, c.Resources))
                     remaining = Math.Max(remaining, Remaining(h, now));
             foreach (var a in ahead)
                 remaining += a.EstimateSeconds ?? a.LeaseSeconds;
-            estimate = remaining;
+            estimate = (int)Math.Min(remaining, int.MaxValue);
         }
 
         var queue = new QueueInfo(position, ahead.Select(a => Info(a, x)).ToList(), estimate);
-        return new Advice(Grant.Queued, reason, null, "Don't start yet. Check back by renewing this reservation.", queue, contended);
+        return new Advice(Grant.Queued, reason, null, "Don't start yet. Check back by renewing this reservation.", queue, contended)
+        {
+            SlotWait = slotWait,
+        };
     }
 
-    private static int Remaining(Reservation h, DateTimeOffset now)
+    private static long Remaining(Reservation h, DateTimeOffset now)
     {
-        var leaseLeft = Math.Max(0, (int)(h.ExpiresAt - now).TotalSeconds);
+        var leaseLeft = Math.Max(0, (long)(h.ExpiresAt - now).TotalSeconds);
         if (!h.Started) return leaseLeft + (h.EstimateSeconds ?? h.LeaseSeconds); // promoted, not checked in yet
         if (h.EstimateSeconds is int e && h.StartedAt is { } started)
-            return Math.Clamp((int)(started.AddSeconds(e) - now).TotalSeconds, 0, leaseLeft);
+            return Math.Clamp((long)(started.AddSeconds(e) - now).TotalSeconds, 0, leaseLeft);
         return leaseLeft;
     }
 
@@ -741,6 +767,15 @@ public sealed class Warden
             var n = s.ThrottleMaxCores;
             parts.Add($"use at most {n} core{(n == 1 ? "" : "s")} at {s.ThrottlePriority.Replace('_', '-')} priority " +
                       $"(e.g. dotnet build -m:{n}, dotnet test -- RunConfiguration.MaxCpuCount={n}, make -j{n})");
+            // Windows start's priority switches; an unrecognized setting just gets no example.
+            var startSwitch = s.ThrottlePriority.Replace("-", "_").ToLowerInvariant() switch
+            {
+                "below_normal" => "/belownormal",
+                "idle" or "low" => "/low",
+                _ => null,
+            };
+            if (startSwitch is not null)
+                parts.Add($"to lower the priority, run it as: cmd /c start \"\" /b /wait {startSwitch} <command>");
         }
         if (Resources.Overlaps(contended, ResourceSet.Ram))
             parts.Add($"keep memory under {s.ThrottleMaxRamGb.ToString(CultureInfo.InvariantCulture)} GB (no large parallel test hosts or in-memory datasets)");

@@ -149,22 +149,21 @@ internal static class Cli
                 continue;
             }
 
-            if (duration is null && reason.Count == 0)
+            // The duration can go anywhere ("steady 2h gaming", "steady gaming for 2h"). Anything
+            // that looks like a duration must be one: a typo must not make the mode permanent.
+            var afterFor = a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && LooksLikeDuration(args[i + 1]);
+            var token = afterFor ? args[i + 1] : a;
+            if (afterFor || LooksLikeDuration(token))
             {
-                var afterFor = a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length;
-                var token = afterFor ? args[i + 1] : a;
-                // Anything that looks like a duration must be one: a typo must not make the mode permanent.
-                if (afterFor || LooksLikeDuration(token))
+                if (duration is not null) { error = $"Two durations ('{token}'): give one."; return false; }
+                if (!TryParseDuration(token, out var seconds))
                 {
-                    if (!TryParseDuration(token, out var seconds))
-                    {
-                        error = $"Bad duration '{token}' (use e.g. 90m, 2h, 1h30m, 1d; at most 7d).";
-                        return false;
-                    }
-                    duration = seconds;
-                    if (afterFor) i++;
-                    continue;
+                    error = $"Bad duration '{token}' (use e.g. 90m, 2h, 1h30m, 1d; at most 7d).";
+                    return false;
                 }
+                duration = seconds;
+                if (afterFor) i++;
+                continue;
             }
             reason.Add(a);
         }
@@ -215,6 +214,7 @@ internal static class Cli
         if (s.Mode is { } mode) w.WriteLine($"Mode:    {Describe(mode, now)}");
         var busy = s.BusyResources == ResourceSet.None ? "" : $" {Names(s.BusyResources)}";
         w.WriteLine($"Machine: {s.State.ToString().ToUpperInvariant()}{busy}");
+        if (s.DaemonVersion is { } version) w.WriteLine($"Daemon:  v{version}");
 
         var games = s.Blockers.Where(b => b.Type == BlockerType.Process).ToList();
         var manual = s.Blockers.Where(b => b.Type == BlockerType.Manual && b.Id != "mode").ToList();
