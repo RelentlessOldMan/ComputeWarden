@@ -14,12 +14,6 @@ public sealed class WardenConfig
 
     public string LogLevel { get; init; } = "info";
 
-    public static WardenConfig CreateDefault() => new()
-    {
-        ProcessRules =
-        {
-            new ProcessRule { Name = "MSBuild", Executable = "MSBuild.exe" },
-            new ProcessRule { Name = "CodeCompass", Executable = "CodeCompass.exe" },
-        },
-    };
+    /// <summary>No process rules: which games to yield to is the user's to list.</summary>
+    public static WardenConfig CreateDefault() => new();
 }

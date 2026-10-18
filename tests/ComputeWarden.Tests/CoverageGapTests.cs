@@ -372,7 +372,7 @@ public class ConfigWatcherTests
     public void Locked_config_file_falls_back_to_defaults_and_is_flagged_as_an_error()
     {
         var path = Path.Combine(Path.GetTempPath(), "cw-locked-" + Guid.NewGuid().ToString("N") + ".yaml");
-        File.WriteAllText(path, "process_rules: []\n");
+        File.WriteAllText(path, "leases:\n  default_seconds: 77\n");
         Environment.SetEnvironmentVariable("COMPUTEWARDEN_CONFIG", path);
         try
         {
@@ -382,7 +382,7 @@ public class ConfigWatcherTests
 
                 Assert.True(result.IsError);
                 Assert.Contains("Could not read", result.Message);
-                Assert.NotEmpty(result.Config.ProcessRules); // defaults
+                Assert.Equal(300, result.Config.Leases.DefaultSeconds); // defaults, not the file's 77
             }
         }
         finally

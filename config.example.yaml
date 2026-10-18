@@ -23,22 +23,19 @@ process_detection:
   busy_after_ms: 0        # delay before a newly-seen process counts as a blocker
   available_after_ms: 3000 # keep BUSY this long after a matched process exits (debounce)
 
-# Cooperating agents will see the machine as BUSY whenever any enabled rule matches.
-# A matched process is a *priority* claim (the user's own lease, e.g. a game): every agent
-# on its resources is throttled or queued while it runs, in every mode.
+# Your games and other foreground programs agents must yield to. A matched process is a
+# *priority* claim (your own lease): every agent on its resources is throttled or queued
+# while it runs, in every mode. Don't list agent tools (builds, indexers) here; they make
+# shared or exclusive claims instead.
 # Optional per rule: `resources` = which of cpu, gpu, ram, network, disk the process occupies.
 # Agents asking only for other resources can still proceed. Omit it to block everything.
 process_rules:
-  - name: Visual Studio Build
-    executable: MSBuild.exe
+  - name: My Game
+    executable: MyGame.exe
     enabled: true
-  - name: CodeCompass Indexer
-    executable: CodeCompass.exe
-    enabled: true
-  - name: CodeCarver
-    executable: CodeCarver.exe
-    enabled: true
-    resources: [ram, disk]   # memory-heavy analyzer: CPU/GPU work can still run
+    resources: [cpu, gpu, ram]   # disk and network work can still run
+  # - name: Video editor
+  #   executable: Resolve.exe
 
 # Shared work and the line (agent claims with a kind). All advisory: agents apply it themselves.
 sharing:

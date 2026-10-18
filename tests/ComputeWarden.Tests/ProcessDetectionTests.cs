@@ -32,7 +32,7 @@ public class ProcessDetectionTests
             new[]
             {
                 new ProcessRule { Name = "MSBuild", Executable = "MSBuild.exe" },
-                new ProcessRule { Name = "CodeCompass", Executable = "CodeCompass.exe" },
+                new ProcessRule { Name = "Indexer", Executable = "Indexer.exe" },
                 new ProcessRule { Name = "Disabled", Executable = "Nope.exe", Enabled = false },
             },
             options ?? new ProcessDetectionOptions { AvailableAfterMs = 3000 },
@@ -88,7 +88,7 @@ public class ProcessDetectionTests
         var clock = new FakeClock();
         var provider = Provider(lister, clock);
 
-        lister.Set(("MSBuild", 1), ("CodeCompass", 2));
+        lister.Set(("MSBuild", 1), ("Indexer", 2));
         provider.Refresh();
 
         Assert.Equal(2, provider.GetBlockers().Blockers.Count);
@@ -153,7 +153,7 @@ public class ProcessDetectionTests
     {
         var lister = new FakeLister();
         var clock = new FakeClock();
-        var provider = Provider(lister, clock); // rules: MSBuild, CodeCompass
+        var provider = Provider(lister, clock); // rules: MSBuild, Indexer
         lister.Set(("MSBuild", 1), ("Game", 2));
         provider.Refresh();
         var before = Assert.Single(provider.GetBlockers().Blockers);

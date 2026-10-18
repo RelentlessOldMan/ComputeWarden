@@ -22,7 +22,7 @@ ask (over [MCP](https://modelcontextprotocol.io)) and respect the answer.
 ComputeWarden tracks **blockers**, meaning reasons some resource is in use:
 
 - **Reservations**: an agent asked for resources and got them, on an expiring lease.
-- **Processes**: a program you listed in the config is running (a game, `MSBuild.exe`, an indexer).
+- **Processes**: a program you listed in the config is running, such as a game.
 - **Manual holds**: you marked resources busy for something it can't detect.
 
 Each blocker occupies some of `cpu`, `gpu`, `ram`, `network`, and `disk`. An agent calls
@@ -182,7 +182,7 @@ and legacy acquires are refused until that clears. Manual holds and hold mode st
 
 The daemon reads `%ProgramData%\ComputeWarden\config.yaml` (or wherever the
 `COMPUTEWARDEN_CONFIG` environment variable points). Without one it uses defaults: lease
-30s–1h (default 5 min), and MSBuild + CodeCompass as busy processes.
+30s–1h (default 5 min), and no process rules.
 
 The part you'll edit most is the process list:
 
@@ -190,9 +190,9 @@ The part you'll edit most is the process list:
 process_rules:
   - name: Overwatch
     executable: Overwatch.exe          # blocks everything while running
-  - name: CodeCarver
-    executable: CodeCarver.exe
-    resources: [ram, disk]             # memory-heavy: CPU/GPU work can still run
+  - name: Video editor
+    executable: Resolve.exe
+    resources: [cpu, gpu, ram]         # disk and network work can still run
 ```
 
 **Edits apply live.** The daemon watches the file, so changes to `process_rules`, the
@@ -289,7 +289,7 @@ Other client ┘                        │       cw.exe (you) ─┐
 | `tests/ComputeWarden.Tests` | xUnit tests. |
 
 [`DESIGN.md`](DESIGN.md) explains the design decisions (state model, acquire algorithm,
-protocol). [`OriginalSpec.md`](OriginalSpec.md) is the original specification.
+protocol).
 
 ## Contributing
 

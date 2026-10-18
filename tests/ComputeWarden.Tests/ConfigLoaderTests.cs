@@ -26,7 +26,7 @@ public class ConfigLoaderTests
                 executable: MSBuild.exe
                 enabled: true
               - name: Indexer
-                executable: CodeCompass.exe
+                executable: Indexer.exe
                 enabled: false
             allow_manual_blocker: false
             logging:

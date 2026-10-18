@@ -151,10 +151,10 @@ public class ResourceTests
     public void Process_rule_blocks_only_its_resources()
     {
         var clock = new FakeClock();
-        var lister = new FixedLister { Processes = new[] { new RunningProcess(1, "CodeCarver") } };
+        var lister = new FixedLister { Processes = new[] { new RunningProcess(1, "Analyzer") } };
         var provider = new ProcessBlockerProvider(
             lister,
-            new[] { new ProcessRule { Name = "CodeCarver", Executable = "CodeCarver.exe", Resources = ResourceSet.Ram } },
+            new[] { new ProcessRule { Name = "Analyzer", Executable = "Analyzer.exe", Resources = ResourceSet.Ram } },
             new ProcessDetectionOptions(),
             clock);
         provider.Refresh();
@@ -192,8 +192,8 @@ public class ResourceTests
     {
         var config = ConfigLoader.Parse("""
             process_rules:
-              - name: CodeCarver
-                executable: CodeCarver.exe
+              - name: Analyzer
+                executable: Analyzer.exe
                 resources: [ram, disk]
               - name: Game
                 executable: Game.exe

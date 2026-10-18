@@ -1,7 +1,7 @@
 # ComputeWarden — Design
 
-> Derived from `OriginalSpec.md`. This document records the design decisions and why they
-> were made. The spec is the "what"; this is the "how". For usage, see the README.
+> This document records the design decisions and why they were made. For usage, see the
+> README.
 
 ## 1. Summary
 
@@ -44,7 +44,7 @@ resources (an old client, a process rule without `resources`, a bare manual hold
 and old daemons therefore interoperate conservatively, with no protocol version bump.
 
 - **UNKNOWN** is not a blocker; it means "couldn't compute the blocker set."
-  `acquire` under UNKNOWN **refuses** (fail-conservative, spec §32). Agents treat
+  `acquire` under UNKNOWN **refuses** (fail-conservative). Agents treat
   UNKNOWN as "do not begin work."
 - Debounce (`available_after_ms`) lives **inside** the ProcessProvider, so acquire
   automatically respects the "recently-seen" grace window without special-casing.
@@ -69,7 +69,7 @@ extension seam for future measured CPU/disk/GPU providers.
 
 ## 5. Acquire algorithm (the critical correctness property)
 
-Single lock, atomic check-and-create (spec §27):
+Single lock, atomic check-and-create:
 
 ```
 lock (state):
@@ -85,9 +85,9 @@ lock (state):
 
 Notes:
 - Acquire checks the **last process poll snapshot** (up to `poll_interval_ms` stale) — it
-  does *not* trigger a fresh enumeration (spec §7 "avoid excessive enumeration"). The
+  does *not* trigger a fresh enumeration. The
   cooperative contract only promises "known-safe at acquisition time," not guaranteed
-  exclusivity (spec §28).
+  exclusivity.
 - Lease seconds are clamped server-side to `[minimum_seconds, maximum_seconds]`, never below 1s.
 - UNKNOWN refuses every request, even one for resources nothing appears to hold: if the
   process list can't be read, nothing is known to be free.
@@ -96,7 +96,7 @@ Notes:
   stall on each other. Agents request everything in one call; if needs change, they release
   and re-acquire.
 - A process starting *after* a reservation is granted adds a second blocker; the existing
-  reservation is **not** revoked (spec §28).
+  reservation is **not** revoked.
 
 ## 6. Reservations & leases
 
@@ -113,7 +113,7 @@ Notes:
 
 - `set_manual_busy(reason, resources?)` / `clear_manual_busy()` create/remove a single MANUAL
   blocker, visually distinct in status.
-- May be disabled via config if only admins should control it (spec §17).
+- May be disabled via config if only admins should control it.
 
 ## 8. Process monitoring
 
@@ -154,8 +154,8 @@ Notes:
   single-instance mutex (`Global\ComputeWardenDaemon`) makes extras exit immediately. An
   ACL-denied pipe (daemon owned by another user / elevated) is reported, not "fixed" by
   spawning.
-- Exposes tools 1:1 with spec §18, plus `computewarden_stats`.
-- Responses are **structured JSON**, not prose (spec §38).
+- Exposes one tool per daemon operation, plus `computewarden_stats`.
+- Responses are **structured JSON**, not prose.
 - `can_run` is informational only — carries a note that availability isn't guaranteed after
   the call; agents that will do protected work must `acquire`.
 
@@ -163,7 +163,7 @@ Notes:
 
 - Location: `%ProgramData%\ComputeWarden\config.yaml` (machine-wide, matches daemon scope).
   Overridable via `COMPUTEWARDEN_CONFIG` env var.
-- Format per spec §25 (server poll interval, lease bounds, `process_detection`,
+- Format (server poll interval, lease bounds, `process_detection`,
   `process_rules`, logging). Missing config → defaults; corrupt or unreadable → defaults,
   logged as an error, daemon still starts.
 - **Hot-reload** of `process_rules` + debounce via a file watcher (500ms debounce). A corrupt
@@ -185,16 +185,16 @@ ComputeWarden.slnx
 
 Core has **no** OS or IPC dependencies (pure, unit-testable). Daemon/Client/Mcp are thin.
 
-## 13. Observability (spec §31)
+## 13. Observability
 
 Counters kept in memory and returned by `computewarden_stats`: `total_acquisitions`,
 `failed_acquisitions`, `expired_reservations`, `current_reservations`,
 `current_process_blockers`, `uptime_seconds`. Lifecycle events (acquire/release/expiry,
 process blockers appearing/clearing, config reloads) go to
-`%ProgramData%\ComputeWarden\logs\daemon.log`, capped at 5 MB with one backup (spec §30).
+`%ProgramData%\ComputeWarden\logs\daemon.log`, capped at 5 MB with one backup.
 An expiry is logged as "owner did not release", the main sign of an agent misusing leases.
 
-## 14. Test plan (spec §36)
+## 14. Test plan
 
 - **Reservation:** acquire-when-available, acquire-when-reserved, release, renew, expiry,
   invalid id, double release, **concurrent acquire → exactly one winner** (critical).
@@ -207,7 +207,7 @@ An expiry is logged as "owner did not release", the main sign of an agent misusi
 - Core state/acquire logic tested with a fake clock + fake process provider (no real
   processes needed for the critical concurrency test).
 
-## 15. Definition of done (spec §42)
+## 15. Definition of done
 
 Two agents, one machine: A acquires, B is refused and told A is the blocker, A renews then
 releases, B then acquires. If A crashes, its lease expires and the machine frees up. A
