@@ -62,7 +62,7 @@ public static class ComputeWardenTools
                  "advice: grant full (run normally), throttled (the user is gaming: run small, follow " +
                  "advice.throttle / advice.how), or queued (don't start yet; see advice.next). kind=shared " +
                  "(the default) is for all everyday work. Set bigMemory=true ONLY if the job needs more than " +
-                 "~8 GB and can't cap its memory: only one big-memory job runs at a time. kind=solo is ONLY for " +
+                 "~8 GB of RAM and can't cap it, or more than half the GPU's memory: only one big-memory job runs at a time. kind=solo is ONLY for " +
                  "short timing runs and benchmarks (at most 10 minutes, or up to 60 with userApproved, set only " +
                  "when the user explicitly approved that run): it waits until nothing else runs, and " +
                  "nothing new starts while it runs, so release it the moment the measured run ends. While one " +
@@ -73,7 +73,7 @@ public static class ComputeWardenTools
         [Description("Who is acquiring, e.g. 'Claude Code (MyRepo)'.")] string owner,
         [Description("What the work is, e.g. 'dotnet test MyRepo.slnx'.")] string description,
         [Description("shared (default: every build, test, and run) or solo (a timing run or benchmark under 10 minutes).")] string? kind = null,
-        [Description("True only for a job that needs more than ~8 GB of memory and can't cap itself. Only one runs at a time.")] bool? bigMemory = null,
+        [Description("True only for a job that needs more than ~8 GB of RAM and can't cap itself, or more than half the GPU's memory. Only one runs at a time.")] bool? bigMemory = null,
         [Description("How long the work takes, in seconds. Sets the lease (err high) and others' wait estimates.")] int? estimateSeconds = null,
         [Description("Requested lease seconds; clamped to server bounds. Omit to derive it from estimateSeconds.")] int? leaseSeconds = null,
         [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null,
@@ -295,7 +295,7 @@ public static class ComputeWardenTools
         "" or "shared" => ClaimKind.Shared,
         "solo" => ClaimKind.Solo,
         "exclusive" => throw new WardenClientException(
-            "kind exclusive was removed: use shared (with bigMemory: true only if it needs more than ~8 GB and can't cap its memory), " +
+            "kind exclusive was removed: use shared (with bigMemory: true only if it needs more than ~8 GB of RAM and can't cap it, or more than half the GPU's memory), " +
             "or solo for a short timing run"),
         _ => throw new WardenClientException($"Unknown kind '{kind}' (expected shared or solo)"),
     };

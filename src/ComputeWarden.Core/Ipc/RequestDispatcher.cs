@@ -231,7 +231,7 @@ public sealed class RequestDispatcher
         "" or "shared" => ClaimKind.Shared,
         "solo" => ClaimKind.Solo,
         "exclusive" => throw new ArgumentException(
-            "kind exclusive was removed: use shared (with bigMemory: true only if it needs more than ~8 GB and can't cap its memory), " +
+            "kind exclusive was removed: use shared (with bigMemory: true only if it needs more than ~8 GB of RAM and can't cap it, or more than half the GPU's memory), " +
             "or solo for a short timing run"),
         _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared or solo)"),
     };

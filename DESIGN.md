@@ -233,7 +233,7 @@ exclusive" beside others throttled for no reason the user wanted), so 2.0 remove
 | Claim | Request | Rule |
 |---|---|---|
 | **Shared** | `kind: shared` (the default) | Every build, test and run. `full` unless the machine is slowed (below), then `throttled`. Shared claims never block each other. |
-| **Big memory** | `bigMemory: true` | A shared claim that needs more than ~8 GB and can't cap its memory. At most one runs at a time; the next is `queued` until it ends. It doesn't hold up claims that aren't big-memory. |
+| **Big memory** | `bigMemory: true` | A shared claim that needs more than ~8 GB of RAM and can't cap it, or more than half the GPU's memory. At most one runs at a time; the next is `queued` until it ends. It doesn't hold up claims that aren't big-memory. |
 | **Solo** | `kind: solo` | A timing run of at most 10 minutes (`MaxSoloSeconds`), or up to 60 (`MaxApprovedSoloSeconds`) with `userApproved: true`, which agents set only when the user explicitly approved that run. Starts only when nothing else runs and nothing slows the machine; while it runs, nothing new starts, and while it waits, only work that ends first (rule 3). Its lease never reaches past 10 minutes after it starts, whatever it asks for. A longer `estimateSeconds` is refused. |
 
 `kind: exclusive` is refused with an error naming what to use instead. Claims are leases:
@@ -336,7 +336,7 @@ its mode is dropped.
 ### Agent policy
 
 Every session claims its builds, tests, and runs (two small tool calls per command) in every
-project, sets `bigMemory` only for jobs over ~8 GB that can't cap themselves, uses `solo` only
+project, sets `bigMemory` only for jobs over ~8 GB of RAM that can't cap themselves or over half the GPU's memory, uses `solo` only
 for timing runs of 10 minutes or less (longer only with the user's explicit approval), and follows the advice. Projects keep no ComputeWarden
 rules of their own, only facts about their jobs' resource needs (duration, peak memory, GPU, disk).
 
