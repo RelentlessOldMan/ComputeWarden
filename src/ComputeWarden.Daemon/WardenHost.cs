@@ -15,6 +15,8 @@ namespace ComputeWarden.Daemon;
 /// If a config file path is supplied, the host watches it and hot-reloads the process rules,
 /// debounce, and sharing settings on change — so editing the exe list takes effect without a restart. (Lease bounds,
 /// manual-blocker toggle, log level, and the poll interval are still applied only at startup.)
+///
+/// Given a state path, claims, the mode and the manual hold survive a restart (<see cref="StateStore"/>).
 /// </summary>
 public sealed class WardenHost : IAsyncDisposable
 {
@@ -23,6 +25,7 @@ public sealed class WardenHost : IAsyncDisposable
     private readonly NamedPipeServer _pipeServer;
     private readonly ProcessBlockerProvider _processProvider;
     private readonly MonitorPublisher? _publisher;
+    private readonly StateStore? _store;
     private readonly ILog _log;
     private readonly string? _configPath;
 
@@ -39,7 +42,8 @@ public sealed class WardenHost : IAsyncDisposable
         IClock? clock = null,
         string? pipeName = null,
         string? configPath = null,
-        IMonitorSink? monitor = null)
+        IMonitorSink? monitor = null,
+        string? statePath = null)
     {
         _log = log;
         _configPath = configPath;
@@ -51,6 +55,13 @@ public sealed class WardenHost : IAsyncDisposable
             processLister, config.ProcessRules, config.ProcessDetection, clock);
 
         Warden = new Warden(clock, config.Leases, config.Limits, manual, new[] { _processProvider }, log, config.Sharing);
+
+        // Before anything can serve a request: agents come back to the claims they had.
+        if (statePath is not null)
+        {
+            _store = new StateStore(statePath, Warden, log);
+            _store.Load();
+        }
 
         var dispatcher = new RequestDispatcher(Warden, config.AllowManualBlocker);
 
@@ -65,6 +76,7 @@ public sealed class WardenHost : IAsyncDisposable
         _log.Info("ComputeWarden daemon starting");
         _monitor.Start();
         _sweeper.Start();
+        _store?.Start();
         _pipeServer.Start();
         StartConfigWatcher();
         _publisher?.Start();
@@ -158,6 +170,7 @@ public sealed class WardenHost : IAsyncDisposable
         if (_publisher is not null) await _publisher.DisposeAsync();
         await _pipeServer.DisposeAsync();
         await _sweeper.DisposeAsync();
+        if (_store is not null) await _store.DisposeAsync(); // last: nothing changes the claims after this
         await _monitor.DisposeAsync();
         _log.Info("ComputeWarden daemon stopped");
     }

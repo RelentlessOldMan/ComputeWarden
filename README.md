@@ -243,17 +243,24 @@ shows up in it as a Compute Warden panel with:
 
 `reye request ComputeWarden.status` returns the same JSON as `computewarden_status`.
 
-You can also set the mode from the panel. Pick **For** (until changed, 30m, 2h or 8h) and
-**Resources** (none ticked means all) first, then pick the mode. Open and hold ask you to confirm.
-The panel always shows the mode the daemon actually has.
+You can also set the mode from the panel: auto, steady, open or hold, for the whole machine
+until you change it. Open and hold ask you to confirm. The panel always shows the mode the daemon
+actually has. (`cw mode` can also limit a mode to some resources or a set time.)
+
+**Jobs while gaming** (0 to 4) sets how many jobs may run beside a game. Each runs on one core,
+so it's also how many cores of background work the game shares the machine with. A game suffers
+mostly from the memory traffic of background work, which priority doesn't stop; fewer jobs is
+what helps. Lowering it makes the next jobs wait; work already running carries on. 0 means
+nothing new starts until the game closes. It starts at `max_throttled_per_resource` from the
+config and, once picked, stays across restarts.
 
 While jobs are waiting to start, you can reorder the line: click a queued job's row, then **Move
 picked to front**, **Move up** or **Move down**. The new order is the real one: the job at the
 front gets the resources next. Moving a job ahead of one with user priority gives it priority
 too; moving a priority job behind plain ones takes its priority away.
 
-Only a monitor (the panel or `reye`) can set the mode or reorder the line. Requests from apps
-connected to the hub, such as agent sessions, are refused and logged, since both are the user's
+Only a monitor (the panel or `reye`) can set the mode, jobs while gaming, or reorder the line. Requests from apps
+connected to the hub, such as agent sessions, are refused and logged, since all of these are the user's
 call. Setting the mode needs RelentlessEye 1.1 or later; the claims table needs 1.2.
 
 There is nothing to configure, and ComputeWarden takes no dependency on RelentlessEye. The daemon
@@ -270,7 +277,12 @@ client, restart the daemon to pick it up.
 appearing and clearing, and config reloads.
 
 **Restart the daemon:** `Stop-Process -Name ComputeWarden.Daemon`. The next tool call starts
-a fresh one. Claims and the mode are in memory, so a restart clears them.
+a fresh one. Claims (with their place in line and leases), the mode and the manual hold carry
+over: the daemon saves them to `%LOCALAPPDATA%\ComputeWarden\state.json` within a second of any
+change and loads them when it starts. Claims whose lease ran out while it was down are dropped.
+The file holds claim ids, so it stays in your own profile. To start clean, stop the daemon and
+delete the file. If the file can't be read, it's moved to `state.json.bad` and the daemon starts
+empty.
 
 **What is everyone doing?** Run `cw`. It shows the mode, running games, and every agent
 claim with its advice, place in line, and lease.
@@ -286,9 +298,10 @@ to `ComputeWarden.Mcp.exe` (or `cw.exe`). Put it there, or set `COMPUTEWARDEN_DA
 overwritten, but Windows does allow renaming it. Stop the daemon, rename the old adapter
 aside (e.g. to `ComputeWarden.Mcp.exe.old`), copy the new exes in, and delete the old one
 later. `./publish.ps1 -Install` does all of this when building from source (it leaves
-`*.old-<timestamp>` files, cleaned up on the next install). It refuses while a mode other
-than auto is set, since the restart drops it; pass `-Force` to install anyway. Open sessions
-keep using the old adapter until they restart.
+`*.old-<timestamp>` files, cleaned up on the next install). Claims and the mode survive the
+restart. (Upgrading from a daemon older than 1.1.5, which didn't save them, it refuses while a
+mode other than auto is set; pass `-Force` to install anyway.) Open sessions keep using the old
+adapter until they restart.
 
 ## Limitations
 

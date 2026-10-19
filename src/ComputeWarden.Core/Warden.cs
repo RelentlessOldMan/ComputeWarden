@@ -23,6 +23,7 @@ namespace ComputeWarden.Core;
 public sealed class Warden
 {
     private const int MaxModeSeconds = 7 * 24 * 3600;
+    public const int MaxGameJobs = 12;
 
     /// <summary>What everyday work uses when it doesn't say: builds and tests are cpu, ram, and disk.</summary>
     public const ResourceSet SharedDefault = ResourceSet.Cpu | ResourceSet.Ram | ResourceSet.Disk;
@@ -40,6 +41,7 @@ public sealed class Warden
     // Mutated only under _gate.
     private SharingOptions _sharing;
     private ModeState _mode;
+    private int? _gameJobs; // the user's limit on jobs running beside a game; null = the config's slot count
     private long _seq;
     private long _totalAcquisitions;
     private long _failedAcquisitions;
@@ -482,6 +484,31 @@ public sealed class Warden
         return ClaimPhase.Waiting;
     }
 
+    /// <summary>
+    /// How many jobs may run beside a game, per resource: the user's setting, or the config's
+    /// throttle slots until they set one.
+    /// </summary>
+    public int GameJobs
+    {
+        get { lock (_gate) return _gameJobs ?? _sharing.MaxThrottledPerResource; }
+    }
+
+    /// <summary>
+    /// Sets how many jobs may run beside a game. Only the user should do this. It limits new
+    /// starts: lowering it makes the next jobs wait, and work already running keeps going.
+    /// </summary>
+    public int SetGameJobs(int jobs)
+    {
+        if (jobs is < 0 or > MaxGameJobs)
+            throw new ArgumentOutOfRangeException(nameof(jobs), $"jobs while gaming must be between 0 and {MaxGameJobs}");
+        lock (_gate)
+        {
+            _gameJobs = jobs;
+            _log.Info($"Jobs while gaming set to {jobs}");
+            return jobs;
+        }
+    }
+
     public ModeState GetMode()
     {
         lock (_gate)
@@ -507,6 +534,71 @@ public sealed class Warden
     public void UpdateSharing(SharingOptions sharing)
     {
         lock (_gate) _sharing = sharing;
+    }
+
+    /// <summary>The state worth keeping across a restart: claims, the user's mode, the manual hold, and jobs while gaming.</summary>
+    public SavedState Save()
+    {
+        lock (_gate)
+        {
+            var hold = _manual.GetBlockers().Blockers.FirstOrDefault();
+            return new SavedState(
+                SavedState.Version,
+                _mode,
+                hold is null ? null : new SavedHold(hold.Description, hold.Resources, hold.CreatedAt ?? _clock.UtcNow),
+                _reservations.Values.OrderBy(r => r.Seq).Select(r => new SavedClaim(
+                    r.Id, r.Owner, r.Description, r.CreatedAt, r.LastRenewedAt, r.ExpiresAt,
+                    r.Metadata.Count == 0 ? null : new Dictionary<string, string>(r.Metadata),
+                    r.Resources, r.Kind, r.WhenBusy, r.EstimateSeconds, r.Cores, r.RamGb, r.UserPriority,
+                    r.Seq, r.LeaseSeconds, r.Holding, r.Started, r.StartedAt, r.LastGrant, r.LastContended, r.SlotWait)).ToList(),
+                _gameJobs);
+        }
+    }
+
+    /// <summary>
+    /// Puts back what <see cref="Save"/> kept, before the daemon starts serving: claims keep their
+    /// ids, places in line and leases, so agents carry on as if nothing happened. Anything whose
+    /// lease ran out while the daemon was down is dropped. Returns how many claims came back.
+    /// </summary>
+    public int Restore(SavedState state)
+    {
+        lock (_gate)
+        {
+            var now = _clock.UtcNow;
+            _mode = state.Mode;
+            _gameJobs = state.GameJobs is >= 0 and <= MaxGameJobs ? state.GameJobs : null;
+            if (state.Hold is { } hold) _manual.Set(hold.Reason, hold.Resources, hold.CreatedAt);
+            foreach (var c in state.Claims)
+            {
+                _reservations[c.Id] = new Reservation(c.Id, c.Owner, c.Description, c.CreatedAt, c.ExpiresAt, c.Metadata, c.Resources)
+                {
+                    LastRenewedAt = c.LastRenewedAt,
+                    Kind = c.Kind,
+                    WhenBusy = c.WhenBusy,
+                    EstimateSeconds = c.EstimateSeconds,
+                    Cores = c.Cores,
+                    RamGb = c.RamGb,
+                    UserPriority = c.UserPriority,
+                    Seq = c.Seq,
+                    LeaseSeconds = c.LeaseSeconds,
+                    Holding = c.Holding,
+                    Started = c.Started,
+                    StartedAt = c.StartedAt,
+                    LastGrant = c.LastGrant,
+                    LastContended = c.LastContended,
+                    SlotWait = c.SlotWait,
+                };
+                _seq = Math.Max(_seq, c.Seq);
+            }
+
+            var kept = state.Claims.Count(c => c.ExpiresAt > now);
+            var mode = _mode.Mode == UserMode.Auto ? "" : $"; mode {ModeName(_mode.Mode)} {Names(_mode.Resources)}";
+            var held = state.Hold is null ? "" : "; manual hold";
+            var jobs = _gameJobs is int j ? $"; {j} job(s) while gaming" : "";
+            _log.Info($"Restored {kept} claim(s) from the last run ({state.Claims.Count - kept} expired while down){mode}{held}{jobs}");
+            BuildLocked(); // drops what expired while down and ends a mode whose time is up, logging both
+            return _reservations.Count;
+        }
     }
 
     /// <summary>
@@ -701,10 +793,14 @@ public sealed class Warden
         if (!c.Started && capped != ResourceSet.None)
         {
             var waiting = EarlierWaiting(c, capped);
-            var full = FullSlots(c, x, capped, waiting, sharing.MaxThrottledPerResource);
+            var gameJobs = _gameJobs ?? sharing.MaxThrottledPerResource;
+            var full = FullSlots(c, x, capped, waiting, sharing.MaxThrottledPerResource, gameJobs);
             if (full != ResourceSet.None)
             {
-                reasons.Add($"throttle slots full on {string.Join("/", Resources.ToNames(full))} ({sharing.MaxThrottledPerResource} per resource)");
+                var limit = Resources.Overlaps(full, x.Priority)
+                    ? $"{gameJobs} while a game runs"
+                    : $"{sharing.MaxThrottledPerResource} per resource";
+                reasons.Add($"throttle slots full on {string.Join("/", Resources.ToNames(full))} ({limit})");
                 ahead = ahead.Union(waiting).OrderBy(r => r.UserPriority is null ? 1 : 0).ThenBy(r => r.Seq).ToList();
                 return Queued(c, x, ahead, contended, now, Join(reasons), slotWait: capped);
             }
@@ -783,8 +879,9 @@ public sealed class Warden
     /// The resources in <paramref name="capped"/> whose throttle slots are all taken, counted per
     /// resource: tickets ahead waiting for one, running work throttled on it, and running work a
     /// game (or steady mode, or UNKNOWN) now contends there, which turns throttled at its next check-in.
+    /// Where a game runs, the user's jobs-while-gaming limit applies instead of <paramref name="max"/>.
     /// </summary>
-    private ResourceSet FullSlots(Reservation c, Context x, ResourceSet capped, List<Reservation> waiting, int max)
+    private ResourceSet FullSlots(Reservation c, Context x, ResourceSet capped, List<Reservation> waiting, int max, int gameJobs)
     {
         var slowing = x.Priority | x.Steady | (x.Confident ? ResourceSet.None : ResourceSet.All);
         var full = ResourceSet.None;
@@ -794,7 +891,7 @@ public sealed class Warden
                 r != c && r.Started && (r.LastGrant == Grant.Throttled
                     ? Resources.Overlaps(r.LastContended, bit)
                     : Resources.Overlaps(r.Resources & slowing, bit)));
-            if (used >= max) full |= bit;
+            if (used >= (Resources.Overlaps(x.Priority, bit) ? gameJobs : max)) full |= bit;
         }
         return full;
     }

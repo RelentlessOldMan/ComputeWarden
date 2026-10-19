@@ -276,6 +276,10 @@ acquire(owner, description, resources, kind: "shared" | "exclusive",
    newcomer. The cap applies only to *new* starts: **work that has started is never told
    `queued`**, only `throttled`. It can't un-start, and telling it to stop would just be
    ignored.
+   Where a game runs, the user's **jobs while gaming** (picked on the monitor panel, 0 to 4,
+   kept across restarts) replaces the cap. Measured on a 6-core desktop, a game's fps falls
+   with the memory traffic of the work beside it, roughly per busy core, whatever its
+   priority; with one core per throttled job, this number is the one knob that controls it.
 5. **The line is first come, first served.** A newcomer can't get `full` ahead of an
    earlier waiter for an overlapping resource. A waiting exclusive claim is promoted to the
    hold as soon as it's at the front and its resources are free (on any request or the

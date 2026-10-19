@@ -103,6 +103,42 @@ public class SharingTests
     }
 
     [Fact]
+    public void Jobs_while_gaming_set_by_the_user_replaces_the_slot_count_beside_a_game()
+    {
+        var rig = new Rig();
+        Assert.Equal(3, rig.Warden.GameJobs); // the config's slots until the user picks
+        rig.Warden.SetGameJobs(1);
+        rig.StartGame();
+
+        var a = rig.Shared("A");
+        var b = rig.Shared("B");
+
+        Assert.Equal(Grant.Throttled, a.Advice!.Grant);
+        Assert.Equal(Grant.Queued, b.Advice!.Grant);
+        Assert.Contains("(1 while a game runs)", b.Advice.Reason);
+        Assert.True(rig.Log.Contains("Jobs while gaming set to 1"));
+
+        rig.Warden.SetGameJobs(2); // raising it lets the next one start
+        Assert.Equal(Grant.Throttled, rig.Renew(b));
+
+        rig.Warden.SetGameJobs(0); // lowering it stops new starts, not running work
+        Assert.Equal(Grant.Queued, rig.Shared("C").Advice!.Grant);
+        Assert.Equal(Grant.Throttled, rig.Renew(a));
+    }
+
+    [Fact]
+    public void Jobs_while_gaming_doesnt_limit_work_when_no_game_runs()
+    {
+        var rig = new Rig();
+        rig.Warden.SetGameJobs(0);
+
+        Assert.Equal(Grant.Full, rig.Shared("A").Advice!.Grant);
+        Assert.Throws<ArgumentOutOfRangeException>(() => rig.Warden.SetGameJobs(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => rig.Warden.SetGameJobs(Warden.MaxGameJobs + 1));
+        Assert.Equal(0, rig.Warden.GameJobs);
+    }
+
+    [Fact]
     public void Game_exit_turns_throttled_work_full_on_renew()
     {
         var rig = new Rig();

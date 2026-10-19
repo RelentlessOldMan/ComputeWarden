@@ -18,14 +18,14 @@ public sealed class ManualBlockerProvider : IBlockerProvider
     public string Name => "ManualBlockerProvider";
 
     /// <summary>Creates (or replaces) the manual blocker. Returns the created blocker.</summary>
-    public Blocker Set(string reason, ResourceSet resources = ResourceSet.All)
+    public Blocker Set(string reason, ResourceSet resources = ResourceSet.All, DateTimeOffset? createdAt = null)
     {
         var blocker = new Blocker(
             Id: "manual",
             Type: BlockerType.Manual,
             Source: Name,
             Description: reason,
-            CreatedAt: _clock.UtcNow,
+            CreatedAt: createdAt ?? _clock.UtcNow,
             Resources: resources);
 
         lock (_gate) _blocker = blocker;

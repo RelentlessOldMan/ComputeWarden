@@ -46,6 +46,7 @@ sharing:
   throttle_max_ram_gb: 2
   # At most this many new claims run throttled per contended resource; later ones queue.
   # Work already running is never queued, only throttled.
+  # Beside a game, the panel's "Jobs while gaming" replaces this once you pick it.
   max_throttled_per_resource: 3
   # Resources that can't run small beside a holder: contended claims are queued instead.
   # [] makes everything shareable.

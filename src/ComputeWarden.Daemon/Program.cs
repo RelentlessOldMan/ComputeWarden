@@ -66,7 +66,8 @@ log.Info($"RelentlessEye: {monitor.Status}");
 // any thread; if it ends up "abandoned", the next daemon start handles AbandonedMutexException above.
 try
 {
-    await using var host = new WardenHost(loaded.Config, log, configPath: ConfigLoader.ResolvePath(), monitor: monitor);
+    await using var host = new WardenHost(loaded.Config, log, configPath: ConfigLoader.ResolvePath(), monitor: monitor,
+        statePath: StateStore.DefaultPath);
     host.Start();
 
     using var shutdown = new CancellationTokenSource();

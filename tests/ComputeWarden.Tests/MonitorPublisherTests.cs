@@ -75,7 +75,6 @@ public class MonitorPublisherTests
         Assert.Equal("available", sink.Last("state"));
         Assert.Equal("auto", sink.Last("mode"));
         Assert.Equal("auto", sink.Last("mode_detail"));
-        Assert.Equal("until changed", sink.Last("mode_for"));
         Assert.Equal("none", sink.Last("busy"));
         Assert.Equal("none", sink.Last("blockers"));
         Assert.Empty(sink.Rows());
@@ -232,42 +231,45 @@ public class MonitorPublisherTests
     }
 
     [Fact]
-    public void Panel_sets_the_mode_with_the_picked_duration_and_resources()
+    public void Panel_sets_the_mode_for_the_whole_machine_until_changed()
     {
         var clock = new FakeClock();
         var log = new CapturingLog();
         var (warden, sink, publisher, _) = NewPublisher(clock, log);
         publisher.Start();
 
-        sink.Choices["mode_for"]("2h");
-        sink.Flags["mode_res"](new[] { "gpu" });
         sink.Pick("steady");
 
         var mode = warden.GetMode();
         Assert.Equal(UserMode.Steady, mode.Mode);
-        Assert.Equal(ResourceSet.Gpu, mode.Resources);
-        Assert.Equal(clock.UtcNow.AddHours(2), mode.ExpiresAt);
+        Assert.Equal(ResourceSet.All, mode.Resources);
+        Assert.Null(mode.ExpiresAt);
         Assert.Equal("steady", sink.Last("mode")); // the panel shows the daemon's real mode at once
         Assert.True(log.Contains("Mode change from RelentlessEye (monitor:3) on the monitor panel"));
-    }
-
-    [Fact]
-    public void Panel_auto_ignores_the_duration_and_none_ticked_means_all()
-    {
-        var clock = new FakeClock();
-        var (warden, sink, publisher, _) = NewPublisher(clock);
-        publisher.Start();
-        sink.Choices["mode_for"]("30m");
-        sink.Flags["mode_res"](Array.Empty<string>());
-
-        sink.Pick("hold");
-        Assert.Equal(ResourceSet.All, warden.GetMode().Resources);
-        Assert.Equal(clock.UtcNow.AddMinutes(30), warden.GetMode().ExpiresAt);
 
         sink.Pick("auto");
         Assert.Equal(UserMode.Auto, warden.GetMode().Mode);
-        Assert.Null(warden.GetMode().ExpiresAt);
         Assert.Equal("auto", sink.Last("mode"));
+    }
+
+    [Fact]
+    public void Panel_sets_the_jobs_while_gaming()
+    {
+        var log = new CapturingLog();
+        var (warden, sink, publisher, _) = NewPublisher(new FakeClock(), log);
+        publisher.Start();
+        Assert.Equal("3", sink.Last(MonitorPublisher.GameJobsPick)); // the config's slots to start with
+
+        sink.Actions[MonitorPublisher.GameJobsPick](JsonSerializer.SerializeToElement("1"));
+
+        Assert.Equal(1, warden.GameJobs);
+        Assert.Equal("1", sink.Last(MonitorPublisher.GameJobsPick));
+        Assert.True(log.Contains("Jobs while gaming change from RelentlessEye (monitor:3) on the monitor panel"));
+
+        Assert.Throws<ArgumentException>(() => sink.Actions[MonitorPublisher.GameJobsPick](JsonSerializer.SerializeToElement("9")));
+        sink.Sender = new MonitorSender("PC/SomeAgent", "app", "SomeAgent", "PC");
+        Assert.Throws<InvalidOperationException>(() => sink.Actions[MonitorPublisher.GameJobsPick](JsonSerializer.SerializeToElement("4")));
+        Assert.Equal(1, warden.GameJobs);
     }
 
     [Fact]
@@ -279,8 +281,6 @@ public class MonitorPublisherTests
 
         sink.Sender = new MonitorSender("PC/SomeAgent", "app", "SomeAgent", "PC");
         Assert.Throws<InvalidOperationException>(() => sink.Pick("hold"));
-        Assert.Throws<InvalidOperationException>(() => sink.Choices["mode_for"]("8h"));
-        Assert.Throws<InvalidOperationException>(() => sink.Flags["mode_res"](new[] { "cpu" }));
         sink.Sender = null; // an old client or hub can't say who sent it
         Assert.Throws<InvalidOperationException>(() => sink.Pick("hold"));
 
@@ -290,14 +290,12 @@ public class MonitorPublisherTests
     }
 
     [Fact]
-    public void Panel_refuses_an_unknown_mode_or_duration()
+    public void Panel_refuses_an_unknown_mode()
     {
         var (warden, sink, _, _) = NewPublisher(new FakeClock());
 
         Assert.Throws<ArgumentException>(() => sink.Pick("turbo"));
         Assert.Throws<ArgumentException>(() => sink.Actions["mode"](null));
-        Assert.Throws<ArgumentException>(() => sink.Choices["mode_for"]("forever"));
-        Assert.Throws<ArgumentException>(() => sink.Flags["mode_res"](new[] { "quantum" }));
         Assert.Equal(UserMode.Auto, warden.GetMode().Mode);
     }
 
@@ -414,7 +412,7 @@ public class MonitorPublisherTests
             bridge.Start();
             bridge.Set("state", "busy");
             bridge.Log(MonitorPublisher.EventsFeed, "x");
-            bridge.OnChoice(MonitorPublisher.ModeFor, _ => { });
+            bridge.OnChoice("x", _ => { });
             bridge.OnPick(MonitorPublisher.ClaimsTable, _ => { });
             Assert.Null(bridge.Sender);
         }

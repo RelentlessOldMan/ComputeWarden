@@ -7,7 +7,7 @@ param(
     # Also copy the published exes to the stable per-user install dir the user-scope MCP
     # server points at (%LOCALAPPDATA%\ComputeWarden\bin), so updating is a one-liner.
     [switch]$Install,
-    # Install even though a user mode (steady, open, hold) is set: restarting the daemon drops it.
+    # Install even though a user mode is set and the running daemon is too old to keep it (before 1.1.5).
     [switch]$Force
 )
 
@@ -41,9 +41,11 @@ if ($Install) {
     Write-Host "Installing to $bin"
     New-Item -ItemType Directory -Force $bin | Out-Null
 
-    # The daemon is restarted at the end, which drops a mode the user set. Don't do that silently.
+    # The daemon is restarted at the end. Since 1.1.5 it saves its claims and mode to state.json and
+    # picks them up again; an older daemon (no state file) drops a mode the user set, so say so.
     $daemons = @(Get-CimInstance Win32_Process -Filter "Name='ComputeWarden.Daemon.exe'")
-    if ($daemons.Count -gt 0 -and -not $Force) {
+    $saved = Test-Path (Join-Path $env:LOCALAPPDATA "ComputeWarden\state.json")
+    if ($daemons.Count -gt 0 -and -not $saved -and -not $Force) {
         $mode = (& (Join-Path $out "cw.exe") mode 2>$null) -join " "
         if ($LASTEXITCODE -eq 0 -and $mode -notmatch '^Mode: auto') {
             throw "$mode. Installing restarts the daemon, which drops that mode. Re-run with -Force to install anyway, then set it again with cw mode."
@@ -88,7 +90,7 @@ if ($Install) {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
     }
-    Write-Host "Stopped the old daemon; the next agent call or cw command starts the new one."
+    Write-Host "Stopped the old daemon; the next agent call or cw command starts the new one, with the same claims."
 
     Write-Host ""
     if ($movedAside.Count -gt 0) {
