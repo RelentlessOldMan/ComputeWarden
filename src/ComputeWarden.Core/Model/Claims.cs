@@ -69,6 +69,8 @@ public enum ClaimPhase
 /// <summary>
 /// An agent's request to do work. <see cref="BigMemory"/> is for a job that needs more memory
 /// than the machine can give two of at once and can't cap itself: only one runs at a time.
+/// <see cref="UserApproved"/> lets a solo claim run past <see cref="Warden.MaxSoloSeconds"/>, up to
+/// <see cref="Warden.MaxApprovedSoloSeconds"/>; agents set it only on the user's explicit word.
 /// </summary>
 public sealed record ClaimRequest(
     string Owner,
@@ -77,4 +79,5 @@ public sealed record ClaimRequest(
     bool BigMemory = false,
     int? LeaseSeconds = null,
     int? EstimateSeconds = null,
-    IReadOnlyDictionary<string, string>? Metadata = null);
+    IReadOnlyDictionary<string, string>? Metadata = null,
+    bool UserApproved = false);

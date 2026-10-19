@@ -33,6 +33,9 @@ public sealed class Warden
     /// <summary>The longest a solo claim may hold the machine.</summary>
     public const int MaxSoloSeconds = 600;
 
+    /// <summary>The longest a solo claim may hold the machine when the user approved a longer run.</summary>
+    public const int MaxApprovedSoloSeconds = 3600;
+
     private readonly object _gate = new();
     private readonly Dictionary<string, Reservation> _reservations = new(StringComparer.Ordinal);
     private readonly IClock _clock;
@@ -141,7 +144,8 @@ public sealed class Warden
 
             var now = _clock.UtcNow;
             var leaseSeconds = _lease.Resolve(request.LeaseSeconds ?? LeaseFromEstimate(request.EstimateSeconds));
-            if (request.Kind == ClaimKind.Solo) leaseSeconds = Math.Min(leaseSeconds, MaxSoloSeconds);
+            var soloLimit = SoloLimit(request);
+            if (request.Kind == ClaimKind.Solo) leaseSeconds = Math.Min(leaseSeconds, soloLimit);
             var r = new Reservation(
                 id: NewId(),
                 owner: request.Owner,
@@ -153,6 +157,7 @@ public sealed class Warden
                 Kind = request.Kind,
                 BigMemory = request.BigMemory,
                 EstimateSeconds = request.EstimateSeconds,
+                SoloLimitSeconds = soloLimit,
                 Seq = ++_seq,
                 LeaseSeconds = leaseSeconds,
             };
@@ -350,7 +355,8 @@ public sealed class Warden
                     r.Id, r.Owner, r.Description, r.CreatedAt, r.LastRenewedAt, r.ExpiresAt,
                     r.Metadata.Count == 0 ? null : new Dictionary<string, string>(r.Metadata),
                     KindName(r.Kind), r.BigMemory, r.EstimateSeconds,
-                    r.Seq, r.LeaseSeconds, r.Started, r.StartedAt, r.LastGrant)).ToList(),
+                    r.Seq, r.LeaseSeconds, r.Started, r.StartedAt, r.LastGrant,
+                    r.SoloLimitSeconds == MaxSoloSeconds ? null : r.SoloLimitSeconds)).ToList(),
                 _gameJobs);
         }
     }
@@ -375,6 +381,7 @@ public sealed class Warden
                     Kind = c.Kind == "solo" ? ClaimKind.Solo : ClaimKind.Shared,
                     BigMemory = c.BigMemory,
                     EstimateSeconds = c.EstimateSeconds,
+                    SoloLimitSeconds = c.SoloLimitSeconds is int lim ? Math.Clamp(lim, 1, MaxApprovedSoloSeconds) : MaxSoloSeconds,
                     Seq = c.Seq,
                     LeaseSeconds = c.LeaseSeconds,
                     Started = c.Started,
@@ -505,7 +512,7 @@ public sealed class Warden
             return Queued(c, x, why);
         if (x.Slowed) return Throttled(SlowReason(x));
         return c.Kind == ClaimKind.Solo
-            ? Advice.Full with { Reason = $"the machine is yours for at most {MaxSoloSeconds / 60} minutes; release as soon as the measured run ends" }
+            ? Advice.Full with { Reason = $"the machine is yours for at most {c.SoloLimitSeconds / 60} minutes; release as soon as the measured run ends" }
             : Advice.Full;
     }
 
@@ -538,7 +545,10 @@ public sealed class Warden
 
     /// <summary>When a started solo claim's time is up; null for anything else.</summary>
     private static DateTimeOffset? SoloEnd(Reservation r)
-        => r.Kind == ClaimKind.Solo && r.StartedAt is { } s ? s.AddSeconds(MaxSoloSeconds) : null;
+        => r.Kind == ClaimKind.Solo && r.StartedAt is { } s ? s.AddSeconds(r.SoloLimitSeconds) : null;
+
+    private static int SoloLimit(ClaimRequest request)
+        => request.UserApproved ? MaxApprovedSoloSeconds : MaxSoloSeconds;
 
     private Advice Throttled(string reason)
     {
@@ -637,7 +647,8 @@ public sealed class Warden
 
     private static string Because(Advice a) => a.Reason is null ? "" : $" ({Trunc(a.Reason)})";
 
-    private static string Label(Reservation r) => KindName(r.Kind) + (r.BigMemory ? ", big memory" : "");
+    private static string Label(Reservation r) => KindName(r.Kind) + (r.BigMemory ? ", big memory" : "")
+        + (r.Kind == ClaimKind.Solo && r.SoloLimitSeconds != MaxSoloSeconds ? $", user-approved {r.SoloLimitSeconds / 60}m" : "");
 
     private static int? LeaseFromEstimate(int? estimateSeconds)
         => estimateSeconds is int e and > 0 ? (int)Math.Min(int.MaxValue, Math.Ceiling(e * 1.25) + 30) : null;
@@ -678,7 +689,7 @@ public sealed class Warden
             _expiredReservations++;
             // The prime "misuse" signal: a lease that lapsed because the owner never released
             // (crashed, forgot, or under-estimated its lease). Distinct from a clean release.
-            var why = SoloEnd(r) is { } end && end <= now ? $"solo time ({MaxSoloSeconds / 60}m) is up" : "owner did not release";
+            var why = SoloEnd(r) is { } end && end <= now ? $"solo time ({r.SoloLimitSeconds / 60}m) is up" : "owner did not release";
             _log.Info($"Reservation expired ({why}): {r.Owner} \"{Trunc(r.Description)}\" [{Short(r.Id)}] held {Held(r, now)}");
         }
     }
@@ -717,9 +728,11 @@ public sealed class Warden
             error = "estimateSeconds must not be negative";
             return false;
         }
-        if (request.Kind == ClaimKind.Solo && request.EstimateSeconds > MaxSoloSeconds)
+        if (request.Kind == ClaimKind.Solo && request.EstimateSeconds > SoloLimit(request))
         {
-            error = $"solo is for short timing runs (at most {MaxSoloSeconds / 60} minutes); run longer work as shared";
+            error = request.UserApproved
+                ? $"solo lasts at most {MaxApprovedSoloSeconds / 60} minutes, even with the user's approval; split the run or run it as shared"
+                : $"solo is for short timing runs (at most {MaxSoloSeconds / 60} minutes); a longer one needs the user's explicit approval for that run, otherwise split it or run it as shared";
             return false;
         }
         if (metadata is not null)

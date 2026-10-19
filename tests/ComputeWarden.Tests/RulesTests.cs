@@ -369,6 +369,30 @@ public class RulesTests
     }
 
     [Fact]
+    public void User_approved_solo_claim_may_run_up_to_an_hour_and_keeps_that_across_a_restart()
+    {
+        var rig = new Rig();
+        var t = rig.Warden.Acquire(new ClaimRequest("T", "long bench", ClaimKind.Solo, EstimateSeconds: 1800, UserApproved: true));
+        Assert.True(t.Acquired);
+        Assert.Equal(Grant.Full, t.Advice!.Grant);
+        Assert.Contains("at most 60 minutes", t.Advice.Reason);
+        Assert.True(rig.Log.Contains("user-approved 60m"));
+
+        var tooLong = rig.Warden.Acquire(new ClaimRequest("U", "x", ClaimKind.Solo, EstimateSeconds: 3700, UserApproved: true));
+        Assert.False(tooLong.Acquired);
+        Assert.Contains("even with the user's approval", tooLong.Reason);
+        var unapproved = rig.Warden.Acquire(new ClaimRequest("U", "x", ClaimKind.Solo, EstimateSeconds: 1800));
+        Assert.Contains("needs the user's explicit approval", unapproved.Reason);
+
+        var restored = new Rig();
+        restored.Warden.Restore(rig.Warden.Save());
+        restored.Clock.AdvanceSeconds(1500); // past 10 minutes, inside the approved hour
+        var renewed = restored.Warden.Renew(t.ReservationId!, leaseSeconds: 3600);
+        Assert.True(renewed.Renewed);
+        Assert.Equal(restored.Clock.UtcNow.AddSeconds(2100), renewed.ExpiresAt);
+    }
+
+    [Fact]
     public void Status_shows_phases_and_places_in_line()
     {
         var rig = new Rig();

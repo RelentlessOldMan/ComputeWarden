@@ -19,6 +19,9 @@ public sealed class Reservation
     public bool BigMemory { get; init; }
     public int? EstimateSeconds { get; init; }
 
+    /// <summary>A solo claim's time limit once it starts: 10 minutes, or longer if the user approved it.</summary>
+    public int SoloLimitSeconds { get; init; } = Warden.MaxSoloSeconds;
+
     /// <summary>Arrival order: first come, first served.</summary>
     public long Seq { get; init; }
 

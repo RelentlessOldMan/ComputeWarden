@@ -41,6 +41,9 @@ public sealed class IpcRequest
     /// <summary>Acquire: a job that needs so much memory that only one may run at a time.</summary>
     public bool? BigMemory { get; set; }
 
+    /// <summary>Acquire: the user explicitly approved a solo run longer than 10 minutes (up to 60).</summary>
+    public bool? UserApproved { get; set; }
+
     public int? EstimateSeconds { get; set; }
 
     /// <summary>Renew: wait up to this long for the claim's grant to change before answering.</summary>

@@ -8,7 +8,7 @@ runs, so a shared machine stays usable. It does three things:
    check-in says full and they go full speed, without you telling each session by hand.
 2. **Only one big-memory job at a time.** Two sessions that each want 20 GB don't run together.
 3. **Short quiet-machine timing runs.** A session that needs to time something gets the machine
-   to itself for up to 10 minutes.
+   to itself for up to 10 minutes (longer only with your approval).
 
 The rest of the time, nobody waits: agent work runs side by side at full speed.
 
@@ -30,7 +30,7 @@ An agent **claims** before each build, test or run and releases when it ends. Th
 |---|---|---|
 | **Shared** (the default) | Every build, test and run | Full on an idle machine, side by side with any other work. Throttled while you game. |
 | **Big memory** (`bigMemory: true`) | A job that needs more than ~8 GB and can't cap its memory | Like shared, but only one big-memory job runs at a time; the next waits. Everyday work isn't held up. |
-| **Solo** (`kind: "solo"`) | A timing test or benchmark | Waits until nothing else runs and no game is on, then has the machine for at most 10 minutes. While it waits, only work whose `estimateSeconds` ends before the running work does may start; nothing starts while it runs. |
+| **Solo** (`kind: "solo"`) | A timing test or benchmark | Waits until nothing else runs and no game is on, then has the machine for at most 10 minutes (up to 60 with `userApproved: true`, set only on your explicit approval of that run). While it waits, only work whose `estimateSeconds` ends before the running work does may start; nothing starts while it runs. |
 
 **Gaming** means a program from your config's `process_rules` is running. While one runs, work
 already running is told to shrink (never to stop), and at most `game_jobs` claims run (3 by
@@ -118,7 +118,7 @@ Each command costs two small tool calls (acquire and release):
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
 - **Claim every build, test run, and app run:** call `computewarden_acquire` right before the command, with an owner like "Claude Code (<repo>)", a description, and `estimateSeconds` (err high: it sets the lease). Release as soon as it exits, even if it failed; renew within the lease during long runs (if a renew says `renewed: false`, acquire again). Don't hold a claim while reading, editing, or waiting on the user.
 - **Big memory:** set `bigMemory: true` only if the job needs more than ~8 GB and can't cap its memory (cap it if you can). Only one big-memory job runs at a time.
-- **Timing runs:** `kind: "solo"` only for a timing test or benchmark of at most 10 minutes. It waits for a quiet machine; release the moment the measured run ends.
+- **Timing runs:** `kind: "solo"` only for a timing test or benchmark, at most 10 minutes (`estimateSeconds` ≤ 600). It waits for a quiet machine; release the moment the measured run ends. A longer solo run (up to 60 minutes) needs the user's explicit approval for that run: only then set `userApproved: true`. Without it, split the run into timed pieces of 10 minutes or less, or run it as shared.
 - **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) is the user's call only.
 ```
 
@@ -129,7 +129,7 @@ which of its jobs are big-memory or solo, and how to cap a job's memory.
 
 | Tool | What it does |
 |---|---|
-| `computewarden_acquire` | Claims work and returns `advice` (`full` / `throttled` / `queued`, with reason, throttle limits, `how`, and place in line). `kind` is `shared` (default) or `solo`; `bigMemory: true` marks a big-memory job. |
+| `computewarden_acquire` | Claims work and returns `advice` (`full` / `throttled` / `queued`, with reason, throttle limits, `how`, and place in line). `kind` is `shared` (default) or `solo`; `bigMemory: true` marks a big-memory job. `userApproved: true` (user only) lets a solo claim run up to 60 minutes. |
 | `computewarden_renew` | Extends the lease and returns current advice. `waitSeconds` (max 60) waits for the advice to change first. |
 | `computewarden_release` | Releases a claim. Safe to call twice. |
 | `computewarden_status` | `AVAILABLE` / `BUSY` / `UNKNOWN`, every blocker (games, the hold, a solo run), `game_jobs`, and every agent claim. |

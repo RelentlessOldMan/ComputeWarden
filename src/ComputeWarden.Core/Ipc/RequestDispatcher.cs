@@ -152,7 +152,8 @@ public sealed class RequestDispatcher
             r.BigMemory == true,
             r.LeaseSeconds,
             r.EstimateSeconds,
-            r.Metadata));
+            r.Metadata,
+            r.UserApproved == true));
 
         return Ok(o =>
         {

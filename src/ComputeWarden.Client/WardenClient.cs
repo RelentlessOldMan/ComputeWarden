@@ -67,6 +67,7 @@ public sealed class WardenClient
             Description = claim.Description,
             Kind = Warden.KindName(claim.Kind),
             BigMemory = claim.BigMemory ? true : null,
+            UserApproved = claim.UserApproved ? true : null,
             LeaseSeconds = claim.LeaseSeconds,
             EstimateSeconds = claim.EstimateSeconds,
             Metadata = claim.Metadata is null ? null : new Dictionary<string, string>(claim.Metadata),

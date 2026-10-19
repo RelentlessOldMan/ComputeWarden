@@ -63,7 +63,8 @@ public static class ComputeWardenTools
                  "advice.throttle / advice.how), or queued (don't start yet; see advice.next). kind=shared " +
                  "(the default) is for all everyday work. Set bigMemory=true ONLY if the job needs more than " +
                  "~8 GB and can't cap its memory: only one big-memory job runs at a time. kind=solo is ONLY for " +
-                 "short timing runs and benchmarks (at most 10 minutes): it waits until nothing else runs, and " +
+                 "short timing runs and benchmarks (at most 10 minutes, or up to 60 with userApproved, set only " +
+                 "when the user explicitly approved that run): it waits until nothing else runs, and " +
                  "nothing new starts while it runs, so release it the moment the measured run ends. While one " +
                  "waits, only work whose estimateSeconds ends before the running work does may start. " +
                  "Save reservation_id; renew it during long work (renew returns new advice, e.g. full once a " +
@@ -75,11 +76,12 @@ public static class ComputeWardenTools
         [Description("True only for a job that needs more than ~8 GB of memory and can't cap itself. Only one runs at a time.")] bool? bigMemory = null,
         [Description("How long the work takes, in seconds. Sets the lease (err high) and others' wait estimates.")] int? estimateSeconds = null,
         [Description("Requested lease seconds; clamped to server bounds. Omit to derive it from estimateSeconds.")] int? leaseSeconds = null,
-        [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null)
+        [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null,
+        [Description("USER ONLY: true only if the user explicitly approved THIS solo run lasting longer than 10 minutes (up to 60). Never set it on your own.")] bool? userApproved = null)
         => Run(async client =>
         {
             var r = await client.AcquireAsync(new ClaimRequest(
-                owner, description, ParseKind(kind), bigMemory == true, leaseSeconds, estimateSeconds, metadata));
+                owner, description, ParseKind(kind), bigMemory == true, leaseSeconds, estimateSeconds, metadata, userApproved == true));
 
             var now = DateTimeOffset.UtcNow;
             return new

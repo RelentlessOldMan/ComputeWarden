@@ -35,4 +35,5 @@ public sealed record SavedClaim(
     int LeaseSeconds,
     bool Started,
     DateTimeOffset? StartedAt,
-    Grant LastGrant);
+    Grant LastGrant,
+    int? SoloLimitSeconds = null);
