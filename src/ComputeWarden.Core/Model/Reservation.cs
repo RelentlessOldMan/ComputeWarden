@@ -68,8 +68,8 @@ public sealed class Reservation
 
     public bool IsExpiredAt(DateTimeOffset now) => ExpiresAt <= now;
 
-    /// <summary>An exclusive claim waiting for its resources (running throttled, or a ticket).</summary>
-    public bool InLine => Kind == ClaimKind.Exclusive && !Holding;
+    /// <summary>An exclusive or solo claim waiting for its resources (running throttled, or a ticket).</summary>
+    public bool InLine => Kind != ClaimKind.Shared && !Holding;
 
     /// <summary>Represents this reservation as a blocker for state calculation.</summary>
     public Blocker ToBlocker() => new(

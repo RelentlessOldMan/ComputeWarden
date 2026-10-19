@@ -26,7 +26,7 @@ public sealed class Warden
     public const int MaxGameJobs = 12;
 
     /// <summary>What everyday work uses when it doesn't say: builds and tests are cpu, ram, and disk.</summary>
-    public const ResourceSet SharedDefault = ResourceSet.Cpu | ResourceSet.Ram | ResourceSet.Disk;
+    public const ResourceSet SharedDefault = ResourceSet.Cpu | ResourceSet.Ram;
 
     private readonly object _gate = new();
     private readonly Dictionary<string, Reservation> _reservations = new(StringComparer.Ordinal);
@@ -148,15 +148,21 @@ public sealed class Warden
     /// claims that throttle or wait are always created (unless invalid); a
     /// <see cref="WhenBusy.Refuse"/> exclusive claim is the legacy acquire.
     /// Resources <see cref="ResourceSet.None"/> means the kind's default: everyday work is
-    /// cpu+ram+disk (so a build isn't held up by a game's GPU), heavy work the whole machine.
+    /// cpu+ram (so a build isn't held up by a game's GPU, and disk only when it's asked for), heavy work the whole machine.
     /// </summary>
     public AcquireResult Acquire(ClaimRequest request)
     {
         var kind = request.Kind;
-        var resources = request.Resources != ResourceSet.None ? request.Resources
+        var resources = kind == ClaimKind.Solo ? ResourceSet.All // a quiet machine is all of it
+            : request.Resources != ResourceSet.None ? request.Resources
             : kind == ClaimKind.Shared ? SharedDefault
             : ResourceSet.All;
-        var whenBusy = kind == ClaimKind.Shared ? WhenBusy.Throttle : request.WhenBusy;
+        var whenBusy = kind switch
+        {
+            ClaimKind.Shared => WhenBusy.Throttle,
+            ClaimKind.Solo => WhenBusy.Wait, // a timing test run small measures the wrong thing
+            _ => request.WhenBusy,
+        };
 
         lock (_gate)
         {
@@ -231,6 +237,12 @@ public sealed class Warden
                 ? "Machine currently unavailable"
                 : $"Requested resources in use: {string.Join(", ", Resources.ToNames(Occupied(blockers) & resources))}";
             return AcquireResult.Failure(reason, state, blockers);
+        }
+
+        if (SoloAhead(null, x) is { } solo)
+        {
+            _failedAcquisitions++;
+            return AcquireResult.Failure(SoloReason(solo), MachineState.Busy, blockers);
         }
 
         // First come, first served: a legacy caller can't take resources someone is waiting for.
@@ -670,6 +682,12 @@ public sealed class Warden
             var unavailable = x.Hold | x.Priority | x.Steady;
             foreach (var w in x.Line.ToList())
             {
+                // A solo claim waits for everything else to finish, and nobody behind it starts meanwhile.
+                if (w.Kind == ClaimKind.Solo && _reservations.Values.Any(r => r != w && (r.Started || r.Holding)))
+                {
+                    waitedFor = ResourceSet.All;
+                    continue;
+                }
                 if (Resources.Overlaps(w.Resources, unavailable | held | waitedFor))
                 {
                     waitedFor |= w.Resources;
@@ -720,11 +738,19 @@ public sealed class Warden
         if (hold != ResourceSet.None)
             return Defer(hold, HoldReason(x, hold));
 
+        // Nothing new starts behind a solo claim, so the machine goes quiet for it.
+        if (!c.Started && SoloAhead(c, x) is { } solo)
+        {
+            var behind = ahead.Contains(solo) ? ahead
+                : ahead.Append(solo).OrderBy(r => r.UserPriority is null ? 1 : 0).ThenBy(r => r.Seq).ToList();
+            return Queued(c, x, behind, res, now, SoloReason(solo));
+        }
+
         if (!x.Confident)
         {
             // A game may be running unseen: treat everything as contended by one.
             var unknown = new List<string> { "machine state is UNKNOWN (the process list can't be read)" };
-            if (c.Kind == ClaimKind.Exclusive) return Defer(res, Join(unknown));
+            if (c.Kind != ClaimKind.Shared) return Defer(res, Join(unknown));
             return Contended(c, x, ahead, res, priorityLike: res, steadyOnly: ResourceSet.None, unknown, now);
         }
 
@@ -738,18 +764,23 @@ public sealed class Warden
         ResourceSet contended;
         var steadyOnly = ResourceSet.None; // slowed only by steady mode: nobody else is on it
         var reasons = new List<string>();
-        if (c.Kind == ClaimKind.Exclusive && !c.Holding)
+        if (c.Kind != ClaimKind.Shared && !c.Holding)
         {
             var waitedFor = Occupied(ahead) & res;
             contended = priority | steady | others | waitedFor;
             if (contended == ResourceSet.None) contended = res; // not promoted, so something is in the way
             steadyOnly = steady & ~(priority | others | waitedFor);
             Explain(reasons, x, c, priority, steady, others);
+            if (c.Kind == ClaimKind.Solo)
+            {
+                var running = _reservations.Values.Count(r => r != c && r.Started && !r.Holding);
+                if (running > 0) reasons.Add($"waiting for {running} running claim(s) to finish");
+            }
             if (ahead.Count > 0) reasons.Add($"{ahead.Count} ahead in line");
             if (c.WhenBusy == WhenBusy.Wait)
                 return Defer(contended, Join(reasons));
         }
-        else if (c.Kind == ClaimKind.Exclusive)
+        else if (c.Kind != ClaimKind.Shared)
         {
             contended = priority | steady;
             steadyOnly = steady & ~priority;
@@ -867,6 +898,20 @@ public sealed class Warden
             .ThenBy(r => r.Seq)
             .ToList();
 
+    /// <summary>
+    /// A solo claim that keeps <paramref name="c"/> from starting: one holding the machine, or one
+    /// waiting ahead of it in line. Null <paramref name="c"/> (a legacy acquire) is behind everyone.
+    /// </summary>
+    private static Reservation? SoloAhead(Reservation? c, Context x)
+        => x.Holders.Where(h => h != c && h.Kind == ClaimKind.Solo)
+            .Concat(x.Line.Where(w => w != c && w.Kind == ClaimKind.Solo && (c is null || Ahead(w, c))))
+            .FirstOrDefault();
+
+    private static string SoloReason(Reservation solo)
+        => solo.Holding
+            ? $"{solo.Owner} has the machine to itself ({Trunc(solo.Description)})"
+            : $"{solo.Owner} is waiting for a quiet machine ({Trunc(solo.Description)}); nothing new starts until it's done";
+
     /// <summary>Line order: user-priority claims first, then first come, first served.</summary>
     private static bool Ahead(Reservation r, Reservation c)
     {
@@ -924,7 +969,11 @@ public sealed class Warden
         if (!Resources.Overlaps(c.Resources | Occupied(ahead), x.Priority | x.Hold | x.Steady) && x.Confident)
         {
             long remaining = 0; // long: estimates are only checked for >= 0, so their sum can pass int.MaxValue
-            foreach (var h in x.Holders)
+            // A solo claim also waits for running shared work, which holds nothing.
+            var running = c.Kind == ClaimKind.Solo
+                ? _reservations.Values.Where(r => r.Started || r.Holding)
+                : x.Holders;
+            foreach (var h in running)
                 if (h != c && Resources.Overlaps(h.Resources, c.Resources))
                     remaining = Math.Max(remaining, Remaining(h, now));
             foreach (var a in ahead)
@@ -1016,7 +1065,12 @@ public sealed class Warden
     private static int? LeaseFromEstimate(int? estimateSeconds)
         => estimateSeconds is int e and > 0 ? (int)Math.Min(int.MaxValue, Math.Ceiling(e * 1.25) + 30) : null;
 
-    public static string KindName(ClaimKind kind) => kind == ClaimKind.Shared ? "shared" : "exclusive";
+    public static string KindName(ClaimKind kind) => kind switch
+    {
+        ClaimKind.Shared => "shared",
+        ClaimKind.Solo => "solo",
+        _ => "exclusive",
+    };
 
     public static string GrantName(Grant grant) => grant switch
     {

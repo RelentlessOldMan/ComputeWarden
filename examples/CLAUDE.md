@@ -28,8 +28,9 @@ saturate), but they shouldn't restate or contradict the policy below.
 
 ## ComputeWarden (shared machine)
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
-- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
+- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. The default is cpu+ram; add `disk` only for heavy disk I/O (clean rebuilds, full scans, large copies), and `gpu` only if it uses the GPU. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
 - **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"` with `estimateSeconds`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`. Release it even if it fails.
+- **Timing tests and benchmarks:** use `kind: "solo"`. It waits until nothing else runs, and nothing new starts while it waits or holds, so acquire right before the measured run and release as soon as it ends. A `queued` grant works as below.
 - **Follow `advice.grant`:**
   - `full`: run normally.
   - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).

@@ -328,7 +328,7 @@ public sealed class MonitorPublisher : IAsyncDisposable
     }
 
     // A claim this long without a check-in may be work that's finished or stuck; the panel says so.
-    public static readonly TimeSpan QuietAfter = TimeSpan.FromMinutes(15);
+    public static readonly TimeSpan NoCheckInAfter = TimeSpan.FromMinutes(15);
 
     private static Dictionary<string, object> ClaimRow(ClaimInfo c, DateTimeOffset now, int? place)
     {
@@ -351,8 +351,8 @@ public sealed class MonitorPublisher : IAsyncDisposable
             if ((c.Resources & set) != 0) row[key] = new { dot = true, color, tip = $"{key}: {state}" };
 
         var lease = $"{Math.Max(0, (int)Math.Ceiling((c.ExpiresAt - now).TotalMinutes))}m";
-        row["lease"] = c.LastCheckIn is { } seen && now - seen >= QuietAfter
-            ? new { text = $"{lease}, quiet {(int)(now - seen).TotalMinutes}m", color = "warn", tip = $"no check-in for {(int)(now - seen).TotalMinutes}m" }
+        row["lease"] = c.LastCheckIn is { } seen && now - seen >= NoCheckInAfter
+            ? new { text = $"{lease}, no check-in {(int)(now - seen).TotalMinutes}m", color = "warn", tip = $"no check-in for {(int)(now - seen).TotalMinutes}m" }
             : lease;
         return row;
     }

@@ -104,7 +104,7 @@ public class MonitorPublisherTests
         Assert.Equal("dotnet test", FakeSink.Text(row, "what"));
         Assert.Matches("^[0-9]+m$", FakeSink.Text(row, "lease"));
         // A dot under each resource it needs, orange while throttled.
-        Assert.Equal(new[] { "orange", null, "orange", null, "orange" },
+        Assert.Equal(new[] { "orange", null, "orange", null, null },
             new[] { "cpu", "gpu", "ram", "net", "disk" }.Select(k => FakeSink.Dot(row, k)));
     }
 
@@ -178,7 +178,7 @@ public class MonitorPublisherTests
     }
 
     [Fact]
-    public void Claim_rows_say_whose_turn_it_is_and_which_have_gone_quiet()
+    public void Claim_rows_say_whose_turn_it_is_and_which_havent_checked_in()
     {
         var clock = new FakeClock();
         var (warden, sink, publisher, _) = NewPublisher(clock);
@@ -193,11 +193,11 @@ public class MonitorPublisherTests
         Assert.Equal("its turn, not started, exclusive", FakeSink.Text(sink.Row("B"), "state"));
         Assert.Equal("blue", FakeSink.Dot(sink.Row("B"), "gpu"));
         Assert.StartsWith("running ", FakeSink.Text(sink.Row("C"), "state"));
-        Assert.DoesNotContain("quiet", FakeSink.Text(sink.Row("C"), "lease"));
+        Assert.DoesNotContain("no check-in", FakeSink.Text(sink.Row("C"), "lease"));
 
-        clock.Advance(MonitorPublisher.QuietAfter + TimeSpan.FromMinutes(1));
+        clock.Advance(MonitorPublisher.NoCheckInAfter + TimeSpan.FromMinutes(1));
         publisher.Publish();
-        Assert.EndsWith(", quiet 16m", FakeSink.Text(sink.Row("C"), "lease"));
+        Assert.EndsWith(", no check-in 16m", FakeSink.Text(sink.Row("C"), "lease"));
     }
 
     [Fact]

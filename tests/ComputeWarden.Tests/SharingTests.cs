@@ -572,7 +572,7 @@ public class SharingTests
         var rig = new Rig();
         rig.Warden.SetManualBusy("disk maintenance", ResourceSet.Disk);
 
-        var r = rig.Shared();
+        var r = rig.Shared(resources: Warden.SharedDefault | ResourceSet.Disk);
 
         Assert.Equal(Grant.Queued, r.Advice!.Grant);
         Assert.Contains("manual hold: disk maintenance", r.Advice.Reason);

@@ -8,6 +8,12 @@ public enum ClaimKind
 
     /// <summary>Everyday work (build, test, run): never refused, told how big it may run.</summary>
     Shared,
+
+    /// <summary>
+    /// A quiet machine (timing tests, benchmarks): the whole machine, held only once nothing
+    /// else runs. While it waits or holds, work behind it doesn't start. Never runs small.
+    /// </summary>
+    Solo,
 }
 
 /// <summary>What an exclusive claim does when it can't have its resources right away.</summary>
@@ -123,7 +129,7 @@ public enum ClaimPhase
 
 /// <summary>
 /// An agent's request to do work, with its own estimate of what that work needs.
-/// <see cref="Resources"/> None means the kind's default (shared: cpu+ram+disk; exclusive: all).
+/// <see cref="Resources"/> None means the kind's default (shared: cpu+ram; exclusive: all).
 /// </summary>
 public sealed record ClaimRequest(
     string Owner,

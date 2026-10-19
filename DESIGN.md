@@ -235,9 +235,10 @@ sessions to get that answer from the warden, live, without being told.
 |---|---|---|
 | **Priority** | Config process rules (games, etc.) | **The user's own lease.** Gaming means the user holds those resources. Non-negotiable: never queued, asked, or throttled, and every agent on those resources is limited for as long as it runs. |
 | **Exclusive** | Agent heavy job (`acquire` with `kind: exclusive`) | Will saturate these resources. One holder per resource; the rest wait in line or run throttled. |
-| **Shared** | Agent everyday build/test/run | Normal work. Never refused; told how big it may run right now. With no `resources`, it means cpu+ram+disk (not all), so a GPU-using game throttles a build instead of queuing it. |
+| **Shared** | Agent everyday build/test/run | Normal work. Never refused; told how big it may run right now. With no `resources`, it means cpu+ram (not all), so a GPU-using game throttles a build instead of queuing it. |
+| **Solo** | Agent timing test or benchmark (`kind: solo`) | Needs a quiet machine. Always the whole machine and `whenBusy: wait`. It holds only once no other claim runs or holds; while it waits in line or holds, no claim behind it starts (shared included) and a legacy acquire is refused. A game still comes first. |
 
-Agent claims (exclusive, shared, and queue tickets) are all **leases**: renew, release,
+Agent claims (exclusive, shared, solo, and queue tickets) are all **leases**: renew, release,
 and crash-safe expiry are unchanged. A lease just gains a `kind` and the warden's current
 **advice**.
 
@@ -394,7 +395,7 @@ global CLAUDE.md rule becomes:
 
 ### Example
 
-Overwatch is configured as `[cpu, gpu, ram]`; shared builds default to cpu+ram+disk.
+Overwatch is configured as `[cpu, gpu, ram]`; shared builds default to cpu+ram.
 
 ```
 10:00  A: shared build (cpu)            → full

@@ -42,7 +42,7 @@ public class ThrottleSlotTests
         rig.Game(ResourceSet.Cpu);
         rig.Warden.SetManualBusy("disk maintenance", ResourceSet.Disk);
         for (var i = 0; i < 3; i++)
-            Assert.Equal(Grant.Queued, rig.Shared(Warden.SharedDefault).Advice!.Grant); // held on disk
+            Assert.Equal(Grant.Queued, rig.Shared(Warden.SharedDefault | ResourceSet.Disk).Advice!.Grant); // held on disk
         Assert.Equal(Grant.Throttled, rig.Shared(ResourceSet.Cpu).Advice!.Grant);
     }
 
@@ -54,7 +54,7 @@ public class ThrottleSlotTests
         rig.Excl(ResourceSet.Disk);                 // holder on disk
         for (var i = 0; i < 3; i++)
         {
-            var a = rig.Shared(Warden.SharedDefault).Advice!;
+            var a = rig.Shared(Warden.SharedDefault | ResourceSet.Disk).Advice!;
             Assert.Equal(Grant.Throttled, a.Grant);
             Assert.Equal(ResourceSet.Disk, a.Contended); // throttled on disk only; cpu is full speed
         }

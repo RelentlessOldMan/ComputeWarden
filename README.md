@@ -29,7 +29,7 @@ Each blocker occupies some of `cpu`, `gpu`, `ram`, `network`, and `disk`. An age
 **acquire** with the resources its job will saturate, and it gets a reservation only if no
 blocker overlaps them. A CPU+network job and a GPU+RAM job can run side by side; two GPU
 jobs take turns. Leaving out `resources` means all of them, i.e. the whole machine (for a
-shared claim it means cpu+ram+disk instead).
+shared claim it means cpu+ram instead).
 
 **Ask for everything in one call.** Request every resource a job needs up front (`[ram, disk]`,
 not `ram` now and `disk` later). Holding one resource while waiting on another is how two
@@ -49,7 +49,8 @@ yes or no:
 |---|---|---|
 | **Priority** | Programs in your config (games, etc.) | **Your lease.** While one runs, every agent on its resources is limited. Nothing overrides it. |
 | **Exclusive** | An agent's heavy job (indexing, test fan-out) | One holder per resource. Others wait in line or run throttled (`whenBusy: throttle` / `wait`). |
-| **Shared** | An agent's everyday build, test or run | Never refused. Full when nothing heavy overlaps; throttled when a game or an exclusive holder does. Defaults to `cpu, ram, disk`. |
+| **Shared** | An agent's everyday build, test or run | Never refused. Full when nothing heavy overlaps; throttled when a game or an exclusive holder does. Defaults to `cpu, ram`. |
+| **Solo** | An agent's timing test or benchmark | A quiet machine. Waits in line until nothing else runs, then has the whole machine; nothing new starts while it waits or holds. Never runs small. |
 
 - **Advice:**
   - `full` means run normally.
@@ -153,8 +154,9 @@ Each command costs two small tool calls (acquire and release):
 ```markdown
 ## ComputeWarden (shared machine)
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
-- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. Pass `resources` only if the work isn't cpu+ram+disk. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
+- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. The default is cpu+ram; add `disk` only for heavy disk I/O (clean rebuilds, full scans, large copies), and `gpu` only if it uses the GPU. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
 - **Heavy work:** for jobs that saturate a resource (full indexing, clean parallel builds, big test fan-outs, ML, encodes), use `kind: "exclusive"` with `estimateSeconds`. Pass every resource it saturates in ONE call, and `whenBusy: "throttle"` (run small now) or `"wait"`. Release it even if it fails.
+- **Timing tests and benchmarks:** use `kind: "solo"`. It waits until nothing else runs, and nothing new starts while it waits or holds, so acquire right before the measured run and release as soon as it ends. A `queued` grant works as below.
 - **Follow `advice.grant`:**
   - `full`: run normally.
   - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
@@ -238,7 +240,7 @@ shows up in it as a Compute Warden panel with:
 - a table of claims: who, where each one is (running full or throttled, its turn but not
   started, or queued with its place in line), a colored dot under each resource it needs
   (cpu, gpu, ram, net, disk), the lease left, and what it's doing. A claim with no check-in
-  for 15 minutes or more is flagged "quiet": the work may be finished or stuck;
+  for 15 minutes or more says "no check-in" and for how long: the work may be finished or stuck;
 - a feed of the daemon's log (claims, releases, promotions, expiries).
 
 `reye request ComputeWarden.status` returns the same JSON as `computewarden_status`.

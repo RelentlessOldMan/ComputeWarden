@@ -245,7 +245,8 @@ public sealed class RequestDispatcher
     {
         "shared" => ClaimKind.Shared,
         "exclusive" => ClaimKind.Exclusive,
-        _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared or exclusive)"),
+        "solo" => ClaimKind.Solo,
+        _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared, exclusive, or solo)"),
     };
 
     private static WhenBusy ParseWhenBusy(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch

@@ -20,7 +20,7 @@ public static class ComputeWardenTools
     private const string ResourcesHelp =
         "Resources the work will saturate: any of cpu, gpu, ram, network, disk. Holds conflict " +
         "only where they overlap, so e.g. cpu+network work can run alongside gpu+ram work. " +
-        "Omit for the default: cpu+ram+disk for kind=shared, the whole machine otherwise. " +
+        "Omit for the default: cpu+ram for kind=shared (add disk only for heavy disk I/O: clean rebuilds, full scans, large copies), the whole machine otherwise. " +
         "Declare every resource it really saturates — " +
         "under-declaring lets conflicting work start.";
 
@@ -81,7 +81,9 @@ public static class ComputeWardenTools
                  "check back by renewing). kind=shared is for everyday builds, tests, and runs: never " +
                  "refused, only told how big to run. kind=exclusive is for heavy jobs that saturate " +
                  "their resources: one holder per resource, others wait in a first-come-first-served " +
-                 "line. Configured priority processes (the user's games) always limit everyone on their " +
+                 "line. kind=solo is for timing tests and benchmarks: it waits until nothing else runs, then " +
+                 "has the whole machine; nothing new starts while it waits or holds, so release it right " +
+                 "after the measured run. Configured priority processes (the user's games) always limit everyone on their " +
                  "resources. Omitting kind is the legacy all-or-nothing acquire (refused when busy). " +
                  "Save reservation_id; renew it during the work (renew returns updated advice, e.g. " +
                  "full once a game exits) and release it when done (finally/cleanup semantics)." + OneCallHelp)]
@@ -91,7 +93,7 @@ public static class ComputeWardenTools
         [Description("Requested lease seconds; clamped to server bounds. Omit to derive it from estimateSeconds (or the server default).")] int? leaseSeconds = null,
         [Description("Optional small string metadata.")] Dictionary<string, string>? metadata = null,
         [Description(ResourcesHelp)] string[]? resources = null,
-        [Description("shared (everyday build/test/run) or exclusive (heavy job). Omit only for the legacy all-or-nothing acquire.")] string? kind = null,
+        [Description("shared (everyday build/test/run), exclusive (heavy job), or solo (timing test or benchmark: a quiet machine). Omit only for the legacy all-or-nothing acquire.")] string? kind = null,
         [Description("Exclusive only, when the resources are taken: throttle (default: run small now, stay in line for full), wait (don't start until it's your turn), or refuse (create nothing).")] string? whenBusy = null,
         [Description("Your estimate of how long the work takes at full size, in seconds. Helps others' wait estimates.")] int? estimateSeconds = null,
         [Description("Cores the work would use at full size, if known.")] int? cores = null,
@@ -135,13 +137,14 @@ public static class ComputeWardenTools
                  "line). Pass waitSeconds to wait for the advice to change instead of polling. Returns " +
                  "renewed=false if the reservation no longer exists (e.g. it already expired).")]
     public static Task<string> Renew(
-        [Description("The reservation_id returned by computewarden_acquire.")] string reservationId,
+        [Description("The reservation_id returned by computewarden_acquire.")] string? reservationId = null,
         [Description("New lease seconds; clamped to server bounds. Omit to keep the claim's lease (legacy holds: the server default).")] int? leaseSeconds = null,
         [Description("Wait up to this many seconds (max 60) for the grant to change before answering.")] int? waitSeconds = null,
+        [Description(IdAliasHelp)] string? reservation_id = null,
         CancellationToken cancellationToken = default) // the host cancelling closes the pipe, which ends the daemon's wait
         => Run(async client =>
         {
-            var r = await client.RenewAsync(reservationId, leaseSeconds, waitSeconds, cancellationToken);
+            var r = await client.RenewAsync(Id(reservationId, reservation_id), leaseSeconds, waitSeconds, cancellationToken);
             var now = DateTimeOffset.UtcNow;
             return new
             {
@@ -174,10 +177,11 @@ public static class ComputeWardenTools
     [Description("Releases a reservation immediately, freeing the machine for other agents. " +
                  "Idempotent: releasing an unknown or already-expired reservation is not an error.")]
     public static Task<string> Release(
-        [Description("The reservation_id to release.")] string reservationId)
+        [Description("The reservation_id to release.")] string? reservationId = null,
+        [Description(IdAliasHelp)] string? reservation_id = null)
         => Run(async client =>
         {
-            var r = await client.ReleaseAsync(reservationId);
+            var r = await client.ReleaseAsync(Id(reservationId, reservation_id));
             return new { released = r.Released, reason = r.Reason };
         });
 
@@ -224,6 +228,15 @@ public static class ComputeWardenTools
         });
 
     // ---- helpers --------------------------------------------------------
+
+    // Acquire answers with reservation_id, so agents pass it back under that name; a missing
+    // required argument fails in the SDK with no message, so both spellings are taken.
+    private const string IdAliasHelp = "Same as reservationId (either name works).";
+
+    private static string Id(string? reservationId, string? alias)
+        => !string.IsNullOrWhiteSpace(reservationId) ? reservationId
+            : !string.IsNullOrWhiteSpace(alias) ? alias
+            : throw new WardenClientException("reservationId is required (the reservation_id from computewarden_acquire)");
 
     private static async Task<string> Run(Func<WardenClient, Task<object>> operation)
     {
@@ -322,7 +335,7 @@ public static class ComputeWardenTools
         kind = Warden.KindName(c.Kind),
         resources = Resources.ToNames(c.Resources),
         grant = Warden.GrantName(c.Grant),
-        holding = c.Kind == ClaimKind.Exclusive ? c.Holding : (bool?)null,
+        holding = c.Kind != ClaimKind.Shared ? c.Holding : (bool?)null,
         position = c.Position,
         estimateSeconds = c.EstimateSeconds,
         userPriority = c.UserPriority,
@@ -341,7 +354,8 @@ public static class ComputeWardenTools
     {
         "shared" => ClaimKind.Shared,
         "exclusive" => ClaimKind.Exclusive,
-        _ => throw new WardenClientException($"Unknown kind '{kind}' (expected shared or exclusive)"),
+        "solo" => ClaimKind.Solo,
+        _ => throw new WardenClientException($"Unknown kind '{kind}' (expected shared, exclusive, or solo)"),
     };
 
     private static WhenBusy ParseWhenBusy(string? whenBusy) => (whenBusy ?? string.Empty).Trim().ToLowerInvariant() switch

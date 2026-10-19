@@ -65,8 +65,11 @@ public class McpToolsTests
 
         var renew = Parse(await ComputeWardenTools.Renew(id, 120));
         Assert.True((bool)renew["renewed"]!);
+        // Acquire answers with reservation_id, so that name works too.
+        Assert.True((bool)Parse(await ComputeWardenTools.Renew(reservation_id: id))["renewed"]!);
+        Assert.Contains("reservationId is required", (string)Parse(await ComputeWardenTools.Release())["error"]!);
 
-        var release = Parse(await ComputeWardenTools.Release(id));
+        var release = Parse(await ComputeWardenTools.Release(reservation_id: id));
         Assert.True((bool)release["released"]!);
 
         Assert.True((bool)Parse(await ComputeWardenTools.Acquire("Other", "work"))["acquired"]!);

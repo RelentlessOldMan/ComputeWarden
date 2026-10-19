@@ -56,8 +56,8 @@ public class SharingIpcTests
         Assert.Equal("throttled", (string)advice["grant"]!);
         Assert.Equal(1, (int)advice["throttle"]!["maxCores"]!);
         Assert.Contains("steady mode: gaming", (string)advice["reason"]!);
-        Assert.Equal(new[] { "cpu", "ram", "disk" }, advice["contended"]!.AsArray().Select(n => (string)n!).ToArray());
-        Assert.Equal(new[] { "cpu", "ram", "disk" }, res["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram" }, advice["contended"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram" }, res["resources"]!.AsArray().Select(n => (string)n!).ToArray());
     }
 
     [Fact]
@@ -105,8 +105,8 @@ public class SharingIpcTests
         var blank = Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "x", kind = "shared", resources = new[] { " " } });
         var nulls = Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "y", kind = "shared", resources = new string?[] { null } });
 
-        Assert.Equal(new[] { "cpu", "ram", "disk" }, blank["resources"]!.AsArray().Select(n => (string)n!).ToArray());
-        Assert.Equal(new[] { "cpu", "ram", "disk" }, nulls["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram" }, blank["resources"]!.AsArray().Select(n => (string)n!).ToArray());
+        Assert.Equal(new[] { "cpu", "ram" }, nulls["resources"]!.AsArray().Select(n => (string)n!).ToArray());
     }
 
     [Fact]

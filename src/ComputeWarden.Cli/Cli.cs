@@ -340,7 +340,7 @@ internal static class Cli
         w.WriteLine("Agent work:");
         foreach (var c in claims)
         {
-            var state = c.Kind == ClaimKind.Exclusive && c.Holding ? "holding"
+            var state = c.Kind != ClaimKind.Shared && c.Holding ? "holding"
                 : c.Position is int p && c.Grant == Grant.Queued ? $"queued #{p}"
                 : c.Position is int q ? $"{Warden.GrantName(c.Grant)}, #{q} in line"
                 : Warden.GrantName(c.Grant);

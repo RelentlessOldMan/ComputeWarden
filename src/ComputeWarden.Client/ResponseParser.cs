@@ -49,7 +49,7 @@ internal static class ResponseParser
         Blockers: Blockers(root),
         Resources: ResourcesOpt(root, "resources") ?? ResourceSet.None,
         Advice: AdviceOpt(root),
-        Kind: String(root, "kind") switch { "shared" => ClaimKind.Shared, "exclusive" => ClaimKind.Exclusive, _ => null });
+        Kind: String(root, "kind") switch { "shared" => ClaimKind.Shared, "exclusive" => ClaimKind.Exclusive, "solo" => ClaimKind.Solo, _ => null });
 
     public static RenewResult Renew(JsonElement root) => new(
         Renewed: Bool(root, "renewed"),
@@ -105,7 +105,7 @@ internal static class ResponseParser
                 Id: String(e, "id") ?? string.Empty,
                 Owner: String(e, "owner") ?? string.Empty,
                 Description: String(e, "description") ?? string.Empty,
-                Kind: String(e, "kind") == "shared" ? ClaimKind.Shared : ClaimKind.Exclusive,
+                Kind: String(e, "kind") switch { "shared" => ClaimKind.Shared, "solo" => ClaimKind.Solo, _ => ClaimKind.Exclusive },
                 Resources: ResourcesOpt(e, "resources") ?? ResourceSet.All,
                 Grant: GrantFrom(String(e, "grant")),
                 Holding: Bool(e, "holding"),
