@@ -53,15 +53,14 @@ public class McpToolsTests
     {
         await using var host = StartHostWithTools();
 
-        var acquire = Parse(await ComputeWardenTools.Acquire("Claude Code", "indexing", 300));
+        var acquire = Parse(await ComputeWardenTools.Acquire("Claude Code", "indexing", leaseSeconds: 300));
         Assert.True((bool)acquire["acquired"]!);
         var id = (string)acquire["reservation_id"]!;
         Assert.NotNull(acquire["lease_remaining_seconds"]);
 
-        var blocked = Parse(await ComputeWardenTools.Acquire("Other", "work"));
-        Assert.False((bool)blocked["acquired"]!);
-        var blocker = Assert.Single(blocked["blockers"]!.AsArray());
-        Assert.Equal("RESERVATION", (string)blocker!["type"]!);
+        var beside = Parse(await ComputeWardenTools.Acquire("Other", "work"));
+        Assert.True((bool)beside["acquired"]!); // everyday work never blocks other work
+        Assert.Equal("full", (string)beside["advice"]!["grant"]!);
 
         var renew = Parse(await ComputeWardenTools.Renew(id, 120));
         Assert.True((bool)renew["renewed"]!);
@@ -73,26 +72,6 @@ public class McpToolsTests
         Assert.True((bool)release["released"]!);
 
         Assert.True((bool)Parse(await ComputeWardenTools.Acquire("Other", "work"))["acquired"]!);
-    }
-
-    [Fact]
-    public async Task Acquire_tool_with_disjoint_resources_runs_in_parallel()
-    {
-        await using var host = StartHostWithTools();
-
-        var a = Parse(await ComputeWardenTools.Acquire("A", "compile", resources: new[] { "cpu", "network" }));
-        var b = Parse(await ComputeWardenTools.Acquire("B", "train", resources: new[] { "gpu", "ram" }));
-        var c = Parse(await ComputeWardenTools.Acquire("C", "encode", resources: new[] { "gpu" }));
-
-        Assert.True((bool)a["acquired"]!);
-        Assert.Equal("[\"cpu\",\"network\"]", a["resources"]!.ToJsonString());
-        Assert.True((bool)b["acquired"]!);
-        Assert.False((bool)c["acquired"]!);
-        Assert.Equal("B", (string)Assert.Single(c["blockers"]!.AsArray())!["owner"]!);
-
-        var status = Parse(await ComputeWardenTools.Status());
-        Assert.Equal("[\"cpu\",\"gpu\",\"ram\",\"network\"]", status["busy_resources"]!.ToJsonString());
-        Assert.True((bool)Parse(await ComputeWardenTools.CanRun(new[] { "disk" }))["can_run"]!);
     }
 
     [Fact]
@@ -127,7 +106,7 @@ public class McpToolsTests
         await using var host = StartHostWithTools();
 
         await ComputeWardenTools.Acquire("A", "work");   // one success
-        await ComputeWardenTools.Acquire("B", "work");   // one failure (blocked)
+        await ComputeWardenTools.Acquire("B", "bench", kind: "solo", estimateSeconds: 900); // one failure (solo too long)
 
         var stats = Parse(await ComputeWardenTools.Stats());
 

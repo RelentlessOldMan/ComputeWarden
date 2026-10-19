@@ -1,15 +1,16 @@
 # ComputeWarden — Design
 
 > This document records the design decisions and why they were made. For usage, see the
-> README.
+> README. §1–§15 describe the original design; §16 is how claims work since 2.0, and wins
+> where they differ.
 
 ## 1. Summary
 
 ComputeWarden is a **cooperative, machine-wide traffic cop** for resource-intensive
-work. A tool asks "is it safe to begin intensive work?"; the warden answers from a set
-of **blockers** (detected processes, active reservations, a manual override) and, if
-clear, atomically hands out an expiring **reservation**. Nothing is enforced — it
-coordinates well-behaved tools by convention.
+work. A tool claims its build, test or run; the warden hands out an expiring **claim** with
+**advice** (full, throttled, or queued), from a set of **blockers** (detected processes such
+as games, the user's manual hold, a running timing run) and the other claims (§16). Nothing
+is enforced — it coordinates well-behaved tools by convention.
 
 ## 2. Locked decisions
 
@@ -20,7 +21,7 @@ coordinates well-behaved tools by convention.
 | Daemon lifecycle | The first MCP adapter or `cw` call starts it if missing (race-safe via named mutex); **runs until reboot** (idle-timeout deferred) |
 | Topology | Daemon = single source of truth; thin per-client MCP adapter forwards over a **named pipe** |
 | IPC transport | Named pipe `\\.\pipe\ComputeWarden`, newline-delimited JSON, versioned |
-| Reservations | **Exclusive per resource** (cpu/gpu/ram/network/disk; holds conflict only where they overlap, default all); `reservation_id` is a **bearer capability** |
+| Claims | Shared by default; one big-memory job at a time; solo for short timing runs (§16). `reservation_id` is a **bearer capability** |
 | Persistence | None for reservations/process blockers; config persisted; manual blocker persistence deferred |
 | Portability | Windows-first; process enumeration + pipe path behind interfaces for a future Linux port |
 
@@ -29,23 +30,19 @@ coordinates well-behaved tools by convention.
 State is **derived**, never stored as a boolean:
 
 ```
-blockers = reservations + ProcessProvider.Get() + ManualProvider.Get()
+blockers = ProcessProvider.Get() + ManualProvider.Get() + the running solo claim, if any
 
 if any provider failed in a way that affects confidence:  UNKNOWN
 elif blockers.Any():                                       BUSY
 else:                                                      AVAILABLE
 ```
 
-Every blocker occupies a **resource set** (`cpu | gpu | ram | network | disk`, a flags enum).
-Machine-wide `BUSY` means *something* is held; `busy_resources` says what. Availability for a
-specific request only considers blockers that overlap it. Anything that doesn't name its
-resources (an old client, a process rule without `resources`, a bare manual hold) occupies
-**all** of them, which is exactly the pre-resource "exclusive machine" behavior. Old clients
-and old daemons therefore interoperate conservatively, with no protocol version bump.
+Shared and big-memory claims are not blockers: they never make the machine `BUSY`. `BUSY`
+means a game or other configured program runs, the hold is on, or a timing run has the
+machine.
 
 - **UNKNOWN** is not a blocker; it means "couldn't compute the blocker set."
-  It is fail-conservative: a legacy acquire under UNKNOWN is refused, an exclusive one
-  queued, and a shared claim is throttled as if a game held its resources (§16 rule 7).
+  It is fail-conservative: claims are treated as if a game were running (§16 rules).
 - Debounce (`available_after_ms`) lives **inside** the ProcessProvider, so acquire
   automatically respects the "recently-seen" grace window without special-casing.
 
@@ -61,7 +58,7 @@ record Blocker(
     DateTimeOffset? CreatedAt,
     DateTimeOffset? ExpiresAt,
     IReadOnlyDictionary<string,string>? Metadata,
-    ResourceSet Resources = ResourceSet.All);
+    ResourceSet Resources = ResourceSet.All); // kept for the wire; 2.0 ignores it
 ```
 
 `IBlockerProvider { ProviderResult GetBlockers(); }` (blockers + a confidence flag) is the
@@ -73,30 +70,27 @@ Single lock, atomic check-and-create:
 
 ```
 lock (state):
-    expire stale reservations
+    expire stale claims
     blockers = collect from all providers        // uses last process snapshot
-    if any provider unconfident:    return { acquired:false, reason:"UNKNOWN", ... }
-    conflicts = blockers overlapping requested resources (default: all)
-    if conflicts.Any():             return { acquired:false, blockers: conflicts }
-    r = new Reservation(id, owner, desc, resources, lease clamped to [min,max])
-    reservations.add(r)
-    return { acquired:true, reservationId:r.Id, expiresAt:r.ExpiresAt, resources }
+    r = new claim(id, owner, desc, kind, bigMemory, lease)
+    claims.add(r)
+    plan = one first-come-first-served pass over the claims that haven't started (§16 rules)
+    advice = plan[r]                             // full, throttled, or queued
+    if advice isn't queued: r starts now
+    return { acquired:true, reservationId:r.Id, advice, expiresAt, blockers }
 ```
 
 Notes:
+- Only an invalid request (empty owner, a negative estimate, a solo over 10 minutes,
+  `kind: exclusive`, oversized fields) is refused. Every valid one gets a claim.
 - Acquire checks the **last process poll snapshot** (up to `poll_interval_ms` stale) — it
-  does *not* trigger a fresh enumeration. The
-  cooperative contract only promises "known-safe at acquisition time," not guaranteed
-  exclusivity.
+  does *not* trigger a fresh enumeration. The cooperative contract only promises
+  "known-safe at acquisition time".
 - Lease seconds are clamped server-side to `[minimum_seconds, maximum_seconds]`, never below 1s.
-- UNKNOWN refuses every legacy acquire, even one for resources nothing appears to hold: if
-  the process list can't be read, nothing is known to be free.
-- There is no "add resources to my reservation" operation. A second acquire is an unrelated
-  reservation, and growing holds piecemeal is the hold-and-wait pattern that lets two agents
-  stall on each other. Agents request everything in one call; if needs change, they release
-  and re-acquire.
-- A process starting *after* a reservation is granted adds a second blocker; the existing
-  reservation is **not** revoked.
+- Because the pass runs under the lock, two big-memory claims arriving together can't both
+  be told full: one runs, the other is first in line.
+- A game starting *after* a claim starts doesn't revoke it; the claim's next renew says
+  throttled.
 
 ## 6. Reservations & leases
 
@@ -111,8 +105,9 @@ Notes:
 
 ## 7. Manual override
 
-- `set_manual_busy(reason, resources?)` / `clear_manual_busy()` create/remove a single MANUAL
-  blocker, visually distinct in status.
+- `set_manual_busy(reason)` / `clear_manual_busy()` turn the user's hold on and off: a single
+  MANUAL blocker, visually distinct in status. While it's on, running claims are throttled
+  and nothing new starts (§16).
 - May be disabled via config if only admins should control it.
 
 ## 8. Process monitoring
@@ -120,8 +115,7 @@ Notes:
 - Poll every `poll_interval_ms` (default 2000). Use a **cheap name-only enumeration**
   (`Process.GetProcesses()` reading `ProcessName`, no per-process handle inspection).
 - Match against enabled `process_rules` by executable name (case-insensitive, with/without
-  `.exe`; a directory in the rule is ignored). Each rule may name the `resources` it
-  occupies (default all). Command-line/regex matching are not implemented.
+  `.exe`; a directory in the rule is ignored). Command-line/regex matching are not implemented.
 - Enumeration failure → provider reports low confidence → state UNKNOWN.
 - **No log spam:** log only transitions (blocker appeared / cleared), never "still running."
 
@@ -129,8 +123,8 @@ Notes:
 
 - Pipe: `\\.\pipe\ComputeWarden`. Restrict ACL to the current user/session.
 - Wire: one JSON object per line (request), one per line (response). `v` field for version.
-- Requests: `STATUS | CAN_RUN | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY | SET_MODE | STATS`.
-- Server validates every input: string/metadata size caps, lease bounds, resource names;
+- Requests: `STATUS | CAN_RUN | ACQUIRE | RENEW | RELEASE | SET_MANUAL_BUSY | CLEAR_MANUAL_BUSY | STATS`.
+- Server validates every input: string/metadata size caps, lease bounds, kinds, estimates;
   unknown ops get a structured error (never crash the pipe loop). Request lines are capped
   at 256K characters *while reading*, and idle connections are dropped after 30s.
 - Versioning is additive: the daemon serves any `v` up to its own and ignores unknown
@@ -138,11 +132,11 @@ Notes:
 
 ```jsonc
 // request
-{ "v": 1, "op": "ACQUIRE", "owner": "Claude Code", "description": "indexing",
-  "leaseSeconds": 300, "resources": ["cpu", "disk"] }
+{ "v": 1, "op": "ACQUIRE", "owner": "Claude Code", "description": "dotnet build",
+  "kind": "shared", "estimateSeconds": 90 }
 // response
-{ "v": 1, "ok": true, "acquired": true, "resources": ["cpu", "disk"], "reservationId": "7f93…",
-  "expiresAt": "…", "machineState": "BUSY", "reason": null, "blockers": [] }
+{ "v": 1, "ok": true, "acquired": true, "kind": "shared", "reservationId": "7f93…",
+  "advice": { "grant": "full", … }, "expiresAt": "…", "machineState": "AVAILABLE", "blockers": [] }
 ```
 
 ## 10. MCP adapter (`ComputeWarden.Mcp`)
@@ -179,7 +173,7 @@ ComputeWarden.slnx
 │   ├── ComputeWarden.Daemon/      # ProcessMonitor, LeaseSweeper, named-pipe server, host, logs
 │   ├── ComputeWarden.Client/      # IPC client library (used by the adapter and cw)
 │   ├── ComputeWarden.Mcp/         # stdio MCP adapter + auto-spawn logic
-│   └── ComputeWarden.Cli/         # cw: status and modes from a terminal
+│   └── ComputeWarden.Cli/         # cw: status, the hold, and cw wait
 └── tests/
     └── ComputeWarden.Tests/       # xUnit
 ```
@@ -197,173 +191,126 @@ An expiry is logged as "owner did not release", the main sign of an agent misusi
 
 ## 14. Test plan
 
-- **Reservation:** acquire-when-available, acquire-when-reserved, release, renew, expiry,
-  invalid id, double release, **concurrent acquire → exactly one winner** (critical).
+- **Rules** (`RulesTests`): everyday work side by side, gaming throttle and the game-jobs
+  cap, the hold, UNKNOWN, one big-memory job at a time, solo, the line's order, check-in
+  windows, leases from estimates, long-poll, save/restore.
+- **Concurrency:** 256 big-memory acquires at once → exactly one runs, the rest are 1..255
+  in line (critical).
 - **Process:** appears / disappears, multiple, unconfigured ignored, monitor failure→UNKNOWN,
   availability debounce.
-- **Combined:** process+reservation, manual+process, process starts during reservation,
-  reservation expires while process blocker persists.
-- **Failure:** client disappears, daemon restart clears stale reservations, malformed IPC,
-  corrupt config, oversized metadata rejected, rapid acquire/release.
-- Core state/acquire logic tested with a fake clock + fake process provider (no real
-  processes needed for the critical concurrency test).
+- **Wire** (`WireTests`): dispatcher, client, MCP tools and `cw` over a real pipe; malformed
+  IPC, corrupt config, oversized metadata, a client hanging up mid-wait.
+- Core logic is tested with a fake clock + fake process provider (no real processes needed).
 
 ## 15. Definition of done
 
-Two agents, one machine: A acquires, B is refused and told A is the blocker, A renews then
-releases, B then acquires. If A crashes, its lease expires and the machine frees up. A
-configured external process blocks both until it exits. When that scenario passes
-reliably, v1 is done.
+Two agents build side by side at full speed. The user starts a game: both are told to run
+small on their next renew, and a fourth job waits for a slot. The game exits: everyone is
+told full again. Two big-memory jobs never run together, and a timing run gets a quiet
+machine. If an agent crashes, its lease expires and its slot frees up.
 
 ## 16. Shared work, advice, and the line
 
-> Status: built (`Warden.Evaluate`, `SharingTests`, `SharingIpcTests`). Everything below is **advisory**. The warden tells agents
+> Status: built (`Warden.Evaluate`, `RulesTests`, `WireTests`). Everything below is **advisory**. The warden tells agents
 > how big to run; it never caps, kills, or reprioritizes a process.
 
 ### Motivation
 
-Before this, the warden only answered yes or no, and only for jobs heavy enough to bother asking.
-Everyday builds, test runs, and app launches never asked, so they piled onto the machine while
-a game was running, or crawled along at one core after it had quit. The target behavior is
-what a human would tell several sessions by hand: *"I'm gaming, keep it small"*, and later
-*"I'm done with my game, go full ham as long as you have the lease."* The aim is for
-sessions to get that answer from the warden, live, without being told.
+The user wants three things from the warden, and nothing more:
 
-### Claim kinds
+1. **Gaming:** while the user games, agent work runs small and only a few jobs at a time, so the
+   game's fps holds. Afterwards everyone goes full speed again without being told by hand.
+2. **Memory:** two sessions don't each fill the machine's memory at once.
+3. **Timing:** a session can get a quiet machine for a short timing run.
 
-| Kind | Created by | Meaning |
+Before 2.0 the warden had more: exclusive claims per resource, resource sets on every claim,
+user modes (steady/open/hold), `userPriority`, and a line the user could reorder. They didn't
+serve these goals better and made the advice hard to predict (sessions saw "running full,
+exclusive" beside others throttled for no reason the user wanted), so 2.0 removed them.
+
+### Claims
+
+| Claim | Request | Rule |
 |---|---|---|
-| **Priority** | Config process rules (games, etc.) | **The user's own lease.** Gaming means the user holds those resources. Non-negotiable: never queued, asked, or throttled, and every agent on those resources is limited for as long as it runs. |
-| **Exclusive** | Agent heavy job (`acquire` with `kind: exclusive`) | Will saturate these resources. One holder per resource; the rest wait in line or run throttled. |
-| **Shared** | Agent everyday build/test/run | Normal work. Never refused; told how big it may run right now. With no `resources`, it means cpu+ram (not all), so a GPU-using game throttles a build instead of queuing it. |
-| **Solo** | Agent timing test or benchmark (`kind: solo`) | Needs a quiet machine. Always the whole machine and `whenBusy: wait`. It holds only once no other claim runs or holds; while it waits in line or holds, no claim behind it starts (shared included) and a legacy acquire is refused. A game still comes first. |
+| **Shared** | `kind: shared` (the default) | Every build, test and run. `full` unless the machine is slowed (below), then `throttled`. Shared claims never block each other. |
+| **Big memory** | `bigMemory: true` | A shared claim that needs more than ~8 GB and can't cap its memory. At most one runs at a time; the next is `queued` until it ends. It doesn't hold up claims that aren't big-memory. |
+| **Solo** | `kind: solo` | A timing run of at most 10 minutes (`MaxSoloSeconds`). Starts only when nothing else runs and nothing slows the machine; while it runs, nothing new starts, and while it waits, only work that ends first (rule 3). Its lease never reaches past 10 minutes after it starts, whatever it asks for. A longer `estimateSeconds` is refused. |
 
-Agent claims (exclusive, shared, solo, and queue tickets) are all **leases**: renew, release,
-and crash-safe expiry are unchanged. A lease just gains a `kind` and the warden's current
-**advice**.
+`kind: exclusive` is refused with an error naming what to use instead. Claims are leases:
+renew, release, and crash-safe expiry work as in §6.
 
-### Request and answer
+### Answer
 
-```
-acquire(owner, description, resources, kind: "shared" | "exclusive",
-        estimateSeconds, cores?, ramGb?, whenBusy: "throttle" | "wait",
-        userPriority?: "<why the user said so>")
-```
-
-| Mode | Meaning |
+| Grant | Meaning |
 |---|---|
-| `full` | Nothing in the way; run normally. For an exclusive claim: go full ham while the lease is held. |
-| `throttled` | Run, but small: `{max_cores, priority, max_ram_gb, reason, how}`, where `how` is a concrete hint (`dotnet build -m:1`, `dotnet test -- RunConfiguration.MaxCpuCount=1`). |
-| `queued` | In line: `{position, ahead[], est_wait_seconds}`. Check back via renew. The estimate is null when a game, hold, or steady mode is in the way, since nobody knows when that ends. |
+| `full` | Run normally. |
+| `throttled` | Run small: `{max_cores, priority, max_ram_gb}` plus `how`, a concrete hint (`dotnet build -m:1`, `start /belownormal`, keep memory under 2 GB, keep off the GPU). |
+| `queued` | Don't start: `{position, ahead[], est_wait_seconds}` and a reason. The estimate is null when a game or hold is in the way, since nobody knows when that ends. |
 
 ### Rules
 
-1. A **priority** claim on a resource throttles everything else on that resource, always.
-   No mode, lease, or `userPriority` overrides it. If the
-   resource can't be shared (config; by default every resource except `gpu` can be), the
-   request is queued instead.
-2. An **exclusive** claim gets `full` when its resources are free *and* nobody ahead of it
-   in line wants them. Otherwise it gets `throttled` or `queued`, per `whenBusy`
-   (default `throttle`).
-3. A **shared** claim gets `full` unless a priority or exclusive claim overlaps it, in
-   which case it gets `throttled`. It is only queued before it starts: by a hold, by an
-   unshareable resource (rule 1), or by the throttle cap (rule 4). Shared claims block
-   neither each other nor exclusive claims; they're short and polite, and they're told to
-   shrink on their next check.
-4. **Throttle cap:** at most `max_throttled_per_resource` (default 3) throttled claims on
-   each contended resource, counted per resource (one throttled claim each on cpu, ram, and
-   disk leaves two slots on each). Beyond that, a new request is queued. Shared tickets
-   queued by the cap keep their order: a freed slot goes to the earliest waiter, not to a
-   newcomer. The cap applies only to *new* starts: **work that has started is never told
-   `queued`**, only `throttled`. It can't un-start, and telling it to stop would just be
-   ignored.
-   Where a game runs, the user's **jobs while gaming** (picked on the monitor panel, 0 to 4,
-   kept across restarts) replaces the cap. Measured on a 6-core desktop, a game's fps falls
-   with the memory traffic of the work beside it, roughly per busy core, whatever its
-   priority; with one core per throttled job, this number is the one knob that controls it.
-5. **The line is first come, first served.** A newcomer can't get `full` ahead of an
-   earlier waiter for an overlapping resource. A waiting exclusive claim is promoted to the
-   hold as soon as it's at the front and its resources are free (on any request or the
-   5-second sweep). It then holds them through its check-in window, so a waiting agent
-   should renew with `waitSeconds`, which hears the promotion at once. A `whenBusy: wait`
-   claim is never told `throttled` before it starts: if a game or steady mode arrives
-   between its promotion and its check-in, it stays `queued`, keeping its hold.
-6. **Skipping the line:** `userPriority` puts the request at the front of the line. It
-   never takes resources from current holders (advisory), and it is logged and shown in
-   status. Agents set it only when the user has told them they have priority.
-7. **UNKNOWN:** exclusive claims are queued (refused with `whenBusy: refuse`; throttled if already running),
-   and nobody is promoted.
-   Shared claims are treated as if a game held all their resources: throttled, with the
-   cap, and queued if they need the gpu. Holds and hold mode still apply, since they're
-   known even when the process list isn't.
-8. **Legacy acquires** (no `kind`) are also refused when anyone is in line for an
-   overlapping resource. They can't jump the queue.
+The machine is **slowed** while a configured process (a game) runs, while the user's manual
+hold is on, or while the state is UNKNOWN (the process list can't be read, so a game can't be
+ruled out).
+
+1. **Slowed:** every running claim is told `throttled`. At most `game_jobs` claims (default 3,
+   0..12, set on the panel and kept across restarts) run; later ones are `queued`. Measured on
+   a 6-core desktop, a game's fps falls with the memory traffic of the work beside it, roughly
+   per busy core, whatever its priority; with one core per throttled job, this number is the
+   knob that controls it. Work already running is never told `queued`, only `throttled`: it
+   can't un-start. A **hold** is stricter: nothing new starts.
+2. **Big memory:** a big-memory claim is `queued` while another big-memory claim runs.
+3. **Solo:** a solo claim is `queued` until nothing else runs and the machine isn't slowed.
+   Running work isn't affected: it finishes, and then the solo claim starts. While a solo
+   claim runs, every claim behind it is `queued`. While it waits for running work, a claim
+   behind it may still start (**backfill**) if its `estimateSeconds` says it ends no later
+   than the running work should, so it uses the gap without delaying the timing run. A claim
+   with no estimate, or another solo claim, waits. While a solo claim waits for a game or the
+   hold, nothing behind it starts: nobody knows when that ends.
+4. **The line is first come, first served.** One pass over the claims that haven't started,
+   in arrival order, decides each one's grant. A claim whose turn has come counts as running
+   from then on, so its slot is kept for it through its check-in window and a newcomer can't
+   take it. There is no way to skip or reorder the line.
 
 ### Checking back
 
 `renew` returns the current advice, so advice tracks the machine while work is running:
 
-- If a game starts during an exclusive job, the next renew says `throttled: Overwatch
-  started`. The running process won't shrink, but the agent's next step will be smaller.
+- If a game starts, the next renew says `throttled`. The running process won't shrink, but
+  the agent's next step will be smaller.
 - If the game exits, a throttled claim's next renew says `full`, and new claims get `full`
-  straight away. This is the automatic "go full ham".
-- A queued ticket's renew returns its position, or its promotion to `full`. Tickets must
-  check in every `queue_checkin_seconds` (default 120), or they drop out of line, so a
-  crashed agent can't stall the queue. The ticket's lease is the check-in window until it
-  starts. A renew marked `probe` (what `cw wait` sends) checks the ticket in and reports its
-  advice, but never starts the claim, even when its turn has come: it stays a ticket with the
-  check-in window until its owner renews, and that renew starts it with its real lease. So an
-  owner that is woken and never starts drops out as a ticket within one window, and the slot
-  passes to the next in line. Until then, waiters behind it count its full estimate.
+  straight away.
+- A queued ticket's renew returns its position, or `full`/`throttled` when its turn comes.
+  Tickets must check in every `queue_checkin_seconds` (default 120), or they drop out of
+  line, so a crashed agent can't stall the queue. The ticket's lease is the check-in window
+  until it starts. A renew marked `probe` (what `cw wait` sends) checks the ticket in and
+  reports its advice, but never starts the claim, even when its turn has come: it stays a
+  ticket with the check-in window until its owner renews, and that renew starts it with its
+  real lease. So an owner that is woken and never starts drops out within one window, and
+  the slot passes to the next in line.
 - **`cw wait <id>`:** long-polls a queued claim's probe renew in a loop and exits when it may
   start (0), when the claim is gone (1), after `--max` (default 1h) still queued (3), or when
-  the daemon stays unreachable after a few retries (4). An agent runs
-  it as a background command, so it does other work and is woken on exit instead of polling.
-  The cap means a waiter whose session died can't keep a dead ticket in line for ever.
+  the daemon stays unreachable after a few retries (4). An agent runs it as a background
+  command, so it does other work and is woken on exit instead of polling.
 - **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
   grant differs from the last one it was told, or the wait runs out. The claim is kept alive
-  for the wait (plus 15 s), so a short lease or check-in window can't run out mid-wait. The
-  dispatcher polls `Warden.PeekGrant` once a second, and then does the real renew. So
-  waiting agents don't burn tokens polling, and a game exit reaches them within about a
-  second. An unknown id answers at once.
+  for the wait (plus 15 s). The dispatcher polls `Warden.PeekGrant`, then does the real
+  renew. An unknown id answers at once.
 
-### User override: the mode
+### The user's controls
 
-One machine-wide setting that only the user sets. It adjusts how agents treat *each other*.
-It never loosens a priority claim: while a game is running, everyone on its resources is
-limited, in every mode.
+- **Manual hold:** `cw hold [reason]` / `cw hold off`, the panel's Hold switch, or an agent
+  calling `computewarden_set_manual_busy` on the user's explicit word. See rule 1.
+- **Jobs while gaming:** the panel's picker (0 to 4), or `game_jobs` in the config.
 
-| Mode | Says | Effect |
-|---|---|---|
-| `hold` | "Nobody start anything." | Every new claim is queued; work already running is throttled (rule 4). |
-| `steady` | "Y'all go slow and steady." | Everything gets `throttled`; nobody gets `full`, and the throttle cap applies. The gpu runs throttled too unless someone else is on it. Exclusive claims are throttled or queued, per `whenBusy`, and none is promoted to a hold until the mode ends. |
-| `auto` | (default) | The rules above. |
-| `open` | "Full bore allowed with a lease." | No throttling between agents: shared work runs `full` beside exclusive leases, with no throttle cap between agents. A game still throttles, and its cap still applies (checked per resource). Exclusive leases still keep two heavy jobs off the same resource. |
-
-- A mode can take `resources` (e.g. `steady` for cpu only), an optional duration (`steady`
-  for 2h, then back to `auto`), and a reason. The reason is shown to agents in their advice:
-  `throttled: user set steady mode ("gaming tonight")`.
-- Running agents pick up a mode change on their next renew, the same way they notice a game
-  starting or stopping.
-- **Ways to set it:** a small CLI (`cw mode steady 2h "gaming"`, also runnable as
-  `! cw mode open` inside a Claude Code session), or by telling any agent, which calls
-  `computewarden_set_mode`. The tool is documented as user-only: an agent calls it only on
-  the user's explicit word, never on its own judgment (the same trust model as
-  `userPriority`).
-- Non-auto modes other than `open` also show as a synthetic `mode` blocker in status, so
-  legacy clients and `can_run` see the machine as busy.
-- `set_manual_busy` and `clear_manual_busy` stay as their own separate provider, not as aliases
-  for the mode. A manual hold acts like `hold` on its resources, and clearing it doesn't
-  touch the mode.
+Both are the user's call: the panel only accepts them from a monitor, never from another app
+on the hub.
 
 ### Estimates
 
-Agents supply `estimateSeconds`, and optionally `cores` and `ramGb`. None is used for core
-arithmetic. The estimate feeds queue wait estimates (time left on the holder plus the jobs
-ahead; a promoted holder that hasn't checked in yet counts its whole estimate) and the
-default lease length: once started, a claim with an estimate and no `leaseSeconds` gets
-`ceil(estimate × 1.25) + 30` seconds, clamped to the lease bounds. `cores` and `ramGb` are
-recorded for future use; nothing shows them yet.
+Agents supply `estimateSeconds`. It feeds queue wait estimates (time left on the running
+claims in the way) and the default lease: once started, a claim with an estimate and no
+`leaseSeconds` gets `ceil(estimate × 1.25) + 30` seconds, clamped to the lease bounds.
 
 ### Config (defaults)
 
@@ -372,42 +319,43 @@ sharing:                     # hot-reloads with the rest of the config
   throttle_max_cores: 1
   throttle_priority: below_normal   # or idle
   throttle_max_ram_gb: 2
-  max_throttled_per_resource: 3
-  unshareable: [gpu]
+  game_jobs: 3
   queue_checkin_seconds: 120
 ```
 
+`max_throttled_per_resource` (before 2.0) is read as `game_jobs`; `unshareable` and rule
+`resources` are accepted and ignored.
+
 ### Compatibility
 
-An acquire without `kind` behaves as it did before claim kinds: an exclusive claim that is
-refused rather than queued. Old adapters and old CLAUDE.md wording keep working, with no IPC version
-bump.
+The IPC version stays 1. An acquire without `kind` is a shared claim. `resources`, `whenBusy`,
+`cores`, `ramGb` and `userPriority` in a request are ignored; `SET_MODE` is an unknown op. A
+saved state from before 2.0 (version 1) loads: its exclusive claims come back as shared, and
+its mode is dropped.
 
-### Agent policy change
+### Agent policy
 
-For this to work, every session reports its builds, tests, and runs as shared claims
-(about two small tool calls per command) in every project, not just opted-in ones. The
-global CLAUDE.md rule becomes:
-
-- Report builds, tests, and runs as shared claims, and follow the advice.
-- Use exclusive claims for genuinely heavy jobs.
-- Set `userPriority` only on the user's word.
+Every session claims its builds, tests, and runs (two small tool calls per command) in every
+project, sets `bigMemory` only for jobs over ~8 GB that can't cap themselves, uses `solo` only
+for timing runs under 10 minutes, and follows the advice. Projects need no ComputeWarden notes
+of their own beyond naming which of their jobs are big-memory or solo.
 
 ### Example
 
-Overwatch is configured as `[cpu, gpu, ram]`; shared builds default to cpu+ram.
+Overwatch is in `process_rules`; `game_jobs` is 3.
 
 ```
-10:00  A: shared build (cpu)            → full
-10:01  B: exclusive test fan-out (cpu), estimate 5 min
-                                        → full     (A's next check: throttled by B)
-10:02  C: exclusive indexing (cpu,disk), whenBusy: wait
-                                        → queued #1, ~5 min
-10:03  User starts Overwatch            → B's renew: throttled; A's: throttled
-10:04  D: shared build                  → throttled (cpu slots: A, B, D: the cap of 3)
-10:05  E: shared build                  → queued #1 (throttle slots full on cpu); no estimate
-10:07  B releases                       → a cpu slot frees: E's renew says throttled.
-                                          C stays queued (Overwatch is priority)
-10:40  Overwatch exits                  → C is promoted and its renew says full;
-                                          D and E stay throttled by C's hold on cpu,disk
+10:00  A: shared build                  → full
+10:01  B: big-memory index, est 20 min  → full
+10:02  C: big-memory index              → queued #1, ~19 min ("B is running a big-memory job")
+10:03  D: shared test run               → full (C waiting doesn't hold D up)
+10:05  User starts Overwatch            → A, B, D: next renew says throttled
+10:06  E: shared build                  → queued #2 (3 jobs may run while gaming, all taken)
+10:08  A releases                       → C still waits on B (big memory), so A's slot goes
+                                          to E: its renew says throttled
+10:21  B releases                       → C's renew says throttled (the third slot)
+10:40  Overwatch exits                  → C, D, E: next renew says full
+10:45  T: solo timing run               → queued: waits for C, D, E (the last should end at 10:55)
+10:46  F: shared test, est 5 min        → full: it ends before 10:55, so T isn't delayed
+10:47  G: shared build, est 15 min      → queued behind T
 ```

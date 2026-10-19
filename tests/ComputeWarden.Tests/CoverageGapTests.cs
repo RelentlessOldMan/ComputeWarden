@@ -161,26 +161,17 @@ public class ClientCompatibilityTests
     }
 
     [Fact]
-    public async Task Blockers_from_a_daemon_without_resources_hold_the_whole_machine()
+    public async Task Status_from_a_1x_daemon_parses_and_its_extra_fields_are_ignored()
     {
         var status = await AgainstFakeDaemon(
-            """{"v":1,"ok":true,"state":"BUSY","canRunIntensive":false,"blockers":[{"id":"r1","type":"RESERVATION","source":"x","description":"old"}]}""",
+            """{"v":1,"ok":true,"state":"BUSY","busyResources":["gpu","npu"],"mode":{"mode":"steady"},"blockers":[{"id":"r1","type":"PROCESS","resources":["gpu"]}],"claims":[{"id":"c","owner":"O","description":"d","kind":"exclusive","grant":"queued","holding":false}]}""",
             c => c.StatusAsync());
 
-        Assert.Equal(ResourceSet.All, Assert.Single(status.Blockers).Resources);
-        Assert.Equal(ResourceSet.None, status.BusyResources); // field absent, not guessed
-    }
-
-    [Fact]
-    public async Task Unknown_resource_names_from_a_newer_daemon_are_ignored_not_fatal()
-    {
-        var status = await AgainstFakeDaemon(
-            """{"v":1,"ok":true,"state":"BUSY","busyResources":["gpu","npu"],"blockers":[{"id":"r1","type":"PROCESS","resources":["gpu","npu"]}]}""",
-            c => c.StatusAsync());
-
-        Assert.Equal(ResourceSet.Gpu, status.BusyResources);
-        Assert.Equal(ResourceSet.Gpu, Assert.Single(status.Blockers).Resources);
-        Assert.Equal(BlockerType.Process, status.Blockers[0].Type);
+        Assert.Equal(BlockerType.Process, Assert.Single(status.Blockers).Type);
+        Assert.Null(status.GameJobs);
+        var claim = Assert.Single(status.Claims!);
+        Assert.Equal(ClaimKind.Shared, claim.Kind);
+        Assert.Equal(ClaimPhase.Waiting, claim.Phase); // no phase sent: read from the grant
     }
 
     [Fact]
@@ -203,14 +194,15 @@ public class ClientCompatibilityTests
     }
 
     [Fact]
-    public async Task Acquire_parses_granted_resources_and_expiry()
+    public async Task Acquire_parses_kind_big_memory_and_expiry()
     {
         var result = await AgainstFakeDaemon(
-            """{"v":1,"ok":true,"acquired":true,"reservationId":"abc","expiresAt":"2026-10-06T12:00:00.0000000+00:00","machineState":"BUSY","resources":["cpu","disk"],"blockers":[]}""",
-            c => c.AcquireAsync("A", "w", resources: new[] { "cpu", "disk" }));
+            """{"v":1,"ok":true,"acquired":true,"reservationId":"abc","expiresAt":"2026-10-06T12:00:00.0000000+00:00","machineState":"BUSY","kind":"shared","bigMemory":true,"blockers":[]}""",
+            c => c.AcquireAsync(new ClaimRequest("A", "w", BigMemory: true)));
 
         Assert.True(result.Acquired);
-        Assert.Equal(ResourceSet.Cpu | ResourceSet.Disk, result.Resources);
+        Assert.Equal(ClaimKind.Shared, result.Kind);
+        Assert.True(result.BigMemory);
         Assert.Equal(new DateTimeOffset(2026, 10, 6, 12, 0, 0, TimeSpan.Zero), result.ExpiresAt);
     }
 }

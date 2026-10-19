@@ -8,36 +8,27 @@ using ComputeWarden.Core.Model;
 namespace ComputeWarden.Cli;
 
 /// <summary>
-/// <c>cw</c>: the user's own controls. Shows what's running and sets the user mode
-/// ("y'all go slow and steady", "full bore allowed"), which agents only do on the user's word.
-/// Also <c>cw wait</c>, which agents run in the background to hear when a queued claim may start.
+/// <c>cw</c>: the user's own controls. Shows what's running and turns the manual hold on and off
+/// (which agents only do on the user's word). Also <c>cw wait</c>, which agents run in the
+/// background to hear when a queued claim may start.
 /// </summary>
 internal static class Cli
 {
     public const string Usage = """
         Usage:
           cw                         Show status (same as 'cw status').
-          cw status                  Mode, what holds each resource, and every agent claim.
-          cw mode                    Show the current mode.
-          cw mode <mode> [for] [<duration>] [<reason>...] [--resources cpu,ram,...]
-                                     Set the mode. Duration like 90m, 2h, 1h30m, 1d (at most 7d);
-                                     omit to keep it until changed. Examples:
-                                       cw mode steady 2h gaming
-                                       cw mode open
-                                       cw mode hold 30m "recording a video"
-                                       cw mode auto
+          cw status                  Games, the hold, and every agent claim.
+          cw hold [<reason>...]      Turn the manual hold on: nothing new starts and running work
+                                     is told to run small, as if a game ran. Example:
+                                       cw hold recording a video
+          cw hold off                Turn the manual hold off.
           cw wait <reservationId> [--max <duration>]
                                      Wait until a queued claim may start, keeping it alive in line,
                                      then print its advice. For agents: run it in the background.
                                      Gives up after --max (default 1h). Exit codes: 0 your turn,
                                      3 still queued (run it again), 1 claim gone (acquire again),
                                      4 daemon unreachable (run it again).
-        Modes:
-          auto     Normal rules: games limit everyone; agents share by the line.
-          steady   Everyone runs throttled (slow and steady). Nobody goes full.
-          open     No throttling between agents; exclusive holds still keep heavy jobs apart.
-          hold     Nobody starts new work; work already running is throttled.
-        No mode ever overrides a running game (configured priority process).
+        How many jobs may run while you game is set on the panel (jobs while gaming).
         """;
 
     private static readonly TimeSpan StartupWait = TimeSpan.FromSeconds(8);
@@ -49,7 +40,7 @@ internal static class Cli
         try
         {
             var command = args.Length == 0 ? "status" : args[0].ToLowerInvariant();
-            if (launch is not null && command is "status" or "mode")
+            if (launch is not null && command is "status" or "hold")
                 await EnsureDaemonAsync(client, launch);
             switch (command)
             {
@@ -57,22 +48,14 @@ internal static class Cli
                     Print(await client.StatusAsync(), stdout, DateTimeOffset.UtcNow);
                     return 0;
 
-                case "mode" when args.Length == 1:
-                    var status = await client.StatusAsync();
-                    stdout.WriteLine(status.Mode is { } current
-                        ? $"Mode: {Describe(current, DateTimeOffset.UtcNow)}"
-                        : "Mode: (daemon is too old to report a mode)");
+                case "hold" when args.Length == 2 && args[1].ToLowerInvariant() is "off" or "clear":
+                    stdout.WriteLine(await client.ClearManualBusyAsync() ? "Hold off." : "No hold was on.");
                     return 0;
 
-                case "mode":
-                    if (!TryParseMode(args.Skip(1).ToArray(), out var req, out var error))
-                    {
-                        stderr.WriteLine(error);
-                        stderr.WriteLine("Run 'cw help' for usage.");
-                        return 2;
-                    }
-                    var set = await client.SetModeAsync(req.Mode, req.Resources, req.DurationSeconds, req.Reason);
-                    stdout.WriteLine($"Mode set: {Describe(set, DateTimeOffset.UtcNow)}");
+                case "hold":
+                    var reason = args.Length > 1 ? string.Join(' ', args.Skip(1)) : "held by the user";
+                    await client.SetManualBusyAsync(reason);
+                    stdout.WriteLine($"Hold on: {reason}. Nothing new starts until 'cw hold off'.");
                     return 0;
 
                 case "wait":
@@ -194,7 +177,7 @@ internal static class Cli
     }
 
     /// <summary>
-    /// Starts the daemon if it isn't running, so <c>cw mode steady</c> works before any agent
+    /// Starts the daemon if it isn't running, so <c>cw hold</c> works before any agent
     /// session has started one. A failed start falls through to the normal "could not reach".
     /// </summary>
     private static async Task EnsureDaemonAsync(WardenClient client, Func<bool> launch)
@@ -205,80 +188,9 @@ internal static class Cli
             await Task.Delay(150);
     }
 
-    public sealed record ModeRequest(UserMode Mode, int? DurationSeconds, string? Reason, string[]? Resources);
-
-    public static bool TryParseMode(string[] args, out ModeRequest request, out string? error)
-    {
-        request = new ModeRequest(UserMode.Auto, null, null, null);
-        error = null;
-
-        UserMode? mode = null;
-        int? duration = null;
-        string[]? resources = null;
-        var reason = new List<string>();
-
-        for (var i = 0; i < args.Length; i++)
-        {
-            var a = args[i];
-            if (a is "--resources" or "-r")
-            {
-                if (i + 1 >= args.Length) { error = "--resources needs a list, e.g. cpu,ram"; return false; }
-                resources = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                try { Resources.Parse(resources); }
-                catch (ArgumentException ex) { error = ex.Message; return false; }
-                continue;
-            }
-
-            if (mode is null)
-            {
-                mode = a.ToLowerInvariant() switch
-                {
-                    "auto" or "normal" => UserMode.Auto,
-                    "steady" or "slow" => UserMode.Steady,
-                    "open" or "full" => UserMode.Open,
-                    "hold" or "stop" => UserMode.Hold,
-                    _ => null,
-                };
-                if (mode is null) { error = $"Unknown mode '{a}' (expected auto, steady, open, or hold)."; return false; }
-                continue;
-            }
-
-            // The duration can go anywhere ("steady 2h gaming", "steady gaming for 2h"). Anything
-            // that looks like a duration must be one: a typo must not make the mode permanent.
-            var afterFor = a.Equals("for", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && LooksLikeDuration(args[i + 1]);
-            var token = afterFor ? args[i + 1] : a;
-            if (afterFor || LooksLikeDuration(token))
-            {
-                if (duration is not null) { error = $"Two durations ('{token}'): give one."; return false; }
-                if (!TryParseDuration(token, out var seconds))
-                {
-                    error = $"Bad duration '{token}' (use e.g. 90m, 2h, 1h30m, 1d; at most 7d).";
-                    return false;
-                }
-                duration = seconds;
-                if (afterFor) i++;
-                continue;
-            }
-            reason.Add(a);
-        }
-
-        if (mode is null) { error = "Missing mode (auto, steady, open, or hold)."; return false; }
-        if (mode == UserMode.Auto && (duration is not null || resources is not null))
-        {
-            error = "auto takes no duration or resources: it just ends the current mode.";
-            return false;
-        }
-
-        request = new ModeRequest(mode.Value, duration, reason.Count == 0 ? null : string.Join(' ', reason), resources);
-        return true;
-    }
-
     private static readonly Regex DurationPattern = new(
         @"^(?:(?<d>\d+)d)?(?:(?<h>\d+)h)?(?:(?<m>\d+)m)?(?:(?<s>\d+)s)?$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    /// <summary>Starts with a digit: meant as a duration ("2h", "1.5h", "10d"), so it must parse as one.</summary>
-    private static bool LooksLikeDuration(string text) => text.Length > 0 && char.IsAsciiDigit(text[0]);
 
     /// <summary>Parses 90m, 2h, 1h30m, 1d, 45s (a unit is required), at most 7 days.</summary>
     public static bool TryParseDuration(string text, out int seconds)
@@ -305,67 +217,45 @@ internal static class Cli
 
     public static void Print(StatusResult s, TextWriter w, DateTimeOffset now)
     {
-        if (s.Mode is { } mode) w.WriteLine($"Mode:    {Describe(mode, now)}");
-        var busy = s.BusyResources == ResourceSet.None ? "" : $" {Names(s.BusyResources)}";
-        w.WriteLine($"Machine: {s.State.ToString().ToUpperInvariant()}{busy}");
+        w.WriteLine($"Machine: {s.State.ToString().ToUpperInvariant()}");
         if (s.DaemonVersion is { } version) w.WriteLine($"Daemon:  v{version}");
 
         var games = s.Blockers.Where(b => b.Type == BlockerType.Process).ToList();
-        var manual = s.Blockers.Where(b => b.Type == BlockerType.Manual && b.Id != "mode").ToList();
+        var hold = s.Blockers.FirstOrDefault(b => b.Type == BlockerType.Manual);
         if (games.Count > 0)
         {
             w.WriteLine();
-            w.WriteLine("Priority (limits everyone):");
-            foreach (var b in games) w.WriteLine($"  {b.Description} {Names(b.Resources)}");
+            var jobs = s.GameJobs is int j ? $" ({j} job(s) may run, throttled)" : "";
+            w.WriteLine($"Gaming{jobs}:");
+            foreach (var b in games) w.WriteLine($"  {b.Description}");
         }
-        if (manual.Count > 0)
+        if (hold is not null)
         {
             w.WriteLine();
-            w.WriteLine("Manual holds:");
-            foreach (var b in manual) w.WriteLine($"  {b.Description} {Names(b.Resources)}");
+            w.WriteLine($"Hold: {hold.Description} (nothing new starts; 'cw hold off' to end it)");
         }
 
         var claims = s.Claims ?? Array.Empty<ClaimInfo>();
         w.WriteLine();
-        if (claims.Count == 0)
-        {
-            // Legacy daemon: reservations are only visible as blockers.
-            var holds = s.Blockers.Where(b => b.Type == BlockerType.Reservation).ToList();
-            if (holds.Count == 0) { w.WriteLine("No agent work reported."); return; }
-            w.WriteLine("Holds:");
-            foreach (var b in holds) w.WriteLine($"  {b.Description} {Names(b.Resources)} {Left(b.ExpiresAt, now)}");
-            return;
-        }
+        if (claims.Count == 0) { w.WriteLine("No agent work reported."); return; }
 
         w.WriteLine("Agent work:");
         foreach (var c in claims)
         {
-            var state = c.Kind != ClaimKind.Shared && c.Holding ? "holding"
-                : c.Position is int p && c.Grant == Grant.Queued ? $"queued #{p}"
-                : c.Position is int q ? $"{Warden.GrantName(c.Grant)}, #{q} in line"
-                : Warden.GrantName(c.Grant);
-            var extras = new List<string>();
-            if (c.EstimateSeconds is int e) extras.Add($"est {Span(e)}");
-            if (c.UserPriority is { } up) extras.Add($"user priority: {up}");
-            var tail = extras.Count == 0 ? "" : $" ({string.Join("; ", extras)})";
-            w.WriteLine($"  {state,-22} {Warden.KindName(c.Kind),-9} {c.Owner}: {c.Description} {Names(c.Resources)} {Left(c.ExpiresAt, now)}{tail}");
+            var state = c.Phase switch
+            {
+                ClaimPhase.Waiting => c.Position is int p ? $"queued #{p}" : "queued",
+                ClaimPhase.Ready => "its turn, not started",
+                _ => $"running {Warden.GrantName(c.Grant)}",
+            };
+            var kind = c.Kind == ClaimKind.Solo ? "solo" : c.BigMemory ? "big memory" : "shared";
+            var tail = c.EstimateSeconds is int e ? $" (est {Span(e)})" : "";
+            w.WriteLine($"  {state,-22} {kind,-10} {c.Owner}: {c.Description} {Left(c.ExpiresAt, now)}{tail}");
         }
-    }
-
-    public static string Describe(ModeState m, DateTimeOffset now)
-    {
-        if (m.Mode == UserMode.Auto) return "auto (normal rules)";
-        var text = Warden.ModeName(m.Mode);
-        if (m.Resources != ResourceSet.All) text += $" {Names(m.Resources)}";
-        if (m.ExpiresAt is { } e) text += $", {Span(Math.Max(0, (int)Math.Ceiling((e - now).TotalSeconds)))} left";
-        if (m.Reason is { } r) text += $": {r}";
-        return text;
     }
 
     private static string Left(DateTimeOffset? expiresAt, DateTimeOffset now)
         => expiresAt is { } e ? $"[lease {Span(Math.Max(0, (int)Math.Ceiling((e - now).TotalSeconds)))}]" : "";
-
-    private static string Names(ResourceSet set) => "[" + string.Join(",", Resources.ToNames(set)) + "]";
 
     public static string Span(int seconds)
     {

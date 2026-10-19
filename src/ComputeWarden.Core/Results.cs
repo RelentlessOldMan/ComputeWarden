@@ -3,23 +3,21 @@ using ComputeWarden.Core.Model;
 namespace ComputeWarden.Core;
 
 /// <summary>
-/// Complete current state, for the status operation. <see cref="Blockers"/> are what holds
-/// resources (processes, manual holds, a blocking user mode, exclusive holds);
-/// <see cref="Claims"/> lists every agent claim, including shared work and the line.
+/// Complete current state, for the status operation. <see cref="Blockers"/> are what keeps work
+/// small or waiting (games, the manual hold, a solo claim); <see cref="Claims"/> lists every
+/// agent claim, running and waiting.
 /// </summary>
 public sealed record StatusResult(
     MachineState State,
     bool CanRunIntensive,
     IReadOnlyList<Blocker> Blockers,
-    ResourceSet BusyResources = ResourceSet.None,
-    ModeState? Mode = null,
     IReadOnlyList<ClaimInfo>? Claims = null,
-    string? DaemonVersion = null);
+    string? DaemonVersion = null,
+    int? GameJobs = null);
 
 /// <summary>
-/// Outcome of an acquire. A legacy acquire (no kind) either holds its resources or is refused.
-/// A claim with a kind is always created (unless invalid) and carries <see cref="Advice"/>:
-/// full, throttled, or queued.
+/// Outcome of an acquire. A valid claim is always created and carries <see cref="Advice"/>:
+/// full, throttled, or queued. Only an invalid request is refused.
 /// </summary>
 public sealed record AcquireResult(
     bool Acquired,
@@ -28,19 +26,10 @@ public sealed record AcquireResult(
     MachineState MachineState,
     string? Reason,
     IReadOnlyList<Blocker> Blockers,
-    ResourceSet Resources = ResourceSet.None,
     Advice? Advice = null,
-    ClaimKind? Kind = null)
+    ClaimKind? Kind = null,
+    bool BigMemory = false)
 {
-    public static AcquireResult Success(Reservation r) => new(
-        Acquired: true,
-        ReservationId: r.Id,
-        ExpiresAt: r.ExpiresAt,
-        MachineState: MachineState.Busy,
-        Reason: null,
-        Blockers: Array.Empty<Blocker>(),
-        Resources: r.Resources);
-
     public static AcquireResult Claimed(Reservation r, Advice advice, MachineState state, IReadOnlyList<Blocker> blockers) => new(
         Acquired: true,
         ReservationId: r.Id,
@@ -48,9 +37,9 @@ public sealed record AcquireResult(
         MachineState: state,
         Reason: advice.Reason,
         Blockers: blockers,
-        Resources: r.Resources,
         Advice: advice,
-        Kind: r.Kind);
+        Kind: r.Kind,
+        BigMemory: r.BigMemory);
 
     public static AcquireResult Failure(string reason, MachineState state, IReadOnlyList<Blocker> blockers) =>
         new(false, null, null, state, reason, blockers);

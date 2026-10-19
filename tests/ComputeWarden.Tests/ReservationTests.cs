@@ -15,22 +15,21 @@ public class ReservationTests
 
         Assert.True(result.Acquired);
         Assert.NotNull(result.ReservationId);
-        Assert.Equal(MachineState.Busy, result.MachineState);
+        Assert.Equal(Grant.Full, result.Advice!.Grant);
+        Assert.Equal(MachineState.Available, result.MachineState); // shared work doesn't block anyone
     }
 
     [Fact]
-    public void Acquire_when_reservation_exists_fails_and_reports_blocker()
+    public void A_second_claim_runs_beside_the_first()
     {
         var warden = TestFactory.NewWarden(new FakeClock());
-        var first = warden.Acquire("Agent A", "work");
+        warden.Acquire("Agent A", "work");
 
         var second = warden.Acquire("Agent B", "work");
 
-        Assert.False(second.Acquired);
-        Assert.Equal("Machine currently unavailable", second.Reason);
-        var blocker = Assert.Single(second.Blockers);
-        Assert.Equal(BlockerType.Reservation, blocker.Type);
-        Assert.Equal("Agent A", blocker.Owner);
+        Assert.True(second.Acquired);
+        Assert.Equal(Grant.Full, second.Advice!.Grant);
+        Assert.Empty(second.Blockers);
     }
 
     [Fact]

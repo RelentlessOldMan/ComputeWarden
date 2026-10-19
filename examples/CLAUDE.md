@@ -21,18 +21,15 @@ command = 'C:\Users\<you>\AppData\Local\ComputeWarden\bin\ComputeWarden.Mcp.exe'
 tool_timeout_sec = 120
 ```
 
-Project instructions can add specifics (which commands here are heavy, which resources they
-saturate), but they shouldn't restate or contradict the policy below.
+Projects don't need ComputeWarden notes of their own. At most, a project's instructions can
+name which of its jobs are big-memory or solo, and how to cap a job's memory; they shouldn't
+restate or contradict the policy below.
 
 ---
 
 ## ComputeWarden (shared machine)
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
-- **Everyday work:** before a build, test run, or app run, call `computewarden_acquire` with `kind: "shared"`, an owner like "Claude Code (<repo>)", a description, and `estimateSeconds`. The default is cpu+ram; add `disk` only for heavy disk I/O (clean rebuilds, full scans, large copies), and `gpu` only if it uses the GPU. Big or long jobs (full builds, test fan-outs, renders, encodes) are shared too. `kind: "exclusive"` needs the user's express approval for that job; without it, run the job shared, wait, or do other work that isn't exclusive. Release when it finishes, even if it failed. Claim only for the run itself: acquire right before the command, release as soon as it exits. Don't hold a claim while reading, editing, waiting on the user, or between runs; a held claim fills a slot others queue behind.
-- **Timing tests and benchmarks:** the only time you need the machine to yourself. Use `kind: "solo"`. It waits until nothing else runs, and nothing new starts while it waits or holds, so acquire right before the measured run and release as soon as it ends. A `queued` grant works as below.
-- **Follow `advice.grant`:**
-  - `full`: run normally.
-  - `throttled`: run small per `advice.how` (e.g. `-m:1`, 1 core, below-normal priority).
-  - `queued`: don't start. Run `cw wait <reservation_id>` in the background and do other work meanwhile. When it exits 0, renew and start right away: the slot passes on if you don't renew within the time it prints. Exit 3 (still queued) or 4 (daemon unreachable) means run it again; exit 1 means the claim is gone, so acquire again. If you can't run background commands, call `computewarden_renew` with `waitSeconds: 60` until the grant changes. If `est_wait_seconds` is missing, or you've waited more than 10 minutes, tell the user and ask whether to keep waiting.
-- **Long work:** `estimateSeconds` sets the lease, so err high for the run itself (not the session). Run long jobs in the background and renew within the lease. When the grant changes, size the next step to match; a switch to `full` means go full speed. If renew returns `renewed: false`, the claim is gone: acquire again.
-- **User only:** set `userPriority` (skip the line), call `computewarden_set_mode`, or set a manual hold only when the user explicitly says so.
+- **Claim every build, test run, and app run:** call `computewarden_acquire` right before the command, with an owner like "Claude Code (<repo>)", a description, and `estimateSeconds` (err high: it sets the lease). Release as soon as it exits, even if it failed; renew within the lease during long runs (if a renew says `renewed: false`, acquire again). Don't hold a claim while reading, editing, or waiting on the user.
+- **Big memory:** set `bigMemory: true` only if the job needs more than ~8 GB and can't cap its memory (cap it if you can). Only one big-memory job runs at a time.
+- **Timing runs:** `kind: "solo"` only for a timing test or benchmark of at most 10 minutes. It waits for a quiet machine; release the moment the measured run ends.
+- **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) is the user's call only.

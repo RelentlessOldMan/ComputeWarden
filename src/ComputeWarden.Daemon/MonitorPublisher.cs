@@ -27,12 +27,12 @@ public interface IMonitorSink : IDisposable
 }
 
 /// <summary>
-/// Optional live view in RelentlessEye: machine state, mode, blockers and claims, refreshed
-/// every couple of seconds, plus a <c>status</c> request that answers like the pipe's STATUS.
-/// Daemon log lines reach the panel's feed through <see cref="MonitorLog"/>. The user can also set
-/// the mode and how many jobs may run beside a game from the panel; only a monitor may, never another app, since the mode is the user's
-/// call. The same goes for reordering the jobs waiting to start: pick one in the claims table,
-/// then move it. With no monitor installed the sink is disabled and none of this runs.
+/// Optional live view in RelentlessEye: machine state, blockers and claims, refreshed every
+/// couple of seconds, plus a <c>status</c> request that answers like the pipe's STATUS. Daemon
+/// log lines reach the panel's feed through <see cref="MonitorLog"/>. The user can also turn the
+/// manual hold on and off and set how many jobs may run beside a game from the panel; only a
+/// monitor may, never another app, since both are the user's call. With no monitor installed the
+/// sink is disabled and none of this runs.
 /// </summary>
 public sealed class MonitorPublisher : IAsyncDisposable
 {
@@ -41,37 +41,19 @@ public sealed class MonitorPublisher : IAsyncDisposable
 
     // Before Layout, which reads them: static initializers run in order.
 
-    private static readonly (string Id, string Label, LineMove Move)[] LineButtons =
-    {
-        ("line_front", "Move picked to front", LineMove.Front), ("line_up", "Move up", LineMove.Up), ("line_down", "Move down", LineMove.Down),
-    };
-
     private static readonly int[] GameJobsOptions = { 0, 1, 2, 3, 4 };
 
-    private static readonly (ResourceSet Set, string Key)[] ResourceColumns =
+    private static readonly object[] ClaimColumns =
     {
-        (ResourceSet.Cpu, "cpu"), (ResourceSet.Gpu, "gpu"), (ResourceSet.Ram, "ram"), (ResourceSet.Network, "net"), (ResourceSet.Disk, "disk"),
+        new { key = "who", label = "Claim" },
+        new { key = "state", label = "State" },
+        new { key = "lease", label = "Lease", align = "right" },
+        new { key = "checked", label = "Last check", align = "right" },
+        new { key = "what", label = "Doing" }, // last: takes the rest of the width, cut with a tooltip
     };
 
-    private static readonly object[] ClaimColumns = new object[]
-        {
-            new { key = "who", label = "Claim" },
-            new { key = "state", label = "State" },
-        }
-        .Concat(ResourceColumns.Select(r => (object)new { key = r.Key, label = r.Key, align = "center" }))
-        .Concat(new object[]
-        {
-            new { key = "lease", label = "Lease", align = "right" },
-            new { key = "checked", label = "Last check", align = "right" },
-            new { key = "what", label = "Doing" }, // last: takes the rest of the width, cut with a tooltip
-        })
-        .ToArray();
-
-    /// <summary>The panel with nobody waiting, as plain data in RelentlessEye's layout shape.</summary>
-    public static object Layout { get; } = BuildLayout(waiting: false);
-
-    /// <summary>The panel. The move buttons are there only while jobs are waiting to start.</summary>
-    public static object BuildLayout(bool waiting) => new
+    /// <summary>The panel, as plain data in RelentlessEye's layout shape.</summary>
+    public static object Layout { get; } = new
     {
         title = "Compute Warden",
         sections = new object[]
@@ -84,17 +66,13 @@ public sealed class MonitorPublisher : IAsyncDisposable
                 {
                     new { id = "state", kind = "indicator", label = "State",
                           states = new { available = "green", busy = "orange", unknown = "gray" } },
-                    new { id = ModePick, kind = "choice", label = "Mode",
-                          states = new { auto = "green", steady = "orange", open = "accent", hold = "red" },
+                    new { id = HoldPick, kind = "choice", label = "Hold",
+                          states = new { off = "green", on = "red" },
                           options = new object[]
                           {
-                              "auto",
-                              "steady",
-                              new { value = "open", label = "open", confirm = "Open: agents stop throttling each other (games still win). Set open?" },
-                              new { value = "hold", label = "hold", confirm = "Hold: no new work starts and running work is throttled. Set hold?" },
+                              "off",
+                              new { value = "on", label = "on", confirm = "Hold: no new work starts and running work is told to run small. Turn it on?" },
                           } },
-                    new { id = "busy", kind = "text", label = "Busy" },
-                    new { id = ModeDetail, kind = "text", label = "Now" },
                     new { id = GameJobsPick, kind = "choice", label = "Jobs while gaming",
                           options = GameJobsOptions.Select(n => (object)n.ToString()).ToArray() },
                     new { id = "blockers", kind = "text", label = "Blockers" },
@@ -103,13 +81,7 @@ public sealed class MonitorPublisher : IAsyncDisposable
             new
             {
                 title = "Claims",
-                columns = 3,
-                widgets = new object[]
-                    {
-                        new { id = ClaimsTable, kind = "table", pick = true, span = 3, columns = ClaimColumns },
-                    }
-                    .Concat(waiting ? LineButtons.Select(b => (object)new { id = b.Id, kind = "button", label = b.Label }) : Array.Empty<object>())
-                    .ToArray(),
+                widgets = new object[] { new { id = ClaimsTable, kind = "table", columns = ClaimColumns } },
             },
             new
             {
@@ -119,9 +91,8 @@ public sealed class MonitorPublisher : IAsyncDisposable
         },
     };
 
-    public const string ModePick = "mode";
+    public const string HoldPick = "hold";
     public const string GameJobsPick = "game_jobs";
-    public const string ModeDetail = "mode_detail";
     public const string ClaimsTable = "claims";
 
     private const string StatusRequest = """{"v":1,"op":"STATUS"}""";
@@ -134,10 +105,6 @@ public sealed class MonitorPublisher : IAsyncDisposable
     private readonly Dictionary<string, string> _sent = new(); // id -> JSON last sent
     private readonly object _gate = new();
     private readonly ILog? _log;
-
-    // The waiting job picked in the claims table, and whether the move buttons are showing.
-    private string? _pickJob;
-    private bool _sentWaiting;
 
     public MonitorPublisher(IMonitorSink sink, Warden warden, RequestDispatcher dispatcher, IClock clock,
         TimeSpan? interval = null, ILog? log = null)
@@ -155,54 +122,34 @@ public sealed class MonitorPublisher : IAsyncDisposable
                 using var doc = JsonDocument.Parse(dispatcher.Handle(StatusRequest));
                 return doc.RootElement.Clone();
             },
-            "machine state, mode, blockers and claims (same as computewarden_status)");
+            "machine state, blockers and claims (same as computewarden_status)");
 
-        // The pick is answered by setting the daemon's real mode back, so the panel never shows a
-        // mode that didn't take (a refused sender, a bad value).
-        _sink.OnAction(ModePick, PickMode);
+        // A pick is answered by setting the daemon's real value back, so the panel never shows a
+        // setting that didn't take (a refused sender, a bad value).
+        _sink.OnAction(HoldPick, PickHold);
         _sink.OnAction(GameJobsPick, PickGameJobs);
-        _sink.OnPick(ClaimsTable, id =>
-        {
-            RequireMonitor("pick a job in the line");
-            if (!_warden.GetWaiting().Any(w => w.Id == id))
-                throw new InvalidOperationException("Only a job waiting to start can be moved: pick a queued one.");
-            lock (_gate) _pickJob = id;
-        });
-        foreach (var (id, _, move) in LineButtons) _sink.OnAction(id, _ => MoveJob(move));
     }
 
-    /// <summary>Moves the job picked in the claims table. Public so tests can drive it.</summary>
-    public object? MoveJob(LineMove move)
+    /// <summary>Handles the hold switched on the panel. Public so tests can drive it.</summary>
+    public object? PickHold(JsonElement? value)
     {
-        var sender = RequireMonitor("reorder the line");
-        string? id;
-        lock (_gate) id = _pickJob;
-        if (id is null) throw new InvalidOperationException("Pick a waiting job first.");
-        _log?.Info($"Line change from {sender} on the monitor panel");
-        var place = _warden.MoveInLine(id, move) ?? throw new InvalidOperationException("That job isn't waiting any more.");
-        Publish();
-        return new { place };
-    }
-
-    /// <summary>Handles a mode picked on the panel. Public so tests can drive it.</summary>
-    public object? PickMode(JsonElement? value)
-    {
-        var sender = RequireMonitor("set the mode");
+        var sender = RequireMonitor("set the hold");
         var name = value is { ValueKind: JsonValueKind.String } v ? v.GetString() : null;
-        var mode = name switch
+        switch (name)
         {
-            "auto" => UserMode.Auto,
-            "steady" => UserMode.Steady,
-            "open" => UserMode.Open,
-            "hold" => UserMode.Hold,
-            _ => throw new ArgumentException($"Unknown mode '{name}' (expected auto, steady, open, or hold)"),
-        };
-
-        // The panel keeps it simple: the whole machine, until changed. `cw mode` can narrow it.
-        _log?.Info($"Mode change from {sender} on the monitor panel");
-        var set = _warden.SetMode(mode);
+            case "on":
+                _log?.Info($"Hold from {sender} on the monitor panel");
+                _warden.SetManualBusy("held from the panel");
+                break;
+            case "off":
+                _log?.Info($"Hold cleared by {sender} on the monitor panel");
+                _warden.ClearManualBusy();
+                break;
+            default:
+                throw new ArgumentException($"Unknown hold '{name}' (expected on or off)");
+        }
         Publish();
-        return new { mode = Warden.ModeName(set.Mode), resources = Resources.ToNames(set.Resources), expiresAt = set.ExpiresAt };
+        return new { hold = name };
     }
 
     /// <summary>Handles how many jobs may run beside a game, picked on the panel. Public so tests can drive it.</summary>
@@ -249,15 +196,7 @@ public sealed class MonitorPublisher : IAsyncDisposable
         {
             try
             {
-                var waiting = _warden.GetWaiting();
-                if (waiting.Count > 0 != _sentWaiting)
-                {
-                    _sink.SetLayout(BuildLayout(waiting.Count > 0));
-                    _sentWaiting = waiting.Count > 0;
-                }
-                if (_pickJob is not null && !waiting.Any(w => w.Id == _pickJob)) _pickJob = null; // it started or left
-
-                foreach (var (id, value) in Render(_warden.GetStatus(), _clock.UtcNow, waiting, _pickJob, _warden.GameJobs))
+                foreach (var (id, value) in Render(_warden.GetStatus(), _clock.UtcNow))
                 {
                     var json = JsonSerializer.Serialize(value);
                     if (_sent.TryGetValue(id, out var old) && old == json) continue;
@@ -273,52 +212,26 @@ public sealed class MonitorPublisher : IAsyncDisposable
     }
 
     /// <summary>The panel's values for one status snapshot.</summary>
-    public static IReadOnlyList<(string Id, object Value)> Render(
-        StatusResult status, DateTimeOffset now, IReadOnlyList<ClaimInfo>? waiting = null, string? picked = null, int? gameJobs = null)
+    public static IReadOnlyList<(string Id, object Value)> Render(StatusResult status, DateTimeOffset now)
     {
-        var places = (waiting ?? Array.Empty<ClaimInfo>()).Select((c, i) => (c.Id, Place: i + 1)).ToDictionary(p => p.Id, p => p.Place);
         var claims = status.Claims ?? Array.Empty<ClaimInfo>();
         var values = new List<(string, object)>
         {
             ("state", status.State.ToString().ToLowerInvariant()),
-            (ModePick, Warden.ModeName(status.Mode?.Mode ?? UserMode.Auto)),
-            (ModeDetail, ModeText(status.Mode)),
-            ("busy", status.BusyResources == ResourceSet.None ? "none" : string.Join(", ", Resources.ToNames(status.BusyResources))),
+            (HoldPick, status.Blockers.Any(b => b.Type == BlockerType.Manual) ? "on" : "off"),
             ("blockers", status.Blockers.Count == 0 ? "none" : string.Join("\n", status.Blockers.Select(b => b.Description))),
-            (ClaimsTable, ClaimsValue(ClaimRows(claims, now, places), picked)),
+            (ClaimsTable, new Dictionary<string, object> { ["rows"] = ClaimRows(claims, now) }),
         };
-        if (gameJobs is int jobs) values.Add((GameJobsPick, jobs.ToString()));
+        if (status.GameJobs is int jobs) values.Add((GameJobsPick, jobs.ToString()));
         return values;
     }
 
-    private static string ModeText(ModeState? mode)
-    {
-        if (mode is null) return "auto";
-        var text = Warden.ModeName(mode.Mode);
-        if (mode.Mode != UserMode.Auto && mode.Resources != ResourceSet.All)
-            text += $" ({string.Join(", ", Resources.ToNames(mode.Resources))})";
-        if (mode.ExpiresAt is { } until) text += $" until {until.ToLocalTime():HH:mm}";
-        if (!string.IsNullOrWhiteSpace(mode.Reason)) text += $": {mode.Reason}";
-        return text;
-    }
-
-    // The table's value: its rows, and the picked row when there is one (leaving it out clears it).
-    private static Dictionary<string, object> ClaimsValue(List<Dictionary<string, object>> rows, string? picked)
-    {
-        var value = new Dictionary<string, object> { ["rows"] = rows };
-        if (picked is not null) value["picked"] = picked;
-        return value;
-    }
-
-    /// <summary>
-    /// One table row per claim: running ones first, then those whose turn has come, then the line in
-    /// order. A dot under each resource the claim needs, colored by where the claim is.
-    /// </summary>
-    private static List<Dictionary<string, object>> ClaimRows(IEnumerable<ClaimInfo> claims, DateTimeOffset now, IReadOnlyDictionary<string, int> places)
+    /// <summary>One table row per claim: running ones first, then those whose turn has come, then the line in order.</summary>
+    private static List<Dictionary<string, object>> ClaimRows(IEnumerable<ClaimInfo> claims, DateTimeOffset now)
         => claims
             .OrderBy(c => c.Phase)
-            .ThenBy(c => places.TryGetValue(c.Id, out var p) ? p : 0)
-            .Select(c => ClaimRow(c, now, places.TryGetValue(c.Id, out var p) ? p : null))
+            .ThenBy(c => c.Position ?? 0)
+            .Select(c => ClaimRow(c, now))
             .ToList();
 
     // "Claude Code (CodeCarver)" -> "CodeCarver": the session's name is what tells claims apart.
@@ -338,15 +251,16 @@ public sealed class MonitorPublisher : IAsyncDisposable
         return m == 0 ? "just now" : m < 60 ? $"{m}m ago" : $"{m / 60}h{(m % 60 == 0 ? "" : $"{m % 60}m")} ago";
     }
 
-    private static Dictionary<string, object> ClaimRow(ClaimInfo c, DateTimeOffset now, int? place)
+    private static Dictionary<string, object> ClaimRow(ClaimInfo c, DateTimeOffset now)
     {
         var (state, color) = c.Phase switch
         {
             ClaimPhase.Running => ($"running {Warden.GrantName(c.Grant)}", c.Grant == Grant.Full ? "green" : "orange"),
             ClaimPhase.Ready => ("its turn, not started", "blue"),
-            _ => (place is int p ? $"queued #{p}" : "queued", "gray"),
+            _ => (c.Position is int p ? $"queued #{p}" : "queued", "gray"),
         };
-        if (c.Kind != ClaimKind.Shared) state += $", {Warden.KindName(c.Kind)}";
+        if (c.Kind == ClaimKind.Solo) state += ", solo";
+        if (c.BigMemory) state += ", big memory";
 
         var row = new Dictionary<string, object>
         {
@@ -355,9 +269,6 @@ public sealed class MonitorPublisher : IAsyncDisposable
             ["state"] = new { text = state, color },
             ["what"] = c.Description,
         };
-        foreach (var (set, key) in ResourceColumns)
-            if ((c.Resources & set) != 0) row[key] = new { dot = true, color, tip = $"{key}: {state}" };
-
         var lease = $"{Math.Max(0, (int)Math.Ceiling((c.ExpiresAt - now).TotalMinutes))}m";
         row["lease"] = lease;
         if (c.LastCheckIn is { } seen)

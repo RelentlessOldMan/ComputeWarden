@@ -39,13 +39,14 @@ public class WardenClientTests
         Assert.Equal(MachineState.Available, status.State);
         Assert.True(await client.CanRunAsync());
 
-        var acquire = await client.AcquireAsync("Claude Code", "indexing", leaseSeconds: 300);
+        var acquire = await client.AcquireAsync(new ClaimRequest("Claude Code", "indexing", LeaseSeconds: 300));
         Assert.True(acquire.Acquired);
         Assert.NotNull(acquire.ReservationId);
 
-        var blocked = await client.AcquireAsync("Other Agent", "work");
-        Assert.False(blocked.Acquired);
-        Assert.Contains(blocked.Blockers, b => b.Type == BlockerType.Reservation);
+        var beside = await client.AcquireAsync(new ClaimRequest("Other Agent", "work"));
+        Assert.True(beside.Acquired);
+        Assert.Equal(Grant.Full, beside.Advice!.Grant); // everyday work never blocks other work
+        Assert.True((await client.ReleaseAsync(beside.ReservationId!)).Released);
 
         var renew = await client.RenewAsync(acquire.ReservationId!, 120);
         Assert.True(renew.Renewed);
@@ -53,7 +54,7 @@ public class WardenClientTests
         var release = await client.ReleaseAsync(acquire.ReservationId!);
         Assert.True(release.Released);
 
-        Assert.True((await client.AcquireAsync("Other Agent", "work")).Acquired);
+        Assert.True((await client.AcquireAsync(new ClaimRequest("Other Agent", "work"))).Acquired);
     }
 
     [Fact]
@@ -70,7 +71,7 @@ public class WardenClientTests
         Assert.True(await client.ClearManualBusyAsync());
         Assert.Equal(MachineState.Available, (await client.StatusAsync()).State);
 
-        await client.AcquireAsync("A", "work");
+        await client.AcquireAsync(new ClaimRequest("A", "work"));
         var stats = await client.StatsAsync();
         Assert.Equal(1, stats.TotalAcquisitions);
         Assert.Equal(1, stats.CurrentReservations);

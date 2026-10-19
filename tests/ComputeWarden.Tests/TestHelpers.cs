@@ -66,6 +66,18 @@ public static class TestFactory
             extraProviders);
 }
 
+public static class WardenTestExtensions
+{
+    /// <summary>A plain shared claim, the shape most lifecycle tests need.</summary>
+    public static AcquireResult Acquire(
+        this Warden warden,
+        string owner,
+        string description,
+        int? leaseSeconds = null,
+        IReadOnlyDictionary<string, string>? metadata = null)
+        => warden.Acquire(new ClaimRequest(owner, description, LeaseSeconds: leaseSeconds, Metadata: metadata));
+}
+
 /// <summary>Keeps tests off the real daemon pipe, and keeps pipe awaits from hanging the run.</summary>
 public static class TestIsolation
 {

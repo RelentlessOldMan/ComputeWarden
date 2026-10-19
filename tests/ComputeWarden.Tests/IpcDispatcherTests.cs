@@ -33,7 +33,7 @@ public class IpcDispatcherTests
     }
 
     [Fact]
-    public void Acquire_then_second_acquire_is_blocked()
+    public void Second_acquire_runs_beside_the_first()
     {
         var (d, _) = New();
 
@@ -43,9 +43,9 @@ public class IpcDispatcherTests
         Assert.False(string.IsNullOrEmpty(id));
 
         var second = Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "work" });
-        Assert.False((bool)second["acquired"]!);
-        Assert.Equal("BUSY", (string)second["machineState"]!);
-        Assert.Single(second["blockers"]!.AsArray());
+        Assert.True((bool)second["acquired"]!);
+        Assert.Equal("AVAILABLE", (string)second["machineState"]!);
+        Assert.Equal("full", (string)second["advice"]!["grant"]!);
     }
 
     [Fact]
@@ -143,7 +143,7 @@ public class IpcDispatcherTests
     {
         var (d, _) = New();
         Handle(d, new { v = 1, op = "ACQUIRE", owner = "A", description = "work" });
-        Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "work" }); // fails
+        Handle(d, new { v = 1, op = "ACQUIRE", owner = "B", description = "work", estimateSeconds = -1 }); // invalid
 
         var stats = Handle(d, new { v = 1, op = "STATS" });
 

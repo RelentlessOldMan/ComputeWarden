@@ -1,3 +1,4 @@
+using ComputeWarden.Core;
 using ComputeWarden.Core.Config;
 using ComputeWarden.Core.Model;
 using YamlDotNet.Core;
@@ -121,26 +122,15 @@ public static class ConfigLoader
         var d = new SharingOptions();
         if (s is null) return d;
 
-        ResourceSet unshareable;
-        try
-        {
-            // An explicit empty list means every resource can be shared.
-            unshareable = s.Unshareable is null ? d.Unshareable
-                : s.Unshareable.Count == 0 ? ResourceSet.None
-                : Resources.Parse(s.Unshareable);
-        }
-        catch (ArgumentException ex)
-        {
-            throw new YamlException($"sharing.unshareable: {ex.Message}");
-        }
-
+        // unshareable (before 2.0) is accepted and ignored: claims no longer name resources.
         var cores = s.ThrottleMaxCores ?? d.ThrottleMaxCores;
         var ram = s.ThrottleMaxRamGb ?? d.ThrottleMaxRamGb;
-        var slots = s.MaxThrottledPerResource ?? d.MaxThrottledPerResource;
+        // max_throttled_per_resource is the name before 2.0.
+        var jobs = s.GameJobs ?? s.MaxThrottledPerResource ?? d.GameJobs;
         var checkin = s.QueueCheckinSeconds ?? d.QueueCheckinSeconds;
         if (cores < 1) throw new YamlException("sharing.throttle_max_cores must be at least 1");
         if (!(ram > 0)) throw new YamlException("sharing.throttle_max_ram_gb must be positive");
-        if (slots < 0) throw new YamlException("sharing.max_throttled_per_resource must not be negative");
+        if (jobs is < 0 or > Warden.MaxGameJobs) throw new YamlException($"sharing.game_jobs must be between 0 and {Warden.MaxGameJobs}");
         if (checkin < 10) throw new YamlException("sharing.queue_checkin_seconds must be at least 10");
 
         var priority = string.IsNullOrWhiteSpace(s.ThrottlePriority) ? d.ThrottlePriority : s.ThrottlePriority.Trim().ToLowerInvariant();
@@ -152,8 +142,7 @@ public static class ConfigLoader
             ThrottleMaxCores = cores,
             ThrottlePriority = priority,
             ThrottleMaxRamGb = ram,
-            MaxThrottledPerResource = slots,
-            Unshareable = unshareable,
+            GameJobs = jobs,
             QueueCheckinSeconds = checkin,
         };
     }
@@ -176,6 +165,7 @@ public static class ConfigLoader
         public int? ThrottleMaxCores { get; set; }
         public string? ThrottlePriority { get; set; }
         public double? ThrottleMaxRamGb { get; set; }
+        public int? GameJobs { get; set; }
         public int? MaxThrottledPerResource { get; set; }
         public List<string>? Unshareable { get; set; }
         public int? QueueCheckinSeconds { get; set; }

@@ -160,16 +160,17 @@ public class HotReloadTests
             await using var host = new WardenHost(
                 ConfigLoader.Parse(before), new CapturingLog(), new OneProcess(), pipeName: TestPipe(), configPath: path);
             host.Start();
-            host.Warden.SetMode(UserMode.Steady);
+            var id = host.Warden.Acquire(new ClaimRequest("A", "x", ClaimKind.Shared)).ReservationId!;
+            host.Warden.SetManualBusy("throttle for the test");
 
             // Startup uses the file's sharing section.
-            Assert.Equal(2, host.Warden.Acquire(new ClaimRequest("A", "x", ClaimKind.Shared)).Advice!.Throttle!.MaxCores);
+            Assert.Equal(2, host.Warden.Renew(id).Advice!.Throttle!.MaxCores);
             await Until(() => host.Warden.GetStatus().Blockers.Any(b => b.Type == BlockerType.Process));
 
             File.WriteAllText(path, after);
             host.ReloadConfig();
 
-            Assert.Equal(3, host.Warden.Acquire(new ClaimRequest("B", "y", ClaimKind.Shared)).Advice!.Throttle!.MaxCores);
+            Assert.Equal(3, host.Warden.Renew(id).Advice!.Throttle!.MaxCores);
             await Until(() => !host.Warden.GetStatus().Blockers.Any(b => b.Type == BlockerType.Process));
         }
         finally

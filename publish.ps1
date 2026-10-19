@@ -6,9 +6,7 @@ param(
     [string]$Config  = "Release",
     # Also copy the published exes to the stable per-user install dir the user-scope MCP
     # server points at (%LOCALAPPDATA%\ComputeWarden\bin), so updating is a one-liner.
-    [switch]$Install,
-    # Install even though a user mode is set and the running daemon is too old to keep it (before 1.1.5).
-    [switch]$Force
+    [switch]$Install
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,16 +39,8 @@ if ($Install) {
     Write-Host "Installing to $bin"
     New-Item -ItemType Directory -Force $bin | Out-Null
 
-    # The daemon is restarted at the end. Since 1.1.5 it saves its claims and mode to state.json and
-    # picks them up again; an older daemon (no state file) drops a mode the user set, so say so.
-    $daemons = @(Get-CimInstance Win32_Process -Filter "Name='ComputeWarden.Daemon.exe'")
-    $saved = Test-Path (Join-Path $env:LOCALAPPDATA "ComputeWarden\state.json")
-    if ($daemons.Count -gt 0 -and -not $saved -and -not $Force) {
-        $mode = (& (Join-Path $out "cw.exe") mode 2>$null) -join " "
-        if ($LASTEXITCODE -eq 0 -and $mode -notmatch '^Mode: auto') {
-            throw "$mode. Installing restarts the daemon, which drops that mode. Re-run with -Force to install anyway, then set it again with cw mode."
-        }
-    }
+    # The daemon is restarted at the end. It saves its claims and the hold to state.json and picks
+    # them up again.
 
     # Clean up exes moved aside by earlier installs, once no session is still running them.
     Get-ChildItem $bin -Filter "*.old-*" -File -ErrorAction SilentlyContinue |

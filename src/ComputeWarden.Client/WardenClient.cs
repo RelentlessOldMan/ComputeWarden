@@ -48,36 +48,15 @@ public sealed class WardenClient
     public async Task<StatusResult> StatusAsync(CancellationToken ct = default)
         => ResponseParser.Status(await SendAsync(new IpcRequest { Op = IpcOps.Status }, ct));
 
-    public async Task<bool> CanRunAsync(IEnumerable<string>? resources = null, CancellationToken ct = default)
+    public async Task<bool> CanRunAsync(CancellationToken ct = default)
     {
-        var root = await SendAsync(new IpcRequest { Op = IpcOps.CanRun, Resources = resources?.ToList() }, ct);
+        var root = await SendAsync(new IpcRequest { Op = IpcOps.CanRun }, ct);
         return root.TryGetProperty("canRun", out var v) && v.ValueKind == JsonValueKind.True;
     }
 
-    public async Task<AcquireResult> AcquireAsync(
-        string owner,
-        string description,
-        int? leaseSeconds = null,
-        IReadOnlyDictionary<string, string>? metadata = null,
-        IEnumerable<string>? resources = null,
-        CancellationToken ct = default)
-    {
-        var request = new IpcRequest
-        {
-            Op = IpcOps.Acquire,
-            Owner = owner,
-            Description = description,
-            LeaseSeconds = leaseSeconds,
-            Metadata = metadata is null ? null : new Dictionary<string, string>(metadata),
-            Resources = resources?.ToList(),
-        };
-        return ResponseParser.Acquire(await SendAsync(request, ct));
-    }
-
     /// <summary>
-    /// Reports work and gets the warden's advice (full, throttled, or queued). Shared claims
-    /// and exclusive claims that throttle or wait are always created; the advice says how big
-    /// to run.
+    /// Reports work and gets the warden's advice (full, throttled, or queued). A valid claim is
+    /// always created; the advice says how big to run, or to wait.
     /// </summary>
     public async Task<AcquireResult> AcquireAsync(ClaimRequest claim, CancellationToken ct = default)
     {
@@ -87,14 +66,10 @@ public sealed class WardenClient
             Owner = claim.Owner,
             Description = claim.Description,
             Kind = Warden.KindName(claim.Kind),
-            WhenBusy = claim.Kind == ClaimKind.Exclusive ? WhenBusyName(claim.WhenBusy) : null,
+            BigMemory = claim.BigMemory ? true : null,
             LeaseSeconds = claim.LeaseSeconds,
             EstimateSeconds = claim.EstimateSeconds,
-            Cores = claim.Cores,
-            RamGb = claim.RamGb,
-            UserPriority = claim.UserPriority,
             Metadata = claim.Metadata is null ? null : new Dictionary<string, string>(claim.Metadata),
-            Resources = claim.Resources == ResourceSet.None ? null : Resources.ToNames(claim.Resources).ToList(),
         };
         return ResponseParser.Acquire(await SendAsync(request, ct));
     }
@@ -119,40 +94,16 @@ public sealed class WardenClient
         return ResponseParser.Renew(await SendAsync(request, ct, _responseTimeout + wait));
     }
 
-    /// <summary>Sets the machine-wide user mode. The user's call only.</summary>
-    public async Task<ModeState> SetModeAsync(
-        UserMode mode, IEnumerable<string>? resources = null, int? durationSeconds = null, string? reason = null,
-        CancellationToken ct = default)
-    {
-        var root = await SendAsync(new IpcRequest
-        {
-            Op = IpcOps.SetMode,
-            Mode = Warden.ModeName(mode),
-            Resources = resources?.ToList(),
-            DurationSeconds = durationSeconds,
-            Reason = reason,
-        }, ct);
-        if (!root.TryGetProperty("mode", out var m) || m.ValueKind != JsonValueKind.Object)
-            throw new WardenClientException("Response missing 'mode'");
-        return ResponseParser.Mode(m);
-    }
-
-    private static string WhenBusyName(WhenBusy w) => w switch
-    {
-        WhenBusy.Wait => "wait",
-        WhenBusy.Refuse => "refuse",
-        _ => "throttle",
-    };
-
     public async Task<ReleaseResult> ReleaseAsync(string reservationId, CancellationToken ct = default)
     {
         var request = new IpcRequest { Op = IpcOps.Release, ReservationId = reservationId };
         return ResponseParser.Release(await SendAsync(request, ct));
     }
 
-    public async Task<Blocker> SetManualBusyAsync(string reason, IEnumerable<string>? resources = null, CancellationToken ct = default)
+    /// <summary>Turns on the manual hold. The user's call only.</summary>
+    public async Task<Blocker> SetManualBusyAsync(string reason, CancellationToken ct = default)
     {
-        var root = await SendAsync(new IpcRequest { Op = IpcOps.SetManualBusy, Reason = reason, Resources = resources?.ToList() }, ct);
+        var root = await SendAsync(new IpcRequest { Op = IpcOps.SetManualBusy, Reason = reason }, ct);
         if (!root.TryGetProperty("blocker", out var blocker))
             throw new WardenClientException("Response missing 'blocker'");
         return ResponseParser.Blocker(blocker);

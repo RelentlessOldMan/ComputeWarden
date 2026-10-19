@@ -11,7 +11,6 @@ public static class IpcOps
     public const string SetManualBusy = "SET_MANUAL_BUSY";
     public const string ClearManualBusy = "CLEAR_MANUAL_BUSY";
     public const string Stats = "STATS";
-    public const string SetMode = "SET_MODE";
 }
 
 /// <summary>
@@ -30,40 +29,25 @@ public sealed class IpcRequest
     public string? ReservationId { get; set; }
     public string? Reason { get; set; }
 
-    /// <summary>
-    /// Resource names (cpu, gpu, ram, network, disk) for acquire/can_run/set_manual_busy.
-    /// Absent means all — so older clients keep exclusive-machine semantics, and an older
-    /// daemon that ignores this field errs conservative.
-    /// </summary>
+    /// <summary>Ignored since 2.0 (claims no longer name resources); kept so older clients still parse.</summary>
     public List<string>? Resources { get; set; }
 
     /// <summary>
-    /// Claim kind for acquire: "shared" or "exclusive". Absent means a legacy acquire (exclusive,
-    /// refused when busy), so older clients behave exactly as before.
+    /// Claim kind for acquire: "shared" (the default when absent) or "solo". "exclusive" was
+    /// removed in 2.0 and is refused with an error saying what to use instead.
     /// </summary>
     public string? Kind { get; set; }
 
-    /// <summary>For an exclusive claim: "throttle" (default), "wait", or "refuse".</summary>
-    public string? WhenBusy { get; set; }
+    /// <summary>Acquire: a job that needs so much memory that only one may run at a time.</summary>
+    public bool? BigMemory { get; set; }
 
     public int? EstimateSeconds { get; set; }
-    public int? Cores { get; set; }
-    public double? RamGb { get; set; }
-
-    /// <summary>Why this claim skips the line. Only on the user's explicit word.</summary>
-    public string? UserPriority { get; set; }
 
     /// <summary>Renew: wait up to this long for the claim's grant to change before answering.</summary>
     public int? WaitSeconds { get; set; }
 
     /// <summary>Renew: check in without starting the claim (a background waiter, not the owner).</summary>
     public bool? Probe { get; set; }
-
-    /// <summary>Set mode: auto, steady, open, or hold.</summary>
-    public string? Mode { get; set; }
-
-    /// <summary>Set mode: revert to auto after this long (absent: until changed).</summary>
-    public int? DurationSeconds { get; set; }
 }
 
 public static class IpcProtocol

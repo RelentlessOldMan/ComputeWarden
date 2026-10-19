@@ -8,12 +8,11 @@ namespace ComputeWarden.Tests;
 public class ConcurrencyTests
 {
     /// <summary>
-    /// The critical correctness test (spec §36): when many agents attempt to acquire the
-    /// exclusive machine simultaneously, exactly one must succeed and every loser must see
-    /// the winner as a blocker.
+    /// The critical correctness test: when many agents ask for a big-memory job at once,
+    /// exactly one may run, and the rest wait in one line with no gaps or duplicates.
     /// </summary>
     [Fact]
-    public void Concurrent_acquire_yields_exactly_one_winner()
+    public void Concurrent_big_memory_acquires_yield_exactly_one_runner()
     {
         const int agents = 256;
         var warden = TestFactory.NewWarden(new FakeClock());
@@ -30,18 +29,19 @@ public class ConcurrencyTests
             threads[i] = new Thread(() =>
             {
                 gate.SignalAndWait(); // maximize contention: all fire at once
-                results[id] = warden.Acquire($"agent-{id}", "intensive work");
+                results[id] = warden.Acquire(new ClaimRequest($"agent-{id}", "intensive work", BigMemory: true));
             });
             threads[i].Start();
         }
 
         foreach (var t in threads) t.Join();
 
-        Assert.Equal(1, results.Count(r => r.Acquired));
-        Assert.Equal(agents - 1, results.Count(r => !r.Acquired));
-        Assert.All(
-            results.Where(r => !r.Acquired),
-            loser => Assert.Contains(loser.Blockers, b => b.Type == BlockerType.Reservation));
+        Assert.All(results, r => Assert.True(r.Acquired));
+        Assert.Equal(1, results.Count(r => r.Advice!.Grant == Grant.Full));
+        var waiting = results.Where(r => r.Advice!.Grant == Grant.Queued).ToList();
+        Assert.Equal(agents - 1, waiting.Count);
+        // Each saw the line as it stood when it joined: the n-th to join was n-th in line.
+        Assert.Equal(Enumerable.Range(1, agents - 1), waiting.Select(r => r.Advice!.Queue!.Position!.Value).Order());
     }
 
     [Fact]
@@ -87,11 +87,11 @@ public class ConcurrencyTests
         var stall = new StallOnce();
         var warden = new Warden(clock, new LeaseOptions(), new WardenLimits(), new ManualBlockerProvider(clock), new[] { stall });
 
-        var first = new Thread(() => warden.Acquire(new ClaimRequest("A", "x", ClaimKind.Exclusive, ResourceSet.Cpu)));
+        var first = new Thread(() => warden.Acquire(new ClaimRequest("A", "x")));
         first.Start();
         Assert.True(stall.Entered.Wait(TimeSpan.FromSeconds(30)));
         var secondDone = new ManualResetEventSlim();
-        var second = new Thread(() => { warden.Acquire(new ClaimRequest("B", "y", ClaimKind.Exclusive, ResourceSet.Gpu)); secondDone.Set(); });
+        var second = new Thread(() => { warden.Acquire(new ClaimRequest("B", "y")); secondDone.Set(); });
         second.Start();
 
         var gotThrough = secondDone.Wait(TimeSpan.FromSeconds(2));

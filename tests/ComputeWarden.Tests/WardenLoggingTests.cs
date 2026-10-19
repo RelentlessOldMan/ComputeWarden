@@ -26,7 +26,7 @@ public class WardenLoggingTests
         var (warden, _, log) = New();
 
         var a = warden.Acquire("Claude Code", "indexing", 100);
-        Assert.True(log.Contains("Reservation acquired"));
+        Assert.True(log.Contains("Claim shared"));
         Assert.True(log.Contains("Claude Code"));
 
         warden.Release(a.ReservationId!);

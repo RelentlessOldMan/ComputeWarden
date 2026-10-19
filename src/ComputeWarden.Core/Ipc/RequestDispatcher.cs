@@ -110,7 +110,6 @@ public sealed class RequestDispatcher
                 IpcOps.SetManualBusy => HandleSetManual(request),
                 IpcOps.ClearManualBusy => HandleClearManual(),
                 IpcOps.Stats => HandleStats(),
-                IpcOps.SetMode => HandleSetMode(request),
                 _ => Error($"Unknown op '{request.Op}'"),
             };
         }
@@ -134,42 +133,33 @@ public sealed class RequestDispatcher
         {
             o["state"] = StateString(status.State);
             o["canRunIntensive"] = status.CanRunIntensive;
-            o["busyResources"] = ResourceArray(status.BusyResources);
             o["blockers"] = Blockers(status.Blockers);
-            if (status.Mode is { } mode) o["mode"] = ModeJson(mode);
+            if (status.GameJobs is { } jobs) o["gameJobs"] = jobs;
             o["claims"] = ClaimsJson(status.Claims ?? Array.Empty<ClaimInfo>());
             o["daemonVersion"] = IpcProtocol.ProductVersion;
         });
     }
 
     private string HandleCanRun(IpcRequest r)
-        => Ok(o => o["canRun"] = _warden.CanRun(Resources.Parse(r.Resources)));
+        => Ok(o => o["canRun"] = _warden.CanRun());
 
     private string HandleAcquire(IpcRequest r)
     {
-        var resources = Resources.Parse(r.Resources);
-        var result = string.IsNullOrWhiteSpace(r.Kind)
-            // Legacy acquire: exclusive, refused when busy.
-            ? _warden.Acquire(r.Owner ?? string.Empty, r.Description ?? string.Empty, r.LeaseSeconds, r.Metadata, resources)
-            : _warden.Acquire(new ClaimRequest(
-                r.Owner ?? string.Empty,
-                r.Description ?? string.Empty,
-                ParseKind(r.Kind),
-                Resources.ParseClaim(r.Resources), // None: the kind's default
-                ParseWhenBusy(r.WhenBusy),
-                r.LeaseSeconds,
-                r.EstimateSeconds,
-                r.Cores,
-                r.RamGb,
-                r.UserPriority,
-                r.Metadata));
+        var result = _warden.Acquire(new ClaimRequest(
+            r.Owner ?? string.Empty,
+            r.Description ?? string.Empty,
+            ParseKind(r.Kind),
+            r.BigMemory == true,
+            r.LeaseSeconds,
+            r.EstimateSeconds,
+            r.Metadata));
 
         return Ok(o =>
         {
             o["acquired"] = result.Acquired;
             if (result.Kind is { } kind) o["kind"] = Warden.KindName(kind);
             if (result.Advice is { } advice) o["advice"] = AdviceJson(advice);
-            if (result.Acquired) o["resources"] = ResourceArray(result.Resources);
+            if (result.Acquired) o["bigMemory"] = result.BigMemory;
             o["reservationId"] = result.ReservationId;
             o["expiresAt"] = Iso(result.ExpiresAt);
             o["machineState"] = StateString(result.MachineState);
@@ -190,12 +180,6 @@ public sealed class RequestDispatcher
         });
     }
 
-    private string HandleSetMode(IpcRequest r)
-    {
-        var state = _warden.SetMode(ParseMode(r.Mode), Resources.Parse(r.Resources), r.DurationSeconds, r.Reason);
-        return Ok(o => o["mode"] = ModeJson(state));
-    }
-
     private string HandleRelease(IpcRequest r)
     {
         var result = _warden.Release(r.ReservationId ?? string.Empty);
@@ -213,7 +197,7 @@ public sealed class RequestDispatcher
         if (string.IsNullOrWhiteSpace(r.Reason))
             return Error("'reason' is required");
 
-        var blocker = _warden.SetManualBusy(r.Reason, Resources.Parse(r.Resources));
+        var blocker = _warden.SetManualBusy(r.Reason);
         return Ok(o => o["blocker"] = BlockerJson(blocker));
     }
 
@@ -241,29 +225,14 @@ public sealed class RequestDispatcher
 
     // ---- Parsing --------------------------------------------------------
 
-    private static ClaimKind ParseKind(string value) => value.Trim().ToLowerInvariant() switch
+    private static ClaimKind ParseKind(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
     {
-        "shared" => ClaimKind.Shared,
-        "exclusive" => ClaimKind.Exclusive,
+        "" or "shared" => ClaimKind.Shared,
         "solo" => ClaimKind.Solo,
-        _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared, exclusive, or solo)"),
-    };
-
-    private static WhenBusy ParseWhenBusy(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
-    {
-        "" or "throttle" => WhenBusy.Throttle,
-        "wait" => WhenBusy.Wait,
-        "refuse" => WhenBusy.Refuse,
-        _ => throw new ArgumentException($"Unknown whenBusy '{value}' (expected throttle, wait, or refuse)"),
-    };
-
-    private static UserMode ParseMode(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
-    {
-        "auto" => UserMode.Auto,
-        "steady" => UserMode.Steady,
-        "open" => UserMode.Open,
-        "hold" => UserMode.Hold,
-        _ => throw new ArgumentException($"Unknown mode '{value}' (expected auto, steady, open, or hold)"),
+        "exclusive" => throw new ArgumentException(
+            "kind exclusive was removed: use shared (with bigMemory: true only if it needs more than ~8 GB and can't cap its memory), " +
+            "or solo for a short timing run"),
+        _ => throw new ArgumentException($"Unknown kind '{value}' (expected shared or solo)"),
     };
 
     // ---- JSON helpers ---------------------------------------------------
@@ -274,7 +243,6 @@ public sealed class RequestDispatcher
         {
             ["grant"] = Warden.GrantName(a.Grant),
             ["reason"] = a.Reason,
-            ["contended"] = ResourceArray(a.Contended),
         };
         if (a.Throttle is { } t)
         {
@@ -309,28 +277,17 @@ public sealed class RequestDispatcher
                 ["owner"] = c.Owner,
                 ["description"] = c.Description,
                 ["kind"] = Warden.KindName(c.Kind),
-                ["resources"] = ResourceArray(c.Resources),
+                ["bigMemory"] = c.BigMemory,
                 ["grant"] = Warden.GrantName(c.Grant),
-                ["holding"] = c.Holding,
+                ["phase"] = PhaseString(c.Phase),
                 ["expiresAt"] = Iso(c.ExpiresAt),
                 ["estimateSeconds"] = c.EstimateSeconds,
-                ["cores"] = c.Cores,
-                ["ramGb"] = c.RamGb,
-                ["userPriority"] = c.UserPriority,
                 ["position"] = c.Position,
+                ["lastCheckIn"] = Iso(c.LastCheckIn),
             });
         }
         return array;
     }
-
-    private static JsonObject ModeJson(ModeState m) => new()
-    {
-        ["mode"] = Warden.ModeName(m.Mode),
-        ["resources"] = ResourceArray(m.Resources),
-        ["reason"] = m.Reason,
-        ["setAt"] = Iso(m.SetAt),
-        ["expiresAt"] = Iso(m.ExpiresAt),
-    };
 
     private static string Ok(Action<JsonObject> fill)
     {
@@ -364,7 +321,6 @@ public sealed class RequestDispatcher
             ["owner"] = b.Owner,
             ["createdAt"] = Iso(b.CreatedAt),
             ["expiresAt"] = Iso(b.ExpiresAt),
-            ["resources"] = ResourceArray(b.Resources),
         };
         if (b.Metadata is { Count: > 0 })
         {
@@ -376,14 +332,6 @@ public sealed class RequestDispatcher
         return o;
     }
 
-    private static JsonArray ResourceArray(ResourceSet set)
-    {
-        var array = new JsonArray();
-        foreach (var name in Resources.ToNames(set))
-            array.Add(name);
-        return array;
-    }
-
     private static string? Iso(DateTimeOffset? value) => value?.ToString("o");
 
     private static string StateString(MachineState state) => state switch
@@ -391,6 +339,13 @@ public sealed class RequestDispatcher
         MachineState.Available => "AVAILABLE",
         MachineState.Busy => "BUSY",
         _ => "UNKNOWN",
+    };
+
+    private static string PhaseString(ClaimPhase phase) => phase switch
+    {
+        ClaimPhase.Running => "running",
+        ClaimPhase.Ready => "ready",
+        _ => "waiting",
     };
 
     private static string TypeString(BlockerType type) => type switch

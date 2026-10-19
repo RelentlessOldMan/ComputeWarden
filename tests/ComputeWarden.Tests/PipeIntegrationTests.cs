@@ -47,15 +47,14 @@ public class PipeIntegrationTests
         Assert.True((bool)acquire["acquired"]!);
         var id = (string)acquire["reservationId"]!;
 
-        var blocked = await RoundTripAsync(pipeName, new { v = 1, op = "ACQUIRE", owner = "B", description = "work" });
-        Assert.False((bool)blocked["acquired"]!);
-        Assert.Single(blocked["blockers"]!.AsArray());
+        var beside = await RoundTripAsync(pipeName, new { v = 1, op = "ACQUIRE", owner = "B", description = "work" });
+        Assert.True((bool)beside["acquired"]!);
+        Assert.Equal("full", (string)beside["advice"]!["grant"]!);
 
         var release = await RoundTripAsync(pipeName, new { v = 1, op = "RELEASE", reservationId = id });
         Assert.True((bool)release["released"]!);
-
-        var afterRelease = await RoundTripAsync(pipeName, new { v = 1, op = "ACQUIRE", owner = "B", description = "work" });
-        Assert.True((bool)afterRelease["acquired"]!);
+        var again = await RoundTripAsync(pipeName, new { v = 1, op = "RELEASE", reservationId = id });
+        Assert.False((bool)again["released"]!);
     }
 
     [Fact]
@@ -95,7 +94,7 @@ public class PipeIntegrationTests
     }
 
     [Fact]
-    public async Task Detected_process_blocks_acquire_over_pipe()
+    public async Task Detected_process_throttles_acquire_over_pipe()
     {
         var pipeName = "ComputeWarden-test-" + Guid.NewGuid().ToString("N");
         var lister = new StubLister();
@@ -120,7 +119,8 @@ public class PipeIntegrationTests
 
         Assert.Equal("BUSY", (string)status["state"]!);
         var acquire = await RoundTripAsync(pipeName, new { v = 1, op = "ACQUIRE", owner = "A", description = "work" });
-        Assert.False((bool)acquire["acquired"]!);
+        Assert.True((bool)acquire["acquired"]!);
+        Assert.Equal("throttled", (string)acquire["advice"]!["grant"]!);
         Assert.Contains(acquire["blockers"]!.AsArray(), b => (string)b!["type"]! == "PROCESS");
     }
 }

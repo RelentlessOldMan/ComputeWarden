@@ -5,7 +5,7 @@
 # or wherever the COMPUTEWARDEN_CONFIG environment variable points.
 # If no file is found, built-in defaults are used.
 #
-# Hot-reload: editing process_rules (incl. resources), the debounce (busy_after_ms / available_after_ms),
+# Hot-reload: editing process_rules, the debounce (busy_after_ms / available_after_ms),
 # or sharing takes effect within ~1s while the daemon is running - no restart needed. Changing
 # poll_interval_ms, leases, allow_manual_blocker, or logging still requires a restart.
 
@@ -23,38 +23,30 @@ process_detection:
   busy_after_ms: 0        # delay before a newly-seen process counts as a blocker
   available_after_ms: 3000 # keep BUSY this long after a matched process exits (debounce)
 
-# Your games and other foreground programs agents must yield to. A matched process is a
-# *priority* claim (your own lease): every agent on its resources is throttled or queued
-# while it runs, in every mode. Don't list agent tools (builds, indexers) here; they make
-# shared or exclusive claims instead.
-# Optional per rule: `resources` = which of cpu, gpu, ram, network, disk the process occupies.
-# Agents asking only for other resources can still proceed. Omit it to block everything.
+# Your games and other foreground programs agents must yield to. While one runs, agent work is
+# throttled and only game_jobs claims run (see sharing). Don't list agent tools (builds,
+# indexers) here; they make claims instead.
 process_rules:
   - name: My Game
     executable: MyGame.exe
     enabled: true
-    resources: [cpu, gpu, ram]   # disk and network work can still run
   # - name: Video editor
   #   executable: Resolve.exe
 
-# Shared work and the line (agent claims with a kind). All advisory: agents apply it themselves.
+# How agent work yields while you game. All advisory: agents apply it themselves.
 sharing:
   # What "throttled" tells an agent: run on at most this many cores, at this priority
   # (below_normal or idle), using at most this much memory.
   throttle_max_cores: 1
   throttle_priority: below_normal
   throttle_max_ram_gb: 2
-  # At most this many new claims run throttled per contended resource; later ones queue.
-  # Work already running is never queued, only throttled.
-  # Beside a game, the panel's "Jobs while gaming" replaces this once you pick it.
-  max_throttled_per_resource: 3
-  # Resources that can't run small beside a holder: contended claims are queued instead.
-  # [] makes everything shareable.
-  unshareable: [gpu]
+  # While you game (or hold), at most this many claims run, all throttled; later ones wait
+  # their turn. 0..12. The panel's "Jobs while gaming" replaces this once you pick it.
+  game_jobs: 3
   # A queued ticket must check in (renew) at least this often or it drops out of line.
   queue_checkin_seconds: 120
 
-# Set false to forbid clients from setting/clearing the manual blocker over MCP.
+# Set false to forbid clients from turning the manual hold on or off over MCP.
 allow_manual_blocker: true
 
 logging:

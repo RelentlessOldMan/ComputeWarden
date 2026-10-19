@@ -49,7 +49,7 @@ public class StateTests
     }
 
     [Fact]
-    public void Acquire_refused_while_process_blocker_present()
+    public void Acquire_is_throttled_while_a_process_blocker_is_present()
     {
         var process = new FakeBlockerProvider
         {
@@ -59,12 +59,13 @@ public class StateTests
 
         var result = warden.Acquire("Agent A", "work");
 
-        Assert.False(result.Acquired);
+        Assert.True(result.Acquired);
+        Assert.Equal(Grant.Throttled, result.Advice!.Grant);
         Assert.Contains(result.Blockers, b => b.Type == BlockerType.Process);
     }
 
     [Fact]
-    public void Monitor_failure_yields_unknown_and_refuses_acquire()
+    public void Monitor_failure_yields_unknown_and_throttles_acquire()
     {
         var process = new FakeBlockerProvider { Result = ProviderResult.Unhealthy };
         var warden = TestFactory.NewWarden(new FakeClock(), extraProviders: process);
@@ -74,8 +75,8 @@ public class StateTests
         Assert.False(status.CanRunIntensive);
 
         var acquire = warden.Acquire("Agent A", "work");
-        Assert.False(acquire.Acquired);
-        Assert.Contains("UNKNOWN", acquire.Reason);
+        Assert.Equal(Grant.Throttled, acquire.Advice!.Grant);
+        Assert.Contains("UNKNOWN", acquire.Advice.Reason);
     }
 
     [Fact]
@@ -93,17 +94,18 @@ public class StateTests
     }
 
     [Fact]
-    public void Process_starting_during_reservation_reports_both_blockers()
+    public void Process_starting_during_a_claim_throttles_it_on_renew()
     {
         var process = new FakeBlockerProvider();
         var warden = TestFactory.NewWarden(new FakeClock(), extraProviders: process);
-        warden.Acquire("Agent A", "work"); // reservation exists
+        var id = warden.Acquire("Agent A", "work").ReservationId!;
 
         process.Result = ProviderResult.Ok(FakeBlockerProvider.Process("MSBuild.exe", 14280));
 
         var status = warden.GetStatus();
         Assert.Equal(MachineState.Busy, status.State);
-        Assert.Contains(status.Blockers, b => b.Type == BlockerType.Reservation);
         Assert.Contains(status.Blockers, b => b.Type == BlockerType.Process);
+        Assert.Single(status.Claims!);
+        Assert.Equal(Grant.Throttled, warden.Renew(id).Advice!.Grant);
     }
 }

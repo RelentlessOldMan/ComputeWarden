@@ -37,8 +37,6 @@ public class AgentArgumentTests
     private static JsonNode ClaimOf(JsonNode status, string owner)
         => status["claims"]!.AsArray().Single(c => (string)c!["owner"]! == owner)!;
 
-    private static string[] Names(JsonNode? array) => array!.AsArray().Select(n => (string)n!).ToArray();
-
     // ---- MCP tools ------------------------------------------------------
 
     [Fact]
@@ -48,48 +46,38 @@ public class AgentArgumentTests
         WardenGateway.Configure(new WardenClient(pipe), autoSpawn: false);
         try
         {
-            var a = await Tool(ComputeWardenTools.Acquire("A", "holder", resources: new[] { "cpu" }, kind: "exclusive", estimateSeconds: 400));
+            var a = await Tool(ComputeWardenTools.Acquire("A", "holder", bigMemory: true, estimateSeconds: 400));
             Assert.Equal("full", (string)a["advice"]!["grant"]!);
+            Assert.True((bool)a["big_memory"]!);
             Assert.InRange((int)a["lease_remaining_seconds"]!, 520, 530); // ceil(400 * 1.25) + 30
 
-            var b = await Tool(ComputeWardenTools.Acquire("B", "waiter", resources: new[] { "cpu" }, kind: "exclusive", whenBusy: "wait", estimateSeconds: 100));
+            var b = await Tool(ComputeWardenTools.Acquire("B", "waiter", bigMemory: true, estimateSeconds: 100));
             Assert.Equal("queued", (string)b["advice"]!["grant"]!);
             Assert.Equal(1, (int)b["advice"]!["queue"]!["position"]!);
             Assert.InRange((int)b["advice"]!["queue"]!["est_wait_seconds"]!, 380, 400); // A's estimate
 
-            var c = await Tool(ComputeWardenTools.Acquire("C", "vip", resources: new[] { "cpu" }, kind: "exclusive", whenBusy: "wait", userPriority: "user: me first"));
-            Assert.Equal("queued", (string)c["advice"]!["grant"]!);
-            Assert.Equal(1, (int)c["advice"]!["queue"]!["position"]!); // ahead of B
+            var c = await Tool(ComputeWardenTools.Acquire("C", "next", bigMemory: true));
+            Assert.Equal(2, (int)c["advice"]!["queue"]!["position"]!);
+            Assert.Equal("B", (string)Assert.Single(c["advice"]!["queue"]!["ahead"]!.AsArray())!["owner"]!);
 
-            var s = await Tool(ComputeWardenTools.Acquire("S", "build", resources: new[] { "cpu", "disk" }, kind: "shared"));
-            Assert.Equal("throttled", (string)s["advice"]!["grant"]!);
-            Assert.Equal(new[] { "cpu" }, Names(s["advice"]!["contended"]));
-
-            var g = await Tool(ComputeWardenTools.Acquire("G", "render", resources: new[] { "gpu" }, kind: "exclusive"));
-            Assert.Equal("full", (string)g["advice"]!["grant"]!); // disjoint from A
-
-            var renewB = await Tool(ComputeWardenTools.Renew((string)b["reservation_id"]!));
-            var ahead = Assert.Single(renewB["advice"]!["queue"]!["ahead"]!.AsArray())!;
-            Assert.Equal("C", (string)ahead["owner"]!);
-            Assert.Equal("user: me first", (string)ahead["user_priority"]!);
+            var s = await Tool(ComputeWardenTools.Acquire("S", "build", kind: "shared"));
+            Assert.Equal("full", (string)s["advice"]!["grant"]!); // big jobs waiting don't hold up others
+            Assert.Null(s["big_memory"]);
 
             var status = await Tool(ComputeWardenTools.Status());
             var ca = ClaimOf(status, "A");
-            Assert.Equal("exclusive", (string)ca["kind"]!);
-            Assert.True((bool)ca["holding"]!);
+            Assert.Equal("shared", (string)ca["kind"]!);
+            Assert.True((bool)ca["big_memory"]!);
+            Assert.Equal("running", (string)ca["phase"]!);
             Assert.Equal(400, (int)ca["estimate_seconds"]!);
             var cb = ClaimOf(status, "B");
-            Assert.False((bool)cb["holding"]!);
-            Assert.Equal(2, (int)cb["position"]!);
+            Assert.Equal("waiting", (string)cb["phase"]!);
+            Assert.Equal(1, (int)cb["position"]!);
             Assert.Equal(100, (int)cb["estimate_seconds"]!);
-            var cc = ClaimOf(status, "C");
-            Assert.Equal("user: me first", (string)cc["user_priority"]!);
-            Assert.Equal(1, (int)cc["position"]!);
+            Assert.Equal(2, (int)ClaimOf(status, "C")["position"]!);
             var cs = ClaimOf(status, "S");
-            Assert.Equal("shared", (string)cs["kind"]!);
-            Assert.Equal("throttled", (string)cs["grant"]!);
-            Assert.Null(cs["holding"]); // shown only for exclusive claims
-            Assert.Equal(new[] { "cpu", "disk" }, Names(cs["resources"]));
+            Assert.Equal("full", (string)cs["grant"]!);
+            Assert.Null(cs["big_memory"]); // shown only when set
         }
         finally
         {
@@ -98,15 +86,15 @@ public class AgentArgumentTests
     }
 
     [Fact]
-    public async Task Mcp_renew_waits_for_the_grant_and_user_priority_takes_the_hold()
+    public async Task Mcp_renew_waits_for_the_grant()
     {
         await using var host = StartHost(out var pipe);
         WardenGateway.Configure(new WardenClient(pipe), autoSpawn: false);
         try
         {
-            var a = await Tool(ComputeWardenTools.Acquire("A", "holder", resources: new[] { "cpu" }, kind: "exclusive"));
-            var b = await Tool(ComputeWardenTools.Acquire("B", "first", resources: new[] { "cpu" }, kind: "exclusive", whenBusy: "wait"));
-            var c = await Tool(ComputeWardenTools.Acquire("C", "vip", resources: new[] { "cpu" }, kind: "exclusive", whenBusy: "wait", userPriority: "user: me first"));
+            var a = await Tool(ComputeWardenTools.Acquire("A", "holder", bigMemory: true));
+            var b = await Tool(ComputeWardenTools.Acquire("B", "first", bigMemory: true));
+            var c = await Tool(ComputeWardenTools.Acquire("C", "second", bigMemory: true));
 
             // Nothing changes: the renew waits out its waitSeconds.
             var quiet = Stopwatch.StartNew();
@@ -116,7 +104,7 @@ public class AgentArgumentTests
 
             // The holder leaves: the waiting renew answers on the change.
             var watch = Stopwatch.StartNew();
-            var renewing = Tool(ComputeWardenTools.Renew((string)c["reservation_id"]!, waitSeconds: 30));
+            var renewing = Tool(ComputeWardenTools.Renew((string)b["reservation_id"]!, waitSeconds: 30));
             await Task.Delay(300);
             await Tool(ComputeWardenTools.Release((string)a["reservation_id"]!));
             var renewed = await renewing;
@@ -124,31 +112,9 @@ public class AgentArgumentTests
             Assert.Equal("full", (string)renewed["advice"]!["grant"]!);
 
             var status = await Tool(ComputeWardenTools.Status());
-            Assert.True((bool)ClaimOf(status, "C")["holding"]!);
-            Assert.False((bool)ClaimOf(status, "B")["holding"]!);
-            Assert.Equal("queued", (string)(await Tool(ComputeWardenTools.Renew((string)b["reservation_id"]!)))["advice"]!["grant"]!);
-        }
-        finally
-        {
-            TestIsolation.ConfigureDeadGateway();
-        }
-    }
-
-    [Fact]
-    public async Task Mcp_set_mode_covers_only_the_named_resources()
-    {
-        await using var host = StartHost(out var pipe);
-        WardenGateway.Configure(new WardenClient(pipe), autoSpawn: false);
-        try
-        {
-            var set = await Tool(ComputeWardenTools.SetMode("hold", resources: new[] { "gpu" }));
-            Assert.Equal(new[] { "gpu" }, Names(set["mode"]!["resources"]));
-
-            var cpu = await Tool(ComputeWardenTools.Acquire("A", "build", resources: new[] { "cpu" }, kind: "shared"));
-            var gpu = await Tool(ComputeWardenTools.Acquire("B", "render", resources: new[] { "gpu" }, kind: "shared"));
-
-            Assert.Equal("full", (string)cpu["advice"]!["grant"]!);
-            Assert.Equal("queued", (string)gpu["advice"]!["grant"]!);
+            Assert.Equal("running", (string)ClaimOf(status, "B")["phase"]!);
+            Assert.Equal("waiting", (string)ClaimOf(status, "C")["phase"]!);
+            Assert.Equal("queued", (string)(await Tool(ComputeWardenTools.Renew((string)c["reservation_id"]!)))["advice"]!["grant"]!);
         }
         finally
         {
@@ -163,8 +129,9 @@ public class AgentArgumentTests
     {
         await using var host = StartHost(out var pipe);
         var client = new WardenClient(pipe, responseTimeout: TimeSpan.FromSeconds(1));
-        await client.SetModeAsync(UserMode.Steady).Within();
         var claim = await client.AcquireAsync(new ClaimRequest("A", "build", ClaimKind.Shared)).Within();
+        await client.SetManualBusyAsync("throttle for the test").Within();
+        await client.RenewAsync(claim.ReservationId!).Within(); // hears the throttle
 
         var watch = Stopwatch.StartNew();
         var renew = await client.RenewAsync(claim.ReservationId!, waitSeconds: 3).Within();
@@ -206,14 +173,15 @@ public class AgentArgumentTests
         var clock = new FakeClock();
         var warden = TestFactory.NewWarden(clock);
         var d = new RequestDispatcher(warden, pollInterval: TimeSpan.FromMilliseconds(20));
-        warden.SetMode(UserMode.Steady);
         var id = warden.Acquire(new ClaimRequest("A", "build", ClaimKind.Shared, LeaseSeconds: 30)).ReservationId!;
+        warden.SetManualBusy("throttle for the test");
+        warden.Renew(id); // hears the throttle
 
         var pending = d.HandleAsync(JsonSerializer.Serialize(new { v = 1, op = "RENEW", reservationId = id, waitSeconds = 600 }));
 
         // The wait keeps the claim alive for the capped wait plus the reply's margin, not for 600s.
         Assert.Equal(clock.UtcNow.AddSeconds(60 + 15), Assert.Single(warden.GetStatus().Claims!).ExpiresAt);
-        warden.SetMode(UserMode.Auto);
+        warden.ClearManualBusy();
         Assert.Equal("full", (string)JsonNode.Parse(await pending.Within())!["advice"]!["grant"]!);
     }
 

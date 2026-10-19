@@ -54,7 +54,8 @@ public sealed class StateStore : IAsyncDisposable
             var text = File.ReadAllText(_path);
             var state = JsonSerializer.Deserialize<SavedState>(text, Json)
                         ?? throw new JsonException("the file is empty");
-            if (state.V != SavedState.Version)
+            // Version 1 (before 2.0) reads as is: its removed fields are ignored, its exclusive claims read as shared.
+            if (state.V is < 1 or > SavedState.Version)
                 throw new JsonException($"version {state.V}, expected {SavedState.Version}");
             _warden.Restore(state);
             _written = text;

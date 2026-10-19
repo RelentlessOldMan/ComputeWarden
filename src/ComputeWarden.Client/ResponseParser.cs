@@ -34,11 +34,9 @@ internal static class ResponseParser
         State: State(root, "state"),
         CanRunIntensive: Bool(root, "canRunIntensive"),
         Blockers: Blockers(root),
-        BusyResources: ResourcesOpt(root, "busyResources") ?? ResourceSet.None,
-        // A daemon predating sharing sends neither.
-        Mode: root.TryGetProperty("mode", out var m) && m.ValueKind == JsonValueKind.Object ? Mode(m) : null,
         Claims: root.TryGetProperty("claims", out var c) ? Claims(c) : null,
-        DaemonVersion: String(root, "daemonVersion"));
+        DaemonVersion: String(root, "daemonVersion"),
+        GameJobs: IntOpt(root, "gameJobs"));
 
     public static AcquireResult Acquire(JsonElement root) => new(
         Acquired: Bool(root, "acquired"),
@@ -47,28 +45,15 @@ internal static class ResponseParser
         MachineState: State(root, "machineState"),
         Reason: String(root, "reason"),
         Blockers: Blockers(root),
-        Resources: ResourcesOpt(root, "resources") ?? ResourceSet.None,
         Advice: AdviceOpt(root),
-        Kind: String(root, "kind") switch { "shared" => ClaimKind.Shared, "exclusive" => ClaimKind.Exclusive, "solo" => ClaimKind.Solo, _ => null });
+        Kind: String(root, "kind") switch { "solo" => ClaimKind.Solo, null => null, _ => ClaimKind.Shared },
+        BigMemory: Bool(root, "bigMemory"));
 
     public static RenewResult Renew(JsonElement root) => new(
         Renewed: Bool(root, "renewed"),
         ExpiresAt: DateOpt(root, "expiresAt"),
         Reason: String(root, "reason"),
         Advice: AdviceOpt(root));
-
-    public static ModeState Mode(JsonElement e) => new(
-        Mode: String(e, "mode") switch
-        {
-            "steady" => UserMode.Steady,
-            "open" => UserMode.Open,
-            "hold" => UserMode.Hold,
-            _ => UserMode.Auto,
-        },
-        Resources: ResourcesOpt(e, "resources") ?? ResourceSet.All,
-        Reason: String(e, "reason"),
-        SetAt: DateOpt(e, "setAt") ?? DateTimeOffset.MinValue,
-        ExpiresAt: DateOpt(e, "expiresAt"));
 
     private static Advice? AdviceOpt(JsonElement root)
     {
@@ -91,8 +76,7 @@ internal static class ResponseParser
             String(a, "reason"),
             throttle,
             String(a, "how"),
-            queue,
-            ResourcesOpt(a, "contended") ?? ResourceSet.None);
+            queue);
     }
 
     private static IReadOnlyList<ClaimInfo> Claims(JsonElement arr)
@@ -105,16 +89,20 @@ internal static class ResponseParser
                 Id: String(e, "id") ?? string.Empty,
                 Owner: String(e, "owner") ?? string.Empty,
                 Description: String(e, "description") ?? string.Empty,
-                Kind: String(e, "kind") switch { "shared" => ClaimKind.Shared, "solo" => ClaimKind.Solo, _ => ClaimKind.Exclusive },
-                Resources: ResourcesOpt(e, "resources") ?? ResourceSet.All,
+                Kind: String(e, "kind") == "solo" ? ClaimKind.Solo : ClaimKind.Shared,
+                BigMemory: Bool(e, "bigMemory"),
                 Grant: GrantFrom(String(e, "grant")),
-                Holding: Bool(e, "holding"),
                 ExpiresAt: DateOpt(e, "expiresAt") ?? DateTimeOffset.MinValue,
                 EstimateSeconds: IntOpt(e, "estimateSeconds"),
-                Cores: IntOpt(e, "cores"),
-                RamGb: DoubleOpt(e, "ramGb"),
-                UserPriority: String(e, "userPriority"),
-                Position: IntOpt(e, "position")));
+                Position: IntOpt(e, "position"),
+                Phase: String(e, "phase") switch
+                {
+                    "ready" => ClaimPhase.Ready,
+                    "waiting" => ClaimPhase.Waiting,
+                    // An older daemon sends no phase: read it from the grant.
+                    _ => GrantFrom(String(e, "grant")) == Grant.Queued ? ClaimPhase.Waiting : ClaimPhase.Running,
+                },
+                LastCheckIn: DateOpt(e, "lastCheckIn")));
         }
         return list;
     }
