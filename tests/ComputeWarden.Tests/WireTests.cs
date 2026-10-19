@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using ComputeWarden.Client;
@@ -376,6 +377,36 @@ public class WireTests
         Assert.True(timer.Elapsed >= TimeSpan.FromSeconds(6), $"gave up after {timer.Elapsed}"); // backed off 1+2+4 s
         Assert.Contains("run cw wait again", errors.ToString());
         Assert.DoesNotContain("Claim gone", errors.ToString());
+    }
+
+    [Fact]
+    public async Task Cw_wait_retries_a_daemon_that_hangs_up_without_answering()
+    {
+        // What a daemon restart looks like mid-wait: the pipe connects, then closes with no reply.
+        var pipe = TestIsolation.NewPipeName();
+        using var stop = new CancellationTokenSource();
+        var hangUps = 0;
+        var server = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                await using var s = new NamedPipeServerStream(pipe, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances,
+                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                try { await s.WaitForConnectionAsync(stop.Token); } catch (OperationCanceledException) { return; }
+                using var reader = new StreamReader(s, leaveOpen: true);
+                if (await reader.ReadLineAsync() is not null) Interlocked.Increment(ref hangUps); // read the request, answer nothing
+            }
+        });
+        var client = new WardenClient(pipe, connectTimeoutMs: 500);
+        var output = new StringWriter();
+        var errors = new StringWriter();
+
+        Assert.Equal(Cli.Cli.Unreachable, await Cli.Cli.RunAsync(new[] { "wait", "abc" }, client, output, errors).Within());
+
+        Assert.True(hangUps > 0, "the daemon never hung up on cw wait");
+        Assert.DoesNotContain("Claim gone", errors.ToString());
+        stop.Cancel();
+        await server.Within();
     }
 
     [Fact]

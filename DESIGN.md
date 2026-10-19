@@ -337,8 +337,8 @@ its mode is dropped.
 
 Every session claims its builds, tests, and runs (two small tool calls per command) in every
 project, sets `bigMemory` only for jobs over ~8 GB that can't cap themselves, uses `solo` only
-for timing runs of 10 minutes or less (longer only with the user's explicit approval), and follows the advice. Projects need no ComputeWarden notes
-of their own beyond naming which of their jobs are big-memory or solo.
+for timing runs of 10 minutes or less (longer only with the user's explicit approval), and follows the advice. Projects keep no ComputeWarden
+rules of their own, only facts about their jobs' resource needs (duration, peak memory, GPU, disk).
 
 ### Example
 

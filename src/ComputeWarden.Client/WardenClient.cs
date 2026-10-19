@@ -166,8 +166,9 @@ public sealed class WardenClient
                 $"ComputeWarden daemon did not respond within {limit.TotalSeconds:0}s");
         }
 
+        // A transport failure (the daemon restarting, say), not a bad answer: callers retry it like one.
         if (line is null)
-            throw new WardenClientException("Daemon closed the connection without responding");
+            throw new IOException("Daemon closed the connection without responding");
 
         return ResponseParser.Root(line);
     }
