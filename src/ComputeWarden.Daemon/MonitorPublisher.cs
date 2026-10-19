@@ -62,6 +62,7 @@ public sealed class MonitorPublisher : IAsyncDisposable
         .Concat(new object[]
         {
             new { key = "lease", label = "Lease", align = "right" },
+            new { key = "checked", label = "Last check", align = "right" },
             new { key = "what", label = "Doing" }, // last: takes the rest of the width, cut with a tooltip
         })
         .ToArray();
@@ -330,6 +331,13 @@ public sealed class MonitorPublisher : IAsyncDisposable
     // A claim this long without a check-in may be work that's finished or stuck; the panel says so.
     public static readonly TimeSpan NoCheckInAfter = TimeSpan.FromMinutes(15);
 
+    // Minutes since the claim last checked in (acquired or renewed), e.g. "just now", "4m ago", "1h20m ago".
+    private static string Ago(TimeSpan since)
+    {
+        var m = Math.Max(0, (int)since.TotalMinutes);
+        return m == 0 ? "just now" : m < 60 ? $"{m}m ago" : $"{m / 60}h{(m % 60 == 0 ? "" : $"{m % 60}m")} ago";
+    }
+
     private static Dictionary<string, object> ClaimRow(ClaimInfo c, DateTimeOffset now, int? place)
     {
         var (state, color) = c.Phase switch
@@ -351,9 +359,14 @@ public sealed class MonitorPublisher : IAsyncDisposable
             if ((c.Resources & set) != 0) row[key] = new { dot = true, color, tip = $"{key}: {state}" };
 
         var lease = $"{Math.Max(0, (int)Math.Ceiling((c.ExpiresAt - now).TotalMinutes))}m";
-        row["lease"] = c.LastCheckIn is { } seen && now - seen >= NoCheckInAfter
-            ? new { text = $"{lease}, no check-in {(int)(now - seen).TotalMinutes}m", color = "warn", tip = $"no check-in for {(int)(now - seen).TotalMinutes}m" }
-            : lease;
+        row["lease"] = lease;
+        if (c.LastCheckIn is { } seen)
+        {
+            var ago = Ago(now - seen);
+            row["checked"] = now - seen >= NoCheckInAfter
+                ? new { text = ago, color = "warn", tip = $"no check-in for {ago.Replace(" ago", "")}: the work may be finished or stuck" }
+                : ago;
+        }
         return row;
     }
 

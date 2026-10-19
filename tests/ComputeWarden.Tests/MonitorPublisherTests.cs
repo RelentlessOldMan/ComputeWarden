@@ -193,11 +193,12 @@ public class MonitorPublisherTests
         Assert.Equal("its turn, not started, exclusive", FakeSink.Text(sink.Row("B"), "state"));
         Assert.Equal("blue", FakeSink.Dot(sink.Row("B"), "gpu"));
         Assert.StartsWith("running ", FakeSink.Text(sink.Row("C"), "state"));
-        Assert.DoesNotContain("no check-in", FakeSink.Text(sink.Row("C"), "lease"));
+        Assert.Equal("just now", FakeSink.Text(sink.Row("C"), "checked"));
 
         clock.Advance(MonitorPublisher.NoCheckInAfter + TimeSpan.FromMinutes(1));
         publisher.Publish();
-        Assert.EndsWith(", no check-in 16m", FakeSink.Text(sink.Row("C"), "lease"));
+        Assert.Equal("16m ago", FakeSink.Text(sink.Row("C"), "checked"));
+        Assert.Matches("^[0-9]+m$", FakeSink.Text(sink.Row("C"), "lease"));
     }
 
     [Fact]
