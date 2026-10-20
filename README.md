@@ -63,6 +63,21 @@ cw hold off               # back to normal
 Inside a Claude Code session you can run it as `! cw hold`. Agents turn the hold on or off
 (`computewarden_set_manual_busy`) only when you tell them to.
 
+### `cw run`: claim, run, throttle, release
+
+```powershell
+cw run --estimate 10m --owner "Claude Code (MyRepo)" -- dotnet test
+```
+
+Agents run heavy jobs through `cw run` instead of claiming by hand. It acquires (with
+`--big-memory` or `--solo` if asked), waits its turn, runs the command and releases when it
+exits, passing the command's exit code back. The command runs in its own Windows job object, so
+everything it starts (test hosts, compiler servers) is in it too. While the claim says
+`throttled` (a game, or the hold), the whole job is held to the throttle's cores (never core 0)
+and priority; when it says `full` again, the job goes back to every core at normal priority.
+Work started before the game slows down the moment the game starts, not at the agent's next
+renew. If the daemon isn't there, the command runs unclaimed. Ending `cw run` ends the job.
+
 ## Install
 
 Windows x64. Self-contained, so you don't need the .NET runtime.
@@ -111,12 +126,13 @@ You should get something like:
 Agents only help if they report their work. Add this to your agent's **global** instructions
 (Claude Code: `~/.claude/CLAUDE.md`; Codex: `~/.codex/AGENTS.md`), so every session on the
 machine follows it, not just one project's. A copy is in [`examples/CLAUDE.md`](examples/CLAUDE.md).
-Each command costs two small tool calls (acquire and release):
+Each command costs two small tool calls (acquire and release), or none through `cw run`:
 
 ```markdown
 ## ComputeWarden (shared machine)
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
 - **Claim every build, test run, and app run:** call `computewarden_acquire` right before the command, with an owner like "Claude Code (<repo>)", a description, and `estimateSeconds` (err high: it sets the lease). Release as soon as it exits, even if it failed; renew within the lease during long runs (if a renew says `renewed: false`, acquire again). Don't hold a claim while reading, editing, or waiting on the user.
+- **Heavy jobs:** for a build, test run or app run longer than a minute, run `cw run --estimate <duration> --owner "<owner>" -- <command>` (add `--big-memory` or `--solo` per the rules below) instead of acquiring by hand. It waits its turn, slows the command down the moment a game starts and back up after, and releases when the command exits; its exit code is the command's.
 - **Big memory:** set `bigMemory: true` only if the job needs more than ~8 GB of RAM and can't cap it (cap it if you can), or needs more than half the GPU's memory. Only one big-memory job runs at a time.
 - **Timing runs:** `kind: "solo"` only for a timing test or benchmark, at most 10 minutes (`estimateSeconds` ≤ 600). It waits for a quiet machine; release the moment the measured run ends. A longer solo run (up to 60 minutes) needs the user's explicit approval for that run: only then set `userApproved: true`. Without it, split the run into timed pieces of 10 minutes or less, or run it as shared.
 - **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) is the user's call only.
@@ -286,7 +302,7 @@ Other client ┘                        │       cw.exe (you) ─┐
 | `src/ComputeWarden.Daemon` | Background process: pipe server, process polling, YAML config, logging, single-instance guard. |
 | `src/ComputeWarden.Client` | `WardenClient`, a typed client for the pipe protocol. |
 | `src/ComputeWarden.Mcp` | The stdio MCP adapter; starts the daemon on demand. |
-| `src/ComputeWarden.Cli` | `cw`: status, the manual hold, and `cw wait`, from a terminal. |
+| `src/ComputeWarden.Cli` | `cw`: status, the manual hold, `cw wait` and `cw run`, from a terminal. |
 | `tests/ComputeWarden.Tests` | xUnit tests. |
 
 [`DESIGN.md`](DESIGN.md) explains the design decisions (state model, acquire algorithm,

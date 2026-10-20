@@ -173,7 +173,7 @@ ComputeWarden.slnx
 │   ├── ComputeWarden.Daemon/      # ProcessMonitor, LeaseSweeper, named-pipe server, host, logs
 │   ├── ComputeWarden.Client/      # IPC client library (used by the adapter and cw)
 │   ├── ComputeWarden.Mcp/         # stdio MCP adapter + auto-spawn logic
-│   └── ComputeWarden.Cli/         # cw: status, the hold, and cw wait
+│   └── ComputeWarden.Cli/         # cw: status, the hold, cw wait and cw run
 └── tests/
     └── ComputeWarden.Tests/       # xUnit
 ```
@@ -292,6 +292,16 @@ ruled out).
   start (0), when the claim is gone (1), after `--max` (default 1h) still queued (3), or when
   the daemon stays unreachable after a few retries (4). An agent runs it as a background
   command, so it does other work and is woken on exit instead of polling.
+- **`cw run`:** acquires, long-polls the owner's renew while queued, then starts the command
+  suspended, puts it in a new job object and resumes it, so nothing it spawns escapes the job.
+  While it runs, a long-poll renew loop applies each change of advice to the job: `throttled`
+  sets the job's affinity limit to `max_cores` cores picked at random from all but core 0, and
+  its priority-class limit to the throttle priority; `full` after a throttle sets every core and
+  normal priority (a job never throttled is left as the command set itself). The job is
+  kill-on-close, so ending `cw run` ends the tree; the claim is released when the command
+  exits. A lost claim is acquired again; an unreachable daemon at the start (an error and one
+  retry) means the command runs unclaimed. Memory isn't capped: a job memory limit fails
+  allocations, which would crash the work instead of slowing it.
 - **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
   grant differs from the last one it was told, or the wait runs out. The claim is kept alive
   for the wait (plus 15 s). The dispatcher polls `Warden.PeekGrant`, then does the real

@@ -10,7 +10,8 @@ namespace ComputeWarden.Cli;
 /// <summary>
 /// <c>cw</c>: the user's own controls. Shows what's running and turns the manual hold on and off
 /// (which agents only do on the user's word). Also <c>cw wait</c>, which agents run in the
-/// background to hear when a queued claim may start.
+/// background to hear when a queued claim may start, and <c>cw run</c>, which claims, runs and
+/// throttles a command for them.
 /// </summary>
 internal static class Cli
 {
@@ -28,6 +29,15 @@ internal static class Cli
                                      Gives up after --max (default 1h). Exit codes: 0 your turn,
                                      3 still queued (run it again), 1 claim gone (acquire again),
                                      4 daemon unreachable (run it again).
+          cw run --estimate <duration> [--owner <name>] [--description <text>]
+                 [--big-memory] [--solo [--user-approved]] -- <command> [args...]
+                                     Claim, wait in line, run the command, release when it exits.
+                                     While a game runs (or the hold is on), the command and
+                                     everything it started are held to the throttle's cores and
+                                     priority, and go back to full speed when it ends. Exits with
+                                     the command's exit code (127: it couldn't start). With no
+                                     daemon, the command runs unclaimed. Example:
+                                       cw run --estimate 10m --owner "Claude Code (MyRepo)" -- dotnet test
         How many jobs may run while you game is set on the panel (jobs while gaming).
         """;
 
@@ -40,7 +50,7 @@ internal static class Cli
         try
         {
             var command = args.Length == 0 ? "status" : args[0].ToLowerInvariant();
-            if (launch is not null && command is "status" or "hold")
+            if (launch is not null && command is "status" or "hold" or "run")
                 await EnsureDaemonAsync(client, launch);
             switch (command)
             {
@@ -60,6 +70,9 @@ internal static class Cli
 
                 case "wait":
                     return await WaitAsync(args.Skip(1).ToArray(), client, stdout, stderr);
+
+                case "run":
+                    return await RunCommand.RunAsync(args.Skip(1).ToArray(), client, stderr);
 
                 case "help" or "-h" or "--help" or "/?":
                     stdout.WriteLine(Usage);
