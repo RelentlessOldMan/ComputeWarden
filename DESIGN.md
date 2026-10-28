@@ -301,7 +301,10 @@ ruled out).
   kill-on-close, so ending `cw run` ends the tree; the claim is released when the command
   exits. A lost claim is acquired again; an unreachable daemon at the start (an error and one
   retry) means the command runs unclaimed. Memory isn't capped: a job memory limit fails
-  allocations, which would crash the work instead of slowing it.
+  allocations, which would crash the work instead of slowing it. `--low` throttles the job to
+  one core at below-normal priority before it resumes and ignores the advice after; it also
+  sets `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `UseSharedCompilation=false` for the command, since
+  a compiler server started outside the job would do its work outside the limit.
 - **Long-poll:** `RENEW` with `waitSeconds` (max 60) holds the answer until the claim's
   grant differs from the last one it was told, or the wait runs out. The claim is kept alive
   for the wait (plus 15 s). The dispatcher polls `Warden.PeekGrant`, then does the real

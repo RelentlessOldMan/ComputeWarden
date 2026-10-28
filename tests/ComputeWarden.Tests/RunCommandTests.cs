@@ -100,6 +100,75 @@ public class RunCommandTests
     }
 
     [Fact]
+    public async Task Low_holds_the_job_small_from_the_start_and_through_a_game()
+    {
+        await using var host = StartHost(out var client);
+        var log = new Log();
+        var running = Run(client, log, "--estimate", "5m", "--owner", "T", "--low", "--", "ping", "-n", "120", "127.0.0.1");
+        await log.WaitFor("Started pid");
+        Assert.Contains("low: one core at below-normal priority", log.ToString());
+        var pid = int.Parse(System.Text.RegularExpressions.Regex.Match(log.ToString(), @"pid (\d+)").Groups[1].Value);
+        using var ping = Process.GetProcessById(pid);
+
+        void AssertSmall()
+        {
+            ping.Refresh();
+            Assert.Equal(ProcessPriorityClass.BelowNormal, ping.PriorityClass);
+            Assert.Equal(1, BitOperations.PopCount((ulong)ping.ProcessorAffinity));
+        }
+
+        try
+        {
+            AssertSmall();
+            // A game coming and going doesn't let it go: the claim's long poll answers, and nothing changes.
+            await client.SetManualBusyAsync("a game");
+            await WaitForGrant(client, Core.Model.Grant.Throttled);
+            await client.ClearManualBusyAsync();
+            await WaitForGrant(client, Core.Model.Grant.Full);
+            await Task.Delay(500);
+            AssertSmall();
+            Assert.DoesNotContain("Full speed again", log.ToString());
+        }
+        finally
+        {
+            ping.Kill();
+        }
+        await running.Within();
+    }
+
+    private static async Task WaitForGrant(WardenClient client, Core.Model.Grant grant)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        while (Assert.Single((await client.StatusAsync()).Claims!).Grant != grant)
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"the claim never became {grant}");
+            await Task.Delay(25);
+        }
+    }
+
+    [Fact]
+    public async Task Low_turns_off_shared_compiler_servers_for_the_command()
+    {
+        var client = new WardenClient("ComputeWarden-Test-" + Guid.NewGuid().ToString("N"), connectTimeoutMs: 50);
+        var log = new Log();
+
+        Assert.Equal(9, await Run(client, log, "--estimate", "1m", "--low", "--", "cmd", "/c",
+            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
+        Assert.Equal(0, await Run(client, log, "--estimate", "1m", "--", "cmd", "/c",
+            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
+    }
+
+    [Fact]
+    public void Environment_block_keeps_this_process_s_variables_under_the_overrides()
+    {
+        var block = ThrottledJob.EnvironmentBlock(new Dictionary<string, string> { ["UseSharedCompilation"] = "false" });
+        var vars = block.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Contains("UseSharedCompilation=false", vars);
+        Assert.Contains(vars, v => v.StartsWith("PATH=", StringComparison.OrdinalIgnoreCase));
+        Assert.EndsWith("\0", block);
+    }
+
+    [Fact]
     public async Task Waits_its_turn_before_starting()
     {
         await using var host = StartHost(out var client);

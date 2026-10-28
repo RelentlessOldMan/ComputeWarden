@@ -28,8 +28,9 @@ internal sealed class ThrottledJob : IDisposable
     }
 
     /// <summary>Starts <paramref name="commandLine"/> in a new job, with this process's console and standard handles.</summary>
+    /// <param name="environment">Variables set for the command on top of this process's own (null: just this process's).</param>
     /// <exception cref="Win32Exception">The command couldn't be started (not found, access denied).</exception>
-    public static ThrottledJob Start(string commandLine)
+    public static ThrottledJob Start(string commandLine, IReadOnlyDictionary<string, string>? environment = null)
     {
         var job = CreateJobObject(IntPtr.Zero, null);
         if (job.IsInvalid) throw new Win32Exception();
@@ -44,9 +45,18 @@ internal sealed class ThrottledJob : IDisposable
                 hStdOutput = GetStdHandle(Native.StdOutput),
                 hStdError = GetStdHandle(Native.StdError),
             };
-            if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true,
-                    Native.CreateSuspended | Native.CreateUnicodeEnvironment, IntPtr.Zero, null, ref si, out var pi))
-                throw new Win32Exception();
+            var block = environment is null ? IntPtr.Zero : Marshal.StringToHGlobalUni(EnvironmentBlock(environment));
+            ProcessInformation pi;
+            try
+            {
+                if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true,
+                        Native.CreateSuspended | Native.CreateUnicodeEnvironment, block, null, ref si, out pi))
+                    throw new Win32Exception();
+            }
+            finally
+            {
+                if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
+            }
 
             var process = new SafeWaitHandle(pi.hProcess, ownsHandle: true);
             using var thread = new SafeWaitHandle(pi.hThread, ownsHandle: true);
@@ -65,6 +75,21 @@ internal sealed class ThrottledJob : IDisposable
             job.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// This process's variables with <paramref name="overrides"/> on top, as CreateProcess wants
+    /// them: sorted name=value strings, each ending in a null, then one more (the marshaller adds it).
+    /// </summary>
+    internal static string EnvironmentBlock(IReadOnlyDictionary<string, string> overrides)
+    {
+        var vars = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
+            vars[(string)e.Key] = (string?)e.Value ?? "";
+        foreach (var (name, value) in overrides) vars[name] = value;
+        var sb = new StringBuilder();
+        foreach (var (name, value) in vars) sb.Append(name).Append('=').Append(value).Append('\0');
+        return sb.ToString();
     }
 
     /// <summary>Waits for the command (not its children) to exit and returns its exit code.</summary>

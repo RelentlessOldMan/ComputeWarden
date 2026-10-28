@@ -30,12 +30,14 @@ internal static class Cli
                                      3 still queued (run it again), 1 claim gone (acquire again),
                                      4 daemon unreachable (run it again).
           cw run --estimate <duration> [--owner <name>] [--description <text>]
-                 [--big-memory] [--solo [--user-approved]] -- <command> [args...]
+                 [--big-memory] [--solo [--user-approved]] [--low] -- <command> [args...]
                                      Claim, wait in line, run the command, release when it exits.
                                      While a game runs (or the hold is on), the command and
                                      everything it started are held to the throttle's cores and
                                      priority, and go back to full speed when it ends. Exits with
-                                     the command's exit code (127: it couldn't start). With no
+                                     the command's exit code (127: it couldn't start). --low holds
+                                     it to one core at below-normal priority the whole time (for
+                                     reviews and mutation testing). With no
                                      daemon, the command runs unclaimed. Example:
                                        cw run --estimate 10m --owner "Claude Code (MyRepo)" -- dotnet test
         How many jobs may run while you game is set on the panel (jobs while gaming).

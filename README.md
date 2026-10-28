@@ -78,6 +78,11 @@ and priority; when it says `full` again, the job goes back to every core at norm
 Work started before the game slows down the moment the game starts, not at the agent's next
 renew. If the daemon isn't there, the command runs unclaimed. Ending `cw run` ends the job.
 
+`--low` holds the job to one core at below-normal priority from start to finish, whatever the
+advice, and turns off the shared compiler and MSBuild servers (one started earlier runs outside
+the job, so work handed to it would escape the limit). Reviews and mutation testing use it: they
+fan out many subagents, and ComputeWarden only limits how many jobs run while you game.
+
 ## Install
 
 Windows x64. Self-contained, so you don't need the .NET runtime.
@@ -133,10 +138,11 @@ Each command costs two small tool calls (acquire and release), or none through `
 `computewarden_*` MCP tools share this machine with other agent sessions and the user's games. Advisory: nothing enforces it, so follow the advice. If the tools aren't there, or a call returns `error` and one retry does too, work normally.
 - **Claim every build, test run, and app run:** call `computewarden_acquire` right before the command, with an owner like "Claude Code (<repo>)", a description, and `estimateSeconds` (err high: it sets the lease). Release as soon as it exits, even if it failed; renew within the lease during long runs (if a renew says `renewed: false`, acquire again). Don't hold a claim while reading, editing, or waiting on the user.
 - **Heavy jobs:** for a build, test run or app run longer than a minute, run `cw run --estimate <duration> --owner "<owner>" -- <command>` (add `--big-memory` or `--solo` per the rules below) instead of acquiring by hand. It waits its turn, slows the command down the moment a game starts and back up after, and releases when the command exits; its exit code is the command's.
+- **Reviews and mutation testing:** run every build and test they start, however short, as `cw run --low --estimate <duration> --owner "<owner>" -- <command>`, and tell review subagents to do the same. `--low` holds the job to one core at below-normal priority the whole time, so a fan-out of subagents can't take the machine.
 - **Big memory:** set `bigMemory: true` only if the job needs more than ~8 GB of RAM and can't cap it (cap it if you can), or needs more than half the GPU's memory. Only one big-memory job runs at a time.
 - **Timing runs:** `kind: "solo"` only for a timing test or benchmark, at most 10 minutes (`estimateSeconds` ≤ 600). It waits for a quiet machine; release the moment the measured run ends. A longer solo run (up to 60 minutes) needs the user's explicit approval for that run: only then set `userApproved: true`. Without it, split the run into timed pieces of 10 minutes or less, or run it as shared.
 - **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) is the user's call only.
-- **Project notes:** a project's CLAUDE.md, AGENTS.md or memory may record only facts about its jobs' resource needs: how long a job takes, its peak memory or memory cap, GPU use, heavy disk I/O. No ComputeWarden rules there (claim kinds, owners, which job is solo or bigMemory, how to claim); this section is the only copy of those. Decide each claim from these rules and those facts. If you find ComputeWarden rules in a project, delete them and keep the facts.
+- **Project notes:** a project's CLAUDE.md, AGENTS.md or memory may record only facts about its jobs' resource needs: how long a job takes, its peak memory or memory cap, GPU use, heavy disk I/O. No ComputeWarden or priority rules there (claim kinds, owners, which job is solo, bigMemory or `--low`, how to claim, "always run on one core" or "at low priority"); this section is the only copy of those. When the user asks for a job to run small, do it for that job; don't save it as a standing rule. Decide each claim from these rules and those facts. If you find ComputeWarden or priority rules in a project, delete them and keep the facts.
 ```
 
 Projects don't need their own ComputeWarden notes. At most, a project's instructions can name

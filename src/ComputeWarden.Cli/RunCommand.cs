@@ -15,7 +15,7 @@ namespace ComputeWarden.Cli;
 /// </summary>
 internal static class RunCommand
 {
-    public const string UsageLine = "cw run --estimate <duration> [--owner <name>] [--description <text>] [--big-memory] [--solo [--user-approved]] -- <command> [args...]";
+    public const string UsageLine = "cw run --estimate <duration> [--owner <name>] [--description <text>] [--big-memory] [--solo [--user-approved]] [--low] -- <command> [args...]";
 
     /// <summary>The command couldn't be started (not found, access denied): the shell's convention.</summary>
     public const int CouldNotStart = 127;
@@ -23,7 +23,8 @@ internal static class RunCommand
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan QueueNotice = TimeSpan.FromMinutes(10);
 
-    private sealed record Options(ClaimRequest Claim, string[] Command);
+    /// <param name="Low">One core at below-normal priority from start to finish, whatever the advice.</param>
+    private sealed record Options(ClaimRequest Claim, string[] Command, bool Low);
 
     public static async Task<int> RunAsync(string[] args, WardenClient client, TextWriter stderr)
     {
@@ -38,13 +39,23 @@ internal static class RunCommand
         try
         {
             var claim = await AcquireAsync(client, options.Claim, stderr);
-            return await RunClaimedAsync(client, options.Claim, claim, commandLine, stderr);
+            return await RunClaimedAsync(client, options, claim, commandLine, stderr);
         }
         finally
         {
             Console.CancelKeyPress -= KeepRunning;
         }
     }
+
+    /// <summary>
+    /// For --low: no shared compiler or MSBuild server. One already running from an earlier build
+    /// sits outside this job, so work handed to it would escape the core and priority limit.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> LowEnvironment = new Dictionary<string, string>
+    {
+        ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
+        ["UseSharedCompilation"] = "false",
+    };
 
     // Ctrl+C reaches the command too (it shares the console): let it end, then release as usual.
     private static void KeepRunning(object? sender, ConsoleCancelEventArgs e) => e.Cancel = true;
@@ -108,12 +119,15 @@ internal static class RunCommand
         return claim;
     }
 
-    private static async Task<int> RunClaimedAsync(WardenClient client, ClaimRequest request, Claim claim, string commandLine, TextWriter stderr)
+    private static async Task<int> RunClaimedAsync(WardenClient client, Options options, Claim claim, string commandLine, TextWriter stderr)
     {
+        var request = options.Claim;
         ThrottledJob job;
         try
         {
-            job = ThrottledJob.Start(commandLine);
+            job = ThrottledJob.Start(commandLine, options.Low ? LowEnvironment : null);
+            // Held small before the command's first instruction, and never let go.
+            if (options.Low) job.Throttle(1, "below_normal");
         }
         catch (Win32Exception ex)
         {
@@ -127,6 +141,7 @@ internal static class RunCommand
             var throttled = false;
             void Apply()
             {
+                if (options.Low) return;
                 var advice = claim.Advice;
                 // Queued while running (a lost claim acquired again) is the same as throttled: we're already going.
                 if (advice?.Grant is Grant.Throttled or Grant.Queued)
@@ -147,7 +162,7 @@ internal static class RunCommand
             }
 
             var grant = claim.Advice is { } a ? Warden.GrantName(a.Grant) : "unclaimed";
-            stderr.WriteLine($"[cw] Started pid {job.ProcessId} ({grant}).");
+            stderr.WriteLine($"[cw] Started pid {job.ProcessId} ({grant}{(options.Low ? ", low: one core at below-normal priority" : "")}).");
             Apply();
 
             var exited = job.WaitForExitAsync();
@@ -222,7 +237,7 @@ internal static class RunCommand
         options = null!;
         string? owner = null, description = null;
         int? estimate = null;
-        bool bigMemory = false, solo = false, userApproved = false;
+        bool bigMemory = false, solo = false, userApproved = false, low = false;
         var i = 0;
         for (; i < args.Length; i++)
         {
@@ -244,6 +259,7 @@ internal static class RunCommand
                 case "--big-memory": bigMemory = true; break;
                 case "--solo": solo = true; break;
                 case "--user-approved": userApproved = true; break;
+                case "--low": low = true; break;
                 default:
                     stderr.WriteLine($"Unexpected '{arg}'. Usage: {UsageLine}");
                     return false;
@@ -259,7 +275,7 @@ internal static class RunCommand
         owner ??= $"cw run ({Path.GetFileName(Environment.CurrentDirectory.TrimEnd('\\', '/'))})";
         description ??= Truncate(string.Join(' ', command), 120);
         options = new Options(new ClaimRequest(owner, description, solo ? ClaimKind.Solo : ClaimKind.Shared, bigMemory,
-            EstimateSeconds: estimate, UserApproved: userApproved), command);
+            EstimateSeconds: estimate, UserApproved: userApproved), command, low);
         return true;
     }
 
