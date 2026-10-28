@@ -48,13 +48,14 @@ internal static class RunCommand
     }
 
     /// <summary>
-    /// No shared compiler or MSBuild server for the command. One already running from an earlier build
+    /// No shared compiler or MSBuild server, and no reused MSBuild worker nodes, for the command. One already running from an earlier build
     /// sits outside this job, so work handed to it would escape the core and priority limit.
     /// </summary>
     private static readonly IReadOnlyDictionary<string, string> NoSharedServers = new Dictionary<string, string>
     {
         ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
         ["UseSharedCompilation"] = "false",
+        ["MSBUILDDISABLENODEREUSE"] = "1",
     };
 
     // Ctrl+C reaches the command too (it shares the console): let it end, then release as usual.

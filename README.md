@@ -73,8 +73,8 @@ Agents run heavy jobs through `cw run` instead of claiming by hand. It acquires 
 `--big-memory` or `--solo` if asked), waits its turn, runs the command and releases when it
 exits, passing the command's exit code back. The command runs in its own Windows job object, so
 everything it starts (test hosts, compiler servers) is in it too. It turns off the shared
-compiler and MSBuild servers for the command: one started earlier by another build runs outside
-the job, so work handed to it would keep full speed through a game. While the claim says
+compiler and MSBuild servers and MSBuild node reuse for the command: one started earlier by
+another build runs outside the job, so work handed to it would keep full speed through a game. While the claim says
 `throttled` (a game, or the hold), the whole job is held to the throttle's cores (never core 0)
 and priority; when it says `full` again, the job goes back to every core at normal priority.
 Work started before the game slows down the moment the game starts, not at the agent's next

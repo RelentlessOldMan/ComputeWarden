@@ -153,9 +153,9 @@ public class RunCommandTests
         var log = new Log();
 
         Assert.Equal(9, await Run(client, log, "--estimate", "1m", "--low", "--", "cmd", "/c",
-            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
+            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%%MSBUILDDISABLENODEREUSE%==false01 exit 9").Within());
         Assert.Equal(9, await Run(client, log, "--estimate", "1m", "--", "cmd", "/c",
-            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
+            "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%%MSBUILDDISABLENODEREUSE%==false01 exit 9").Within());
     }
 
     [Fact]
