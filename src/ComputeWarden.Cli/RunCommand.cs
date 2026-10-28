@@ -48,10 +48,10 @@ internal static class RunCommand
     }
 
     /// <summary>
-    /// For --low: no shared compiler or MSBuild server. One already running from an earlier build
+    /// No shared compiler or MSBuild server for the command. One already running from an earlier build
     /// sits outside this job, so work handed to it would escape the core and priority limit.
     /// </summary>
-    private static readonly IReadOnlyDictionary<string, string> LowEnvironment = new Dictionary<string, string>
+    private static readonly IReadOnlyDictionary<string, string> NoSharedServers = new Dictionary<string, string>
     {
         ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
         ["UseSharedCompilation"] = "false",
@@ -125,7 +125,7 @@ internal static class RunCommand
         ThrottledJob job;
         try
         {
-            job = ThrottledJob.Start(commandLine, options.Low ? LowEnvironment : null);
+            job = ThrottledJob.Start(commandLine, NoSharedServers);
             // Held small before the command's first instruction, and never let go.
             if (options.Low) job.Throttle(1, "below_normal");
         }

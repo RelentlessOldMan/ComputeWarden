@@ -147,14 +147,14 @@ public class RunCommandTests
     }
 
     [Fact]
-    public async Task Low_turns_off_shared_compiler_servers_for_the_command()
+    public async Task Turns_off_shared_compiler_servers_for_the_command()
     {
         var client = new WardenClient("ComputeWarden-Test-" + Guid.NewGuid().ToString("N"), connectTimeoutMs: 50);
         var log = new Log();
 
         Assert.Equal(9, await Run(client, log, "--estimate", "1m", "--low", "--", "cmd", "/c",
             "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
-        Assert.Equal(0, await Run(client, log, "--estimate", "1m", "--", "cmd", "/c",
+        Assert.Equal(9, await Run(client, log, "--estimate", "1m", "--", "cmd", "/c",
             "if %UseSharedCompilation%%DOTNET_CLI_USE_MSBUILD_SERVER%==false0 exit 9").Within());
     }
 
