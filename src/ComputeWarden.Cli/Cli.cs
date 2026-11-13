@@ -23,6 +23,10 @@ internal static class Cli
                                      is told to run small, as if a game ran. Example:
                                        cw hold recording a video
           cw hold off                Turn the manual hold off.
+          cw game-jobs [<0-12>]      Show, or set, how many jobs may run while you game. Each runs
+                                     on one core; lowering it makes the next jobs wait. Kept
+                                     across restarts. Example:
+                                       cw game-jobs 1
           cw wait <reservationId> [--max <duration>]
                                      Wait until a queued claim may start, keeping it alive in line,
                                      then print its advice. For agents: run it in the background.
@@ -40,7 +44,6 @@ internal static class Cli
                                      reviews and mutation testing). With no
                                      daemon, the command runs unclaimed. Example:
                                        cw run --estimate 10m --owner "Claude Code (MyRepo)" -- dotnet test
-        How many jobs may run while you game is set on the panel (jobs while gaming).
         """;
 
     private static readonly TimeSpan StartupWait = TimeSpan.FromSeconds(8);
@@ -52,7 +55,7 @@ internal static class Cli
         try
         {
             var command = args.Length == 0 ? "status" : args[0].ToLowerInvariant();
-            if (launch is not null && command is "status" or "hold" or "run")
+            if (launch is not null && command is "status" or "hold" or "game-jobs" or "run")
                 await EnsureDaemonAsync(client, launch);
             switch (command)
             {
@@ -69,6 +72,18 @@ internal static class Cli
                     await client.SetManualBusyAsync(reason);
                     stdout.WriteLine($"Hold on: {reason}. Nothing new starts until 'cw hold off'.");
                     return 0;
+
+                case "game-jobs" when args.Length == 1:
+                    stdout.WriteLine($"Jobs while gaming: {(await client.StatusAsync()).GameJobs?.ToString() ?? "unknown"}.");
+                    return 0;
+
+                case "game-jobs" when args.Length == 2 && int.TryParse(args[1], out var jobs) && jobs is >= 0 and <= Warden.MaxGameJobs:
+                    stdout.WriteLine($"Jobs while gaming: {await client.SetGameJobsAsync(jobs)}.");
+                    return 0;
+
+                case "game-jobs":
+                    stderr.WriteLine($"Usage: cw game-jobs [<0-{Warden.MaxGameJobs}>]");
+                    return 2;
 
                 case "wait":
                     return await WaitAsync(args.Skip(1).ToArray(), client, stdout, stderr);

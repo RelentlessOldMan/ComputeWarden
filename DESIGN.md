@@ -254,7 +254,7 @@ hold is on, or while the state is UNKNOWN (the process list can't be read, so a 
 ruled out).
 
 1. **Slowed:** every running claim is told `throttled`. At most `game_jobs` claims (default 3,
-   0..12, set on the panel and kept across restarts) run; later ones are `queued`. Measured on
+   0..12, set with `cw game-jobs` and kept across restarts) run; later ones are `queued`. Measured on
    a 6-core desktop, a game's fps falls with the memory traffic of the work beside it, roughly
    per busy core, whatever its priority; with one core per throttled job, this number is the
    knob that controls it. Work already running is never told `queued`, only `throttled`: it
@@ -313,12 +313,12 @@ ruled out).
 
 ### The user's controls
 
-- **Manual hold:** `cw hold [reason]` / `cw hold off`, the panel's Hold switch, or an agent
-  calling `computewarden_set_manual_busy` on the user's explicit word. See rule 1.
-- **Jobs while gaming:** the panel's picker (0 to 4), or `game_jobs` in the config.
+- **Manual hold:** `cw hold [reason]` / `cw hold off`, or an agent calling
+  `computewarden_set_manual_busy` on the user's explicit word. See rule 1.
+- **Jobs while gaming:** `cw game-jobs <0-12>`, an agent calling `computewarden_set_game_jobs`
+  on the user's explicit word, or `game_jobs` in the config until one of those sets it.
 
-Both are the user's call: the panel only accepts them from a monitor, never from another app
-on the hub.
+Both are the user's call; the tool descriptions tell agents never to use them on their own.
 
 ### Estimates
 

@@ -116,6 +116,15 @@ public sealed class WardenClient
         return root.TryGetProperty("cleared", out var v) && v.ValueKind == JsonValueKind.True;
     }
 
+    /// <summary>Sets how many jobs may run beside a game (the user's call); returns the value now in force.</summary>
+    public async Task<int> SetGameJobsAsync(int jobs, CancellationToken ct = default)
+    {
+        var root = await SendAsync(new IpcRequest { Op = IpcOps.SetGameJobs, Jobs = jobs }, ct);
+        if (!root.TryGetProperty("gameJobs", out var v) || !v.TryGetInt32(out var set))
+            throw new WardenClientException("Response missing 'gameJobs'");
+        return set;
+    }
+
     public async Task<WardenStats> StatsAsync(CancellationToken ct = default)
         => ResponseParser.Stats(await SendAsync(new IpcRequest { Op = IpcOps.Stats }, ct));
 

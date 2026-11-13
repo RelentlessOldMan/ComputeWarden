@@ -34,7 +34,7 @@ An agent **claims** before each build, test or run and releases when it ends. Th
 
 **Gaming** means a program from your config's `process_rules` is running. While one runs, work
 already running is told to shrink (never to stop), and at most `game_jobs` claims run (3 by
-default; you can change it on the panel). Later ones wait their turn. Your **manual hold**
+default; change it with `cw game-jobs <n>`, or ask an agent to). Later ones wait their turn. Your **manual hold**
 (`cw hold`) works the same way, except nothing new starts at all. If ComputeWarden can't read
 the process list (state `UNKNOWN`), it treats that as gaming too.
 
@@ -62,6 +62,14 @@ cw hold off               # back to normal
 
 Inside a Claude Code session you can run it as `! cw hold`. Agents turn the hold on or off
 (`computewarden_set_manual_busy`) only when you tell them to.
+
+```
+cw game-jobs              # how many jobs may run while you game
+cw game-jobs 1            # set it (0 to 12); kept across restarts
+```
+
+Lowering it makes the next jobs wait; work already running keeps going. You can also tell an
+agent to do it (`computewarden_set_game_jobs`); agents never change it on their own.
 
 ### `cw run`: claim, run, throttle, release
 
@@ -142,7 +150,7 @@ Each command costs two small tool calls (acquire and release), or none through `
 - **Reviews and mutation testing:** run every build and test they start, however short, as `cw run --low --estimate <duration> --owner "<owner>" -- <command>`, and tell review subagents to do the same. `--low` holds the job to one core at below-normal priority the whole time, so a fan-out of subagents can't take the machine.
 - **Big memory:** set `bigMemory: true` only if the job needs more than ~8 GB of RAM and can't cap it (cap it if you can), or needs more than half the GPU's memory. Only one big-memory job runs at a time.
 - **Timing runs:** `kind: "solo"` only for a timing test or benchmark, at most 10 minutes (`estimateSeconds` ≤ 600). It waits for a quiet machine; release the moment the measured run ends. A longer solo run (up to 60 minutes) needs the user's explicit approval for that run: only then set `userApproved: true`. Without it, split the run into timed pieces of 10 minutes or less, or run it as shared.
-- **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) is the user's call only.
+- **Follow `advice.grant`:** `full`: run normally. `throttled` (the user is gaming, or has put on the hold): run small per `advice.how`; when a renew says `full`, go full speed. `queued`: don't start; run `cw wait <reservation_id>` in the background and do other work. When it exits 0, renew and start right away; exit 3 or 4 means run it again, exit 1 means acquire again. Without background commands, renew with `waitSeconds: 60` until the grant changes. If you've waited more than 10 minutes, ask the user. The manual hold (`computewarden_set_manual_busy`) and jobs while gaming (`computewarden_set_game_jobs`) are the user's call only.
 - **Project notes:** a project's CLAUDE.md, AGENTS.md or memory may record only facts about its jobs' resource needs: how long a job takes, its peak memory or memory cap, GPU use, heavy disk I/O. No ComputeWarden or priority rules there (claim kinds, owners, which job is solo, bigMemory or `--low`, how to claim, "always run on one core" or "at low priority"); this section is the only copy of those. When the user asks for a job to run small, do it for that job; don't save it as a standing rule. Decide each claim from these rules and those facts. If you find ComputeWarden or priority rules in a project, delete them and keep the facts.
 ```
 
@@ -160,6 +168,7 @@ which of its jobs are big-memory or solo, and how to cap a job's memory.
 | `computewarden_can_run` | Would new work run full right now? Informational only: it reserves nothing. |
 | `computewarden_set_manual_busy` | Turns on the manual hold. **User only:** agents call it only on your word. |
 | `computewarden_clear_manual_busy` | Turns the hold off. **User only.** |
+| `computewarden_set_game_jobs` | Sets how many jobs may run while you game (0 to 12). **User only.** |
 | `computewarden_stats` | Counters since the daemon started. A high `expired_reservations` means agents acquire but don't release. |
 
 All tools return compact JSON, and errors come back as JSON with an `error` field too.
@@ -202,34 +211,6 @@ sharing:
 ```
 
 [`config.example.yaml`](config.example.yaml) documents every setting.
-
-## Live panel (optional)
-
-If [RelentlessEye](https://github.com/RelentlessOldMan/RelentlessEye) is installed, the daemon
-shows up in it as a Compute Warden panel with:
-
-- the machine state;
-- the **Hold** switch (off/on; turning it on asks you to confirm);
-- **Jobs while gaming**;
-- running games and other blockers;
-- a table of claims: who, where each one is (running full or throttled, its turn but not
-  started, or queued with its place in line, plus solo or big memory), the lease left, when it
-  last checked in, and what it's doing. A last check-in 15 minutes or more ago is highlighted:
-  the work may be finished or stuck;
-- a feed of the daemon's log (claims, releases, promotions, expiries).
-
-`reye request ComputeWarden.status` returns the same JSON as `computewarden_status`.
-
-**Jobs while gaming** (0 to 4) sets how many jobs may run beside a game. Each runs on one core,
-so it's also how many cores of background work the game shares the machine with. A game suffers
-mostly from the memory traffic of background work, which priority doesn't stop; fewer jobs is
-what helps. Lowering it makes the next jobs wait; work already running carries on. 0 means
-nothing new starts until the game closes. It starts at `game_jobs` from the config and, once
-picked, stays across restarts.
-
-Only a monitor (the panel or `reye`) can set the hold or jobs while gaming. Requests from apps
-connected to the hub, such as agent sessions, are refused and logged, since both are the user's
-call. The panel needs RelentlessEye 1.2 or later.
 
 ## Troubleshooting
 

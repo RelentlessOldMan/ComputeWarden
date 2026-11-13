@@ -41,7 +41,7 @@ sharing:
   throttle_priority: below_normal
   throttle_max_ram_gb: 2
   # While you game (or hold), at most this many claims run, all throttled; later ones wait
-  # their turn. 0..12. The panel's "Jobs while gaming" replaces this once you pick it.
+  # their turn. 0..12. `cw game-jobs <n>` replaces this once you set it.
   game_jobs: 3
   # A queued ticket must check in (renew) at least this often or it drops out of line.
   queue_checkin_seconds: 120

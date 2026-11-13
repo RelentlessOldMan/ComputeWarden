@@ -305,6 +305,28 @@ public class WireTests
     }
 
     [Fact]
+    public async Task Cw_shows_and_sets_the_jobs_while_gaming()
+    {
+        await using var host = StartHost(out var pipe);
+        var client = new WardenClient(pipe);
+        var output = new StringWriter();
+        var errors = new StringWriter();
+
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "game-jobs", "1" }, client, output, errors));
+        Assert.Contains("Jobs while gaming: 1.", output.ToString());
+        Assert.Equal(1, host.Warden.GameJobs);
+
+        output.GetStringBuilder().Clear();
+        Assert.Equal(0, await Cli.Cli.RunAsync(new[] { "game-jobs" }, client, output, errors));
+        Assert.Contains("Jobs while gaming: 1.", output.ToString());
+
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "game-jobs", "13" }, client, output, errors));
+        Assert.Equal(2, await Cli.Cli.RunAsync(new[] { "game-jobs", "lots" }, client, output, errors));
+        Assert.Contains("Usage: cw game-jobs [<0-12>]", errors.ToString());
+        Assert.Equal(1, host.Warden.GameJobs);
+    }
+
+    [Fact]
     public async Task Cw_reports_bad_input_and_a_missing_daemon()
     {
         var output = new StringWriter();

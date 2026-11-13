@@ -11,6 +11,7 @@ public static class IpcOps
     public const string SetManualBusy = "SET_MANUAL_BUSY";
     public const string ClearManualBusy = "CLEAR_MANUAL_BUSY";
     public const string Stats = "STATS";
+    public const string SetGameJobs = "SET_GAME_JOBS";
 }
 
 /// <summary>
@@ -51,6 +52,9 @@ public sealed class IpcRequest
 
     /// <summary>Renew: check in without starting the claim (a background waiter, not the owner).</summary>
     public bool? Probe { get; set; }
+
+    /// <summary>Set game jobs: how many jobs may run beside a game.</summary>
+    public int? Jobs { get; set; }
 }
 
 public static class IpcProtocol

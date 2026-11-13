@@ -159,6 +159,18 @@ public static class ComputeWardenTools
             return new { cleared };
         });
 
+    [McpServerTool(Name = "computewarden_set_game_jobs")]
+    [Description("Sets how many jobs may run while the user games (jobs while gaming), 0 to 12; " +
+                 "kept across restarts. Lowering it makes the next jobs wait; running work keeps going. " +
+                 "The USER's control: call this only when the user explicitly asks for it, never on your own.")]
+    public static Task<string> SetGameJobs(
+        [Description("How many jobs may run beside a game, 0 to 12.")] int jobs)
+        => Run(async client =>
+        {
+            var set = await client.SetGameJobsAsync(jobs);
+            return new { ok = true, gameJobs = set };
+        });
+
     [McpServerTool(Name = "computewarden_stats")]
     [Description("Usage counters since the daemon started: total/failed acquisitions, expired " +
                  "reservations (a high count means agents acquire but don't release — a misuse " +

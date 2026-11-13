@@ -101,6 +101,19 @@ public class McpToolsTests
     }
 
     [Fact]
+    public async Task Game_jobs_tool_sets_the_jobs_while_gaming()
+    {
+        await using var host = StartHostWithTools();
+
+        var set = Parse(await ComputeWardenTools.SetGameJobs(2));
+        Assert.Equal(2, (int)set["game_jobs"]!);
+        Assert.Equal(2, (int)Parse(await ComputeWardenTools.Status())["game_jobs"]!);
+
+        Assert.Contains("between 0 and 12", (string)Parse(await ComputeWardenTools.SetGameJobs(13))["error"]!);
+        Assert.Equal(2, (int)Parse(await ComputeWardenTools.Status())["game_jobs"]!);
+    }
+
+    [Fact]
     public async Task Stats_tool_reports_usage_counters()
     {
         await using var host = StartHostWithTools();

@@ -15,7 +15,7 @@ public sealed class SharingOptions
     /// <summary>Memory a throttled job should stay under.</summary>
     public double ThrottleMaxRamGb { get; init; } = 2;
 
-    /// <summary>Jobs that may run beside a game until the user picks a number on the panel.</summary>
+    /// <summary>Jobs that may run beside a game until the user sets one with `cw game-jobs`.</summary>
     public int GameJobs { get; init; } = 3;
 
     /// <summary>A queued ticket that doesn't check in (renew) this often drops out of line.</summary>

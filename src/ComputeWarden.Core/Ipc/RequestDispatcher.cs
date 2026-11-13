@@ -110,6 +110,7 @@ public sealed class RequestDispatcher
                 IpcOps.SetManualBusy => HandleSetManual(request),
                 IpcOps.ClearManualBusy => HandleClearManual(),
                 IpcOps.Stats => HandleStats(),
+                IpcOps.SetGameJobs => HandleSetGameJobs(request),
                 _ => Error($"Unknown op '{request.Op}'"),
             };
         }
@@ -208,6 +209,13 @@ public sealed class RequestDispatcher
             return Error("Manual blocker control is disabled by configuration");
         var cleared = _warden.ClearManualBusy();
         return Ok(o => o["cleared"] = cleared);
+    }
+
+    private string HandleSetGameJobs(IpcRequest r)
+    {
+        if (r.Jobs is not int jobs) return Error("'jobs' is required");
+        var set = _warden.SetGameJobs(jobs);
+        return Ok(o => o["gameJobs"] = set);
     }
 
     private string HandleStats()
